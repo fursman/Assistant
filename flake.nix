@@ -17,7 +17,7 @@
               src = final.fetchPypi {
                 pname = "openai";
                 version = "1.6.1";
-                sha256 = "0d8sj9qfidq5jsfass3p1jx6iyjg6np9s7c5x2f7k32flbq2gv07"; # Update this with the correct hash
+                sha256 = "";
               };
             });
           };
