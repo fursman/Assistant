@@ -28,7 +28,7 @@
           dunst
           gnome.zenity
         ];
-        shellHook = "python Assistant.py";
+        shellHook = "python assistant.py";
       };
     }
   );
