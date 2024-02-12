@@ -46,3 +46,4 @@ outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
       };
     }
   );
+}
