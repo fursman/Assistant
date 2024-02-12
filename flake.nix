@@ -25,7 +25,7 @@
           ]))
           ffmpeg
           portaudio
-          dunzt
+          dunst
           gnome.zenity
         ];
         shellHook = "python Assistant.py";
