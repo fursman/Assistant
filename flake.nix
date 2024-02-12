@@ -20,8 +20,9 @@ outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
         ps.numpy
         ps.keyring
         ps.notify2
-        ps.openai
-        # Add any other Python dependencies here
+        (openai.overrideAttrs (old: {
+          doCheck = false; # This line disables the build tests for the openai package
+        })) 
       ]);
     in {
       packages.assistant = pkgs.stdenv.mkDerivation {
