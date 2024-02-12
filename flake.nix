@@ -20,6 +20,7 @@ outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
         ps.numpy
         ps.keyring
         ps.notify2
+        ps.openai
       ]);
     in {
       packages.assistant = pkgs.stdenv.mkDerivation {
