@@ -15,7 +15,7 @@ outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
       };
       lib = pkgs.lib;
       
-      pythonEnv = pkgs.python310.withPackages (ps: with ps; [
+      pythonEnv = pkgs.python3.withPackages (ps: with ps; [
         ps.pyaudio
         ps.numpy
         ps.keyring
