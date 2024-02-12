@@ -1,5 +1,5 @@
 {
-  description = "A flake for installing NixOS Assistant with openai package";
+  description = "A description of your flake";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -9,37 +9,39 @@
   outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        # Import nixpkgs with potential overlays or custom configurations
-        pkgs = import nixpkgs {
-          inherit system;
+        # Define a custom package overlay
+        customPythonPackages = pythonPackages: {
+          openai = pythonPackages.openai.overrideAttrs (oldAttrs: {
+            doCheck = false;  # This should disable the build tests for openai
+          });
         };
 
-        # Custom Python environment with openai, skipping tests
+        # Import nixpkgs with the overlay for Python packages
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [
+            (self: super: {
+              python3Packages = super.python3Packages.overridePythonAttrs (oldAttrs: customPythonPackages super.python3Packages);
+            })
+          ];
+        };
+
+        # Define your Python environment with the custom package set
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
-          # Other packages as needed
-          (ps.openai.overrideAttrs (oldAttrs: {
-            doCheck = false; # Skip tests
-          }))
+          ps.pyaudio
+          ps.numpy
+          ps.keyring
+          ps.notify2
+          ps.openai  # This should now have tests disabled
         ]);
       in {
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
           buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ];
-          dontUnpack = true;
-          installPhase = ''
-            mkdir -p $out/bin
-            cp ${self}/assistant.py $out/bin/assistant
-            chmod +x $out/bin/assistant
-            wrapProgram $out/bin/assistant \
-              --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.portaudio pythonEnv ]}"
-          '';
+          # Additional configuration...
         };
 
-        defaultPackage.${system} = self.packages.${system}.assistant;
-
-        devShells.${system} = pkgs.mkShell {
-          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ];
-        };
+        # Additional configuration...
       }
     );
 }
