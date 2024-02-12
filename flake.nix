@@ -40,16 +40,16 @@
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
           src = self;
-          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio pkgs.makeWrapper ];
+          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio pkgs.makeWrapper];
           dontUnpack = true;
           installPhase = ''
             mkdir -p $out/bin
             cp ${self}/assistant.py $out/bin/assistant
             chmod +x $out/bin/assistant
             wrapProgram $out/bin/assistant \
-              --prefix PATH : ${lib.makeBinPath [ pkgs.ffmpeg pkgs.portaudio pythonEnv ]}
-              # Include any other necessary runtime dependencies in the PATH
+              --prefix PATH : ''${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.portaudio pythonEnv ]}
           '';
+
         };
 
         defaultPackage.${system} = self.packages.${system}.assistant;
