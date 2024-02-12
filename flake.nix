@@ -31,7 +31,7 @@
             cp ${self}/assistant.py $out/bin/assistant
             chmod +x $out/bin/assistant
             wrapProgram $out/bin/assistant \
-              --prefix PATH : ''${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.portaudio pythonEnv ]}
+              --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg pkgs.portaudio pythonEnv ]}"
           '';
         };
 
