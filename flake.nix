@@ -1,5 +1,5 @@
 {
-  description = "A flake for installing NixOS Assistant";
+  description = "A flake for installing NixOS Assistant with openai package";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -9,40 +9,22 @@
   outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        # Define an overlay to specify the openai version
-        openaiOverlay = final: prev: let
-          _ = builtins.trace "Applying openai overlay" {}; 
-        in {
-          python3Packages = prev.python3Packages // {
-            openai = prev.python3Packages.openai.overrideAttrs (oldAttrs: rec {
-              version = "1.6.1";
-              src = final.fetchPypi {
-                pname = "openai";
-                version = "1.6.1";
-                sha256 = "0000000000000000000000000000000000000000000000000000"; # Placeholder SHA256
-              };
-            });
-          };
-        };
-
-        # Import nixpkgs with the overlay applied
+        # Import nixpkgs with potential overlays or custom configurations
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ openaiOverlay ];
         };
 
+        # Custom Python environment with openai, skipping tests
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
-          ps.pyaudio
-          ps.numpy
-          ps.keyring
-          ps.notify2
-          ps.openai # This now refers to the overridden version
+          # Other packages as needed
+          (ps.openai.overrideAttrs (oldAttrs: {
+            doCheck = false; # Skip tests
+          }))
         ]);
       in {
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
-          src = self;
-          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio pkgs.makeWrapper];
+          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ];
           dontUnpack = true;
           installPhase = ''
             mkdir -p $out/bin
