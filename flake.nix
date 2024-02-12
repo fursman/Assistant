@@ -15,7 +15,7 @@ outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
       };
       lib = pkgs.lib;
       
-      pythonEnv = pkgs.python3.withPackages (ps: with ps; [
+      pythonEnv = pkgs.python310.withPackages (ps: with ps; [
         ps.pyaudio
         ps.numpy
         ps.keyring
@@ -25,7 +25,7 @@ outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
       packages.assistant = pkgs.stdenv.mkDerivation {
         name = "assistant";
         src = self;
-        buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ]; # Ensure all external dependencies are included
+        buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio pkgs.makeWrapper]; # Ensure all external dependencies are included
         dontUnpack = true;
         installPhase = ''
           mkdir -p $out/bin
