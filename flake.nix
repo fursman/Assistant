@@ -9,30 +9,28 @@
   outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        # Define a custom package overlay
-        customPythonPackages = pythonPackages: {
-          openai = pythonPackages.openai.overrideAttrs (oldAttrs: {
-            doCheck = false;  # This should disable the build tests for openai
-          });
+        # Overlay to customize Python packages
+        customPythonOverlay = final: prev: {
+          python3Packages = prev.python3Packages // {
+            openai = prev.python3Packages.openai.overrideAttrs (oa: {
+              doCheck = false;  # Disable build tests for openai
+            });
+          };
         };
 
-        # Import nixpkgs with the overlay for Python packages
+        # Import nixpkgs with the overlay applied
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [
-            (self: super: {
-              python3Packages = super.python3Packages.overridePythonAttrs (oldAttrs: customPythonPackages super.python3Packages);
-            })
-          ];
+          overlays = [ customPythonOverlay ];
         };
 
-        # Define your Python environment with the custom package set
+        # Define your Python environment using the customized package set
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           ps.pyaudio
           ps.numpy
           ps.keyring
           ps.notify2
-          ps.openai  # This should now have tests disabled
+          ps.openai  # Uses the version with tests disabled
         ]);
       in {
         packages.assistant = pkgs.stdenv.mkDerivation {
