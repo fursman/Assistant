@@ -35,7 +35,7 @@
       in {
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
-          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ];
+          buildInputs = [ pythonEnv pkgs.ffmpeg-full pkgs.portaudio ];
           # Additional configuration...
         };
 
