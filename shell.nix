@@ -9,7 +9,7 @@
     (pkgs.python3.withPackages (ps: [ ps.numpy ps.pyaudio ps.notify2 ps.keyring ]))
     pkgs.virtualenv
     pkgs.portaudio
-    pkgs.ffmpeg
+    pkgs.ffmpeg-full
   ];
   shellHook = ''
     DIR="${builtins.toPath ./.}"
