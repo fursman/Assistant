@@ -23,8 +23,8 @@ CHUNK = 1024  # Number of bytes to read from the mic per sample
 FORMAT = pyaudio.paInt16  # Audio format
 CHANNELS = 1  # Number of audio channels
 RATE = 22050  # Sampling rate
-THRESHOLD = 2000  # Threshold for silence/noise
-SILENCE_LIMIT = 2  # Maximum length of silence in seconds before stopping
+THRESHOLD = 1000  # Threshold for silence/noise
+SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
 # Define file paths
@@ -146,34 +146,38 @@ def calculate_rms(data):
     rms = audioop.rms(data, 2)  # Calculate RMS of the given audio chunk
     return rms
 
-def is_silence(data, threshold=THRESHOLD):
-    """Check if the recorded data is considered silence."""
-    rms = calculate_rms(data)
-    print(f"Volume: {rms}")  # Print the RMS (volume) for monitoring
-    return rms < threshold
+def is_silence(data_chunk, threshold=THRESHOLD):
+    """Check if the given audio data_chunk contains silence defined by the threshold.
+    Simple implementation could be based on average volume."""
+    # Assuming data_chunk is in format pyaudio.paInt16
+    as_ints = np.frombuffer(data_chunk, dtype=np.int16)
+    if np.max(np.abs(as_ints)) < threshold:
+        print(np.max(np.abs(as_ints)))
+        return True
+    print(np.max(np.abs(as_ints)))
+    return False
 
-def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT, prev_audio_duration=PREV_AUDIO_DURATION):
+def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
     audio = pyaudio.PyAudio()
     stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
     print("Recording...")
 
     frames = []
-    prev_audio_frames = deque(maxlen=int(rate / chunk * prev_audio_duration))
     silent_frames = 0
+    silence_threshold = int(rate / chunk * silence_limit)
 
     while True:
         data = stream.read(chunk, exception_on_overflow=False)
-
+        rms = audioop.rms(data, 2)  # Calculate RMS of the audio chunk, 2 because FORMAT is paInt16
+        frames.append(data)
+        
         if is_silence(data):
             silent_frames += 1
-            if silent_frames >= int(rate / chunk * silence_limit):
+            if silent_frames >= silence_threshold:
                 print("Silence detected, stopping recording.")
                 break
         else:
             silent_frames = 0
-            frames.extend(list(prev_audio_frames))
-            prev_audio_frames.clear()
-            frames.append(data)
 
     # Stop and close the stream
     stream.stop_stream()
