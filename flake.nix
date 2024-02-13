@@ -1,47 +1,48 @@
 {
-  description = "A description of your flake";
+  description = "A flake to install the NixOS AI LLM Assistant for Wayland";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        # Define a custom package overlay
-        customPythonPackages = pythonPackages: {
-          openai = pythonPackages.openai.overrideAttrs (oldAttrs: {
-            doCheck = false;  # This should disable the build tests for openai
-          });
-        };
+outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
+  flake-utils.lib.eachDefaultSystem (system:
+    let
+      # Import nixpkgs and extract both pkgs and lib
+      pkgs = import nixpkgs {
+        inherit system;
+      };
+      lib = pkgs.lib;
+      
+      pythonEnv = pkgs.python3.withPackages (ps: with ps; [
+        ps.pyaudio
+        ps.numpy
+        ps.keyring
+        ps.notify2
+        ps.openai
+        # Add any other Python dependencies here
+      ]);
+    in {
+      packages.assistant = pkgs.stdenv.mkDerivation {
+        name = "assistant";
+        src = self;
+        buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ]; # Ensure all external dependencies are included
+        dontUnpack = true;
+        installPhase = ''
+          mkdir -p $out/bin
+          cp ${self}/assistant.py $out/bin/assistant
+          chmod +x $out/bin/assistant
+          wrapProgram $out/bin/assistant \
+            --prefix PATH : ${lib.makeBinPath [ pkgs.ffmpeg pkgs.portaudio pythonEnv ]}
+            # Include any other necessary runtime dependencies in the PATH
+        '';
+      };
 
-        # Import nixpkgs with the overlay for Python packages
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [
-            (self: super: {
-              python3Packages = super.python3Packages.overridePythonAttrs (oldAttrs: customPythonPackages super.python3Packages);
-            })
-          ];
-        };
+      defaultPackage.${system} = self.packages.${system}.assistant;
 
-        # Define your Python environment with the custom package set
-        pythonEnv = pkgs.python3.withPackages (ps: with ps; [
-          ps.pyaudio
-          ps.numpy
-          ps.keyring
-          ps.notify2
-          ps.openai  # This should now have tests disabled
-        ]);
-      in {
-        packages.assistant = pkgs.stdenv.mkDerivation {
-          name = "assistant";
-          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ];
-          # Additional configuration...
-        };
-
-        # Additional configuration...
-      }
-    );
-}
+      devShells.${system} = pkgs.mkShell {
+        buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio ];
+      };
+    }
+  );
