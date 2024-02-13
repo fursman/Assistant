@@ -9,39 +9,37 @@
   outputs = { self, nixpkgs, flake-utils, ... }: 
     flake-utils.lib.eachDefaultSystem (system:
       let
-        # Overlay to override the openai package version
-        overlay = self: super: {
-          python3Packages = super.python3Packages // {
-            openai = super.python3Packages.openai.overrideAttrs (oldAttrs: {
-              src = super.fetchPypi {
-                pname = "openai";
-                version = "1.6.1";
-                sha256 = "0000000000000000000000000000000000000000000000000000"; # Update this with the correct hash
-              };
-            });
-          };
-        };
-
-        # Import nixpkgs with the overlay applied
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ overlay ];
+          overlays = [
+            (final: prev: {
+              python3Packages = prev.python3Packages // {
+                openai = prev.python3Packages.buildPythonPackage rec {
+                  pname = "openai";
+                  version = "1.6.1";
+                  src = prev.fetchPypi {
+                    inherit pname version;
+                    sha256 = "<SHA256_HASH>"; # Replace <SHA256_HASH> with the actual hash
+                  };
+                  doCheck = false; # Disable tests
+                };
+              };
+            })
+          ];
         };
 
-        # Define your Python environment
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           ps.pyaudio
           ps.numpy
           ps.keyring
           ps.notify2
-          ps.openai # This should now refer to the overridden version
+          ps.openai # This now uses the specific version 1.6.1
         ]);
       in {
-        # Define your NixOS configuration or package
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
           src = self;
-          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio pkgs.makeWrapper ]; # Ensure all external dependencies are included
+          buildInputs = [ pythonEnv pkgs.ffmpeg pkgs.portaudio pkgs.makeWrapper ];
           dontUnpack = true;
           installPhase = ''
             mkdir -p $out/bin
