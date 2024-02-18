@@ -30,6 +30,7 @@
           ps.numpy
           ps.keyring
           ps.notify2
+          ps.gnome.zenity
           ps.openai  # Uses the version with tests disabled
         ]);
       in {
