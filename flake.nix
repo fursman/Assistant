@@ -9,19 +9,9 @@
   outputs = { self, nixpkgs, flake-utils, ... } @ inputs:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        # Overlay to customize Python packages
-        customPythonOverlay = final: prev: {
-          python3Packages = prev.python3Packages // {
-            openai = prev.python3Packages.openai.overrideAttrs (oa: {
-              doCheck = false;  # Disable build tests for openai
-            });
-          };
-        };
-
-        # Import nixpkgs with the overlay applied
+        # Import nixpkgs without any overlays applied
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ customPythonOverlay ];
         };
 
         # Define your Python environment using the customized package set
@@ -30,13 +20,12 @@
           ps.numpy
           ps.keyring
           ps.notify2
-          ps.gnome.zenity
-          ps.openai  # Uses the version with tests disabled
+          ps.openai
         ]);
       in {
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
-          buildInputs = [ pythonEnv pkgs.ffmpeg-full pkgs.portaudio ];
+          buildInputs = [ pythonEnv pkgs.ffmpeg-full pkgs.portaudio pkgs.gnome.zenity ];
           # Additional configuration...
         };
 
