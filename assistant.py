@@ -27,21 +27,21 @@ THRESHOLD = 1000  # Threshold for silence/noise
 SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
-# Function to get environment variable or default
-def ensure_dir_exists(directory: Path):
-    if not directory.exists():
-        directory.mkdir(parents=True, exist_ok=True)
+# Determine the base directory for logs based on an environment variable or fallback to a directory in /tmp
+base_log_dir = Path(os.getenv('LOG_DIR', f"/tmp/assistant-logs/{os.geteuid()}"))
+base_log_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
-log_dir = Path("/var/log/assistant")
-ensure_dir_exists(log_dir)
+# Determine the base directory for assets based on an environment variable or fallback to a default path
+assets_directory = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
+assets_directory.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists, in case the default is used and doesn't exist
 
-assets_directory = get_path_or_default("AUDIO_ASSETS", Path(__file__).parent / "assets-audio")
-lock_file_path = log_directory / "script.lock"
-
+# Define file paths
 now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_csv_path = log_directory / "interaction_log.csv"
-recorded_audio_path = log_directory / f"input_{now}.wav"
-speech_file_path = log_directory / f"response_{now}.mp3"
+log_csv_path = base_log_dir / "interaction_log.csv"
+recorded_audio_path = base_log_dir / f"input_{now}.wav"
+speech_file_path = base_log_dir / f"response_{now}.mp3"
+lock_file_path = base_log_dir / "script.lock"
+
 welcome_file_path = assets_directory / "welcome.mp3"
 process_file_path = assets_directory / "process.mp3"
 gotit_file_path = assets_directory / "gotit.mp3"
