@@ -54,8 +54,9 @@
             wrapProgram $out/bin/assistant \
               --set AUDIO_ASSETS "$out/share/assistant/assets-audio" \
               --set LOG_DIR "/tmp/logs/assistant" \
-              --prefix PATH : ${lib.getBin pkgs.ffmpeg-full}
+              --prefix PATH : ${pkgs.ffmpeg-full}/bin
           '';
+
         };
 
         defaultPackage.${system} = self.packages.${system}.assistant;
