@@ -20,12 +20,11 @@
           ps.numpy
           ps.keyring
           ps.notify2
-          ps.openai
         ]);
       in {
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
-          buildInputs = [ pythonEnv pkgs.ffmpeg-full pkgs.portaudio pkgs.gnome.zenity ];
+          buildInputs = [ pythonEnv pkgs.ffmpeg-full pkgs.portaudio pkgs.gnome.zenity pkgs.openai ];
           # Additional configuration...
         };
 
