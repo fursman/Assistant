@@ -33,8 +33,7 @@
             pkgs.ffmpeg-full
             pkgs.portaudio
             pkgs.gnome.zenity
-            # Include the openai package if available in your nixpkgs version,
-            # otherwise, you might need to use an overlay or package it yourself.
+            pkgs.openai
           ];
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
