@@ -29,7 +29,8 @@ PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
 # Determine the base directory for logs based on an environment variable or fallback to a directory in /tmp
 base_log_dir = Path(os.getenv('LOG_DIR', "/tmp/logs/assistant/"))
-base_log_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
+print(f"Attempting to create log directory at: {base_log_dir}")
+base_log_dir.mkdir(parents=True, exist_ok=True)
 
 # Determine the base directory for assets based on an environment variable or fallback to a default path
 assets_directory = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
