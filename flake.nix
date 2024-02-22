@@ -21,6 +21,7 @@
           ps.numpy
           ps.notify2
           ps.keyring
+          ps.openai
         ]);
 
       in {
@@ -33,7 +34,6 @@
             pkgs.ffmpeg-full
             pkgs.portaudio
             pkgs.gnome.zenity
-            pkgs.openai
           ];
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
