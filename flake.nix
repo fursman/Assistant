@@ -13,11 +13,8 @@
           inherit system;
         };
 
-        assistantSrc = pkgs.fetchgit {
-          url = "https://github.com/fursman/Assistant";
-          rev = "main";
-          # Note: fetchGit does not require sha256, but it has limitations outside of pure Nix environments.
-        };
+        # Use the local source directly instead of fetching from GitHub
+        assistantSrc = self;
 
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           ps.pyaudio
@@ -36,23 +33,19 @@
             pkgs.ffmpeg-full
             pkgs.portaudio
             pkgs.gnome.zenity
-            # Include the openai package if available in your nixpkgs version,
-            # otherwise, you might need to use an overlay or package it yourself.
+            pkgs.openai
           ];
 
           installPhase = ''
-
-            echo "Listing source directory:"
-            ls $src
             mkdir -p $out/bin $out/share/assistant/audio $out/var/log/assistant
 
             # Install Python script
-            cp $src/assistant.py $out/bin/assistant
+            cp ${assistantSrc}/assistant.py $out/bin/assistant
             chmod +x $out/bin/assistant
 
             # Copy audio assets
-            cp -r $src/assets-audio/* $out/share/assistant/assets-audio/
-            cp -r $src/logs/* $out/share/assistant/logs/
+            cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
+            cp -r ${assistantSrc}/logs/* $out/share/assistant/logs/
           '';
 
           postFixup = ''
