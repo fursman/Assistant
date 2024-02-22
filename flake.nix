@@ -13,9 +13,9 @@
           inherit system;
         };
 
-        assistantSrc = pkgs.fetchgit {
+        assistantSrc = pkgs.fetchGit {
           url = "https://github.com/fursman/Assistant";
-          ref = "main";
+          rev = "main";
           # Note: fetchGit does not require sha256, but it has limitations outside of pure Nix environments.
         };
 
