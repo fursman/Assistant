@@ -47,7 +47,6 @@
 
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
-            cp -r ${assistantSrc}/logs/* $out/tmp/logs/assistant/
           '';
 
           postFixup = ''
