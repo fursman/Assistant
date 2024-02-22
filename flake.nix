@@ -47,13 +47,13 @@
 
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
-            cp -r ${assistantSrc}/logs/* $out/share/assistant/logs/
+            cp -r ${assistantSrc}/logs/* $out/var/log/assistant/
           '';
 
           postFixup = ''
             wrapProgram $out/bin/assistant \
               --set AUDIO_ASSETS "$out/share/assistant/assets-audio" \
-              --set LOG_DIR "$out/share/assistant/logs"
+              --set LOG_DIR "$out/var/log/assistant"
           '';
         };
 
