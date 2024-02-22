@@ -12,6 +12,7 @@
         pkgs = import nixpkgs {
           inherit system;
         };
+        lib = nixpkgs.lib; # Make lib available
 
         # Directly use the local source
         assistantSrc = self;
@@ -47,12 +48,13 @@
 
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
+            cp -r ${assistantSrc}/logs/* $out/var/log/assistant/
           '';
 
           postFixup = ''
             wrapProgram $out/bin/assistant \
               --set AUDIO_ASSETS "$out/share/assistant/assets-audio" \
-              --set LOG_DIR "/tmp/logs/assistant"
+              --set LOG_DIR "/tmp/logs/assistant" \
               --prefix PATH : ${lib.getBin pkgs.ffmpeg-full}
           '';
         };
