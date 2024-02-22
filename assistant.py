@@ -28,7 +28,7 @@ SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
 # Determine the base directory for logs based on an environment variable or fallback to a directory in /tmp
-base_log_dir = Path(os.getenv('LOG_DIR', f"/tmp/assistant-logs/{os.geteuid()}"))
+base_log_dir = Path(os.getenv('LOG_DIR', "/tmp/logs/assistant/"))
 base_log_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
 # Determine the base directory for assets based on an environment variable or fallback to a default path
