@@ -27,18 +27,23 @@ THRESHOLD = 1000  # Threshold for silence/noise
 SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
-# Define file paths
-now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_csv_path = Path(__file__).parent / "logs/interaction_log.csv"
-recorded_audio_path = Path(__file__).parent / f"logs/input_{now}.wav"
-speech_file_path = Path(__file__).parent / f"logs/response_{now}.mp3"
-welcome_file_path = Path(__file__).parent / "assets-audio/welcome.mp3"
-process_file_path = Path(__file__).parent / "assets-audio/process.mp3"
-gotit_file_path = Path(__file__).parent / "assets-audio/gotit.mp3"
-apikey_file_path = Path(__file__).parent / "assets-audio/apikey.mp3"
+# Function to get environment variable or default
+def get_path_or_default(env_var, default_path):
+    return Path(os.getenv(env_var, default_path))
 
-# Define the path for the lock file
-lock_file_path = Path(__file__).parent / "script.lock"
+# Paths with fallbacks
+log_directory = get_path_or_default("LOG_DIR", Path(__file__).parent / "logs")
+assets_directory = get_path_or_default("AUDIO_ASSETS", Path(__file__).parent / "assets-audio")
+lock_file_path = log_directory / "script.lock"
+
+now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+log_csv_path = log_directory / "interaction_log.csv"
+recorded_audio_path = log_directory / f"input_{now}.wav"
+speech_file_path = log_directory / f"response_{now}.mp3"
+welcome_file_path = assets_directory / "welcome.mp3"
+process_file_path = assets_directory / "process.mp3"
+gotit_file_path = assets_directory / "gotit.mp3"
+apikey_file_path = assets_directory / "apikey.mp3"
 
 def signal_handler(sig, frame):
     print(f"Received signal {sig}, cleaning up...")
