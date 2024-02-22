@@ -52,7 +52,7 @@
           postFixup = ''
             wrapProgram $out/bin/assistant \
               --set AUDIO_ASSETS "$out/share/assistant/assets-audio" \
-              --set LOG_DIR "$out/tmp/logs/assistant"
+              --set LOG_DIR "/tmp/logs/assistant"
           '';
         };
 
