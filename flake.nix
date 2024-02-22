@@ -41,6 +41,9 @@
           ];
 
           installPhase = ''
+
+            echo "Listing source directory:"
+            ls $src
             mkdir -p $out/bin $out/share/assistant/audio $out/var/log/assistant
 
             # Install Python script
