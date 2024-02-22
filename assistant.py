@@ -28,11 +28,13 @@ SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
 # Function to get environment variable or default
-def get_path_or_default(env_var, default_path):
-    return Path(os.getenv(env_var, default_path))
+def ensure_dir_exists(directory: Path):
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True)
 
-# Paths with fallbacks
-log_directory = get_path_or_default("LOG_DIR", Path(__file__).parent / "logs")
+log_dir = Path("/var/log/assistant")
+ensure_dir_exists(log_dir)
+
 assets_directory = get_path_or_default("AUDIO_ASSETS", Path(__file__).parent / "assets-audio")
 lock_file_path = log_directory / "script.lock"
 
