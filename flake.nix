@@ -27,30 +27,32 @@
         packages.assistant = pkgs.stdenv.mkDerivation {
           name = "assistant";
           src = assistantSrc;
-
+        
           buildInputs = [
             pythonEnv
             pkgs.ffmpeg-full
             pkgs.portaudio
             pkgs.gnome.zenity
-            pkgs.openai
+            # other dependencies
           ];
-
+        
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+        
           installPhase = ''
-            mkdir -p $out/bin $out/share/assistant/assets-audio $out/share/assistant/logs
-          
+            mkdir -p $out/bin $out/share/assistant/audio $out/var/log/assistant
+        
             echo "Listing source directory:"
             ls $src
-          
+        
             # Install Python script
             cp ${assistantSrc}/assistant.py $out/bin/assistant
             chmod +x $out/bin/assistant
-          
+        
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
             cp -r ${assistantSrc}/logs/* $out/share/assistant/logs/
           '';
-
+        
           postFixup = ''
             wrapProgram $out/bin/assistant \
               --set AUDIO_ASSETS "$out/share/assistant/assets-audio" \
