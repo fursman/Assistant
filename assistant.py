@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Version 0.1
 
 import os
 import pyaudio
