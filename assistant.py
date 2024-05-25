@@ -122,7 +122,9 @@ def send_notification(title, message):
 
 def calculate_rms(data):
     as_ints = np.frombuffer(data, dtype=np.int16)
-    return np.sqrt(np.mean(as_ints**2))
+    if as_ints.size == 0:
+        return 0
+    return np.sqrt(np.mean(np.square(as_ints)))
 
 def is_silence(data_chunk, threshold=THRESHOLD):
     rms = calculate_rms(data_chunk)
@@ -265,7 +267,8 @@ def main():
         stream_run(client, thread.id, assistant.id)
 
         play_audio(gotit_file_path)
-        synthesize_speech(client, transcript, speech_file_path)
+        response_text = generate_response(client, transcript)  # Ensure this function is defined properly
+        synthesize_speech(client, response_text, speech_file_path)
         send_notification("NixOS Assistant:", "Audio Received")
         play_audio(speech_file_path)
 
