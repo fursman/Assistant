@@ -12,9 +12,8 @@
         pkgs = import nixpkgs {
           inherit system;
         };
-        lib = nixpkgs.lib; # Make lib available
+        lib = nixpkgs.lib;
 
-        # Directly use the local source
         assistantSrc = self;
 
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
@@ -56,7 +55,6 @@
               --set LOG_DIR "/tmp/logs/assistant" \
               --prefix PATH : ${pkgs.ffmpeg-full}/bin
           '';
-
         };
 
         defaultPackage.${system} = self.packages.${system}.assistant;
