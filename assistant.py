@@ -8,7 +8,6 @@ import notify2
 import datetime
 import signal
 import numpy as np
-import audioop
 import sys
 import csv
 import json
@@ -122,14 +121,12 @@ def send_notification(title, message):
     n.show()
 
 def calculate_rms(data):
-    rms = audioop.rms(data, 2)
-    return rms
+    as_ints = np.frombuffer(data, dtype=np.int16)
+    return np.sqrt(np.mean(as_ints**2))
 
 def is_silence(data_chunk, threshold=THRESHOLD):
-    as_ints = np.frombuffer(data_chunk, dtype=np.int16)
-    if np.max(np.abs(as_ints)) < threshold:
-        return True
-    return False
+    rms = calculate_rms(data_chunk)
+    return rms < threshold
 
 def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
     audio = pyaudio.PyAudio()
@@ -140,7 +137,6 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
 
     while True:
         data = stream.read(chunk, exception_on_overflow=False)
-        rms = audioop.rms(data, 2)
         frames.append(data)
         
         if is_silence(data):
@@ -226,6 +222,21 @@ def stream_run(client, thread_id, assistant_id):
         event_handler=event_handler,
     ) as stream:
         stream.until_done()
+
+def play_audio(speech_file_path):
+    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'])
+    create_lock(ffmpeg_pid=process.pid)
+    process.wait()
+    update_lock_for_ffmpeg_completion()
+
+def synthesize_speech(client, text, speech_file_path):
+    response = client.audio.speech.create(
+        model="tts-1-hd",
+        voice="nova",
+        response_format="opus",
+        input=text
+    )
+    response.stream_to_file(speech_file_path)
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
