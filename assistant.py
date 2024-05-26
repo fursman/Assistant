@@ -226,9 +226,9 @@ def generate_response(client, assistant_id, thread_id, transcript):
 
     class EventHandler(AssistantEventHandler):
         def on_text_created(self, text) -> None:
-            print(f"\nassistant > ", end="", flush=True)
-          
-        def on_text_delta(self, delta, snapshot):
+            print(f"\nassistant > {text}\n", flush=True)
+      
+        def on_text_delta(self, delta, index, is_final, text, snapshot):
             print(delta, end="", flush=True)
           
         def on_tool_call_created(self, tool_call):
@@ -244,18 +244,17 @@ def generate_response(client, assistant_id, thread_id, transcript):
                         if output.type == "logs":
                             print(f"\n{output.logs}", flush=True)
 
-    run = client.beta.threads.runs.with_streaming_response(
+    run = client.beta.threads.runs.create_with_streaming_response(
       thread_id=thread_id,
       assistant_id=assistant_id,
-      instructions="Please address the user as Jane Doe. The user has a premium account.",
+      instructions="Please answer the user's questions.",
       event_handler=EventHandler(),
     )
 
     response_text = []
-    with run as stream:
-        for event in stream:
-            if event['type'] == 'text':
-                response_text.append(event['delta'])
+    for event in run.events():
+        if event.type == 'text':
+            response_text.append(event.delta)
     
     return ''.join(response_text)
 
