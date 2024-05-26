@@ -18,11 +18,13 @@
 
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           ps.pyaudio
+          ps.pydub
+          ps.simpleaudio
+          ps.requests
           ps.numpy
           ps.notify2
           ps.keyring
           ps.openai
-          ps.requests
         ]);
 
       in {
