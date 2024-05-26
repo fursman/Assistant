@@ -100,10 +100,15 @@ def send_notification(title, message):
 
 def calculate_rms(data):
     as_ints = np.frombuffer(data, dtype=np.int16)
-    return np.sqrt(np.mean(np.square(as_ints))) if as_ints.size > 0 else 0
+    if as_ints.size == 0:
+        return 0
+    mean_square = np.mean(np.square(as_ints))
+    rms = np.sqrt(mean_square)
+    return rms if np.isfinite(rms) else 0
 
 def is_silence(data_chunk, threshold=THRESHOLD):
-    return calculate_rms(data_chunk) < threshold
+    rms = calculate_rms(data_chunk)
+    return rms < threshold
 
 def record_audio(file_path):
     audio = pyaudio.PyAudio()
@@ -231,4 +236,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Version 0.3
+# Version 0.4
