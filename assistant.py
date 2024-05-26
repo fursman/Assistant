@@ -10,12 +10,9 @@ import notify2
 import datetime
 import signal
 import numpy as np
-import simpleaudio as sa
-from pydub import AudioSegment
-from io import BytesIO
 import keyring
 from pathlib import Path
-import json  # Import the json module
+import json
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -49,7 +46,6 @@ apikey_file_path = assets_directory / "apikey.mp3"
 api_key = keyring.get_password("NixOSAssistant", "APIKey")
 headers = {
     "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json",
     "OpenAI-Beta": "assistants=v1",
 }
 base_url = "https://api.openai.com/v1"
@@ -170,7 +166,9 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
 def transcribe_audio(audio_file_path):
     url = f"{base_url}/audio/transcriptions"
     with open(audio_file_path, "rb") as audio_file:
-        response = requests.post(url, headers=headers, files={"file": audio_file}, data={"model": "whisper-1"})
+        files = {"file": audio_file}
+        data = {"model": "whisper-1"}
+        response = requests.post(url, headers=headers, files=files, data=data)
         if response.status_code == 200:
             return response.json().get("text")
         else:
