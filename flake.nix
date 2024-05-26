@@ -22,6 +22,7 @@
           ps.notify2
           ps.keyring
           ps.openai
+          ps.requests
         ]);
 
       in {
