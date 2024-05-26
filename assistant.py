@@ -13,6 +13,7 @@ import json
 import keyring
 from pathlib import Path
 import openai
+from openai import AssistantEventHandler
 
 # Configuration for silence detection
 CHUNK = 1024
@@ -141,13 +142,22 @@ def transcribe_audio(client, audio_file_path):
         sys.exit("Failed to authenticate with OpenAI. Exiting.")
 
 def create_assistant(client):
-    return client.beta.assistants.create(name="NixOS Assistant", instructions="You are an assistant helping with various tasks.", model="gpt-4")
+    return client.beta.assistants.create(
+        name="NixOS Assistant",
+        instructions="You are an assistant helping with various tasks.",
+        tools=[{"type": "code_interpreter"}],
+        model="gpt-4"
+    )
 
 def create_thread(client):
     return client.beta.threads.create()
 
 def add_message_to_thread(client, thread_id, message_content):
-    return client.beta.threads.messages.create(thread_id=thread_id, role="user", content=message_content)
+    return client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=message_content
+    )
 
 class MyEventHandler(AssistantEventHandler):
     def on_text_created(self, text):
@@ -168,7 +178,11 @@ class MyEventHandler(AssistantEventHandler):
 
 def stream_run(client, thread_id, assistant_id):
     event_handler = MyEventHandler()
-    with client.beta.threads.runs.stream(thread_id=thread_id, assistant_id=assistant_id, event_handler=event_handler) as stream:
+    with client.beta.threads.runs.stream(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        event_handler=event_handler,
+    ) as stream:
         stream.until_done()
 
 def play_audio(file_path):
@@ -217,4 +231,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Version 0.2
+# Version 0.3
