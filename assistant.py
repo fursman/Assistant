@@ -203,7 +203,7 @@ def add_message_to_thread(client, thread_id, message_content):
 class MyEventHandler(AssistantEventHandler):
     def on_text_created(self, text):
         print(f"\nassistant > ", end="", flush=True)
-        0.1
+        
     def on_text_delta(self, delta, snapshot):
         print(delta.value, end="", flush=True)
         
@@ -281,5 +281,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# V 0.1
