@@ -244,15 +244,16 @@ def generate_response(client, assistant_id, thread_id, transcript):
                         if output.type == "logs":
                             print(f"\n{output.logs}", flush=True)
 
-    run = client.beta.threads.runs.create_with_streaming_response(
-      thread_id=thread_id,
-      assistant_id=assistant_id,
-      instructions="Please answer the user's questions.",
-      event_handler=EventHandler(),
+    run = client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=assistant_id,
+        instructions="Please address the user as Jane Doe. The user has a premium account.",
     )
 
+    streaming_run = run.with_streaming_response(event_handler=EventHandler())
+    
     response_text = []
-    for event in run.events():
+    for event in streaming_run.events():
         if event.type == 'text':
             response_text.append(event.delta)
     
