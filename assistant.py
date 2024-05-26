@@ -13,6 +13,7 @@ import numpy as np
 import keyring
 from pathlib import Path
 import json
+import csv
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -174,6 +175,23 @@ def transcribe_audio(audio_file_path):
         else:
             raise Exception(f"Failed to transcribe audio: {response.text}")
 
+def create_assistant():
+    url = f"{base_url}/assistants"
+    data = {
+        "model": "gpt-4-1106-preview",
+        "instructions": "You are a helpful assistant.",
+    }
+    response = requests.post(url, json=data, headers=headers)
+    return response.json()
+
+def create_thread():
+    url = f"{base_url}/threads"
+    response = requests.post(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"Failed to create thread: {response.text}")
+
 def generate_response(thread_id, assistant_id, transcript):
     url = f"{base_url}/threads/{thread_id}/messages"
     data = {"role": "user", "content": transcript}
@@ -220,23 +238,15 @@ def play_audio(audio_content):
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-
     check_and_kill_existing_process()
+    create_lock()
 
     try:
-        create_lock()
-        
-        api_key = keyring.get_password("NixOSAssistant", "APIKey")
-
         play_audio(open(welcome_file_path, "rb").read())
-
-        send_notification("NixOS Assistant", "Recording")
         record_audio(recorded_audio_path)
-
-        play_audio(open(process_file_path, "rb").read())
+        update_lock_for_ffmpeg_completion()
 
         transcript = transcribe_audio(recorded_audio_path)
-        send_notification("You asked:", transcript)
         print(f"Transcript: {transcript}")
 
         assistant = create_assistant()
