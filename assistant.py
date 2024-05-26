@@ -215,9 +215,9 @@ def synthesize_speech(text):
         raise Exception(f"Failed to synthesize speech: {response.text}")
 
 def play_audio(audio_content):
-    audio = AudioSegment.from_file(BytesIO(audio_content), format="mp3")
-    playback = sa.play_buffer(audio.raw_data, num_channels=audio.channels, bytes_per_sample=audio.sample_width, sample_rate=audio.frame_rate)
-    playback.wait_done()
+    with open("/tmp/temp_audio.mp3", "wb") as temp_audio_file:
+        temp_audio_file.write(audio_content)
+    subprocess.run(["ffmpeg", "-i", "/tmp/temp_audio.mp3", "-f", "alsa", "default"])
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
