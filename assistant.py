@@ -247,7 +247,7 @@ def generate_response(client, assistant_id, thread_id, transcript):
     with client.beta.threads.runs.stream(
       thread_id=thread_id,
       assistant_id=assistant_id,
-      instructions="Please answer the user's question",
+      instructions="Please address the user as Jane Doe. The user has a premium account.",
       event_handler=EventHandler(),
     ) as stream:
         stream.until_done()
