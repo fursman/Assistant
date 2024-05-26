@@ -15,6 +15,7 @@ from pydub import AudioSegment
 from io import BytesIO
 import keyring
 from pathlib import Path
+import json  # Import the json module
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
