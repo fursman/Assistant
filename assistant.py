@@ -13,7 +13,6 @@ import json
 import keyring
 from pathlib import Path
 import openai
-from openai import AssistantEventHandler
 
 # Configuration for silence detection
 CHUNK = 1024
@@ -59,21 +58,33 @@ def load_api_key():
 def handle_api_error():
     keyring.delete_password("NixOSAssistant", "APIKey")
     send_notification("NixOS Assistant Error", "Invalid API Key. Please re-enter your API key.")
+    sys.exit(1)
 
 def check_and_kill_existing_process():
     if lock_file_path.exists():
         with open(lock_file_path, 'r') as lock_file:
-            lock_data = json.load(lock_file)
-            for pid in [lock_data.get('script_pid'), lock_data.get('ffmpeg_pid')]:
-                if pid:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-        sys.exit("Exiting existing process.")
+            try:
+                lock_data = json.load(lock_file)
+                script_pid = lock_data.get('script_pid')
+                ffmpeg_pid = lock_data.get('ffmpeg_pid')
+                if ffmpeg_pid:
+                    os.kill(ffmpeg_pid, signal.SIGTERM)
+                if script_pid:
+                    os.kill(script_pid, signal.SIGTERM)
+                    send_notification("NixOS Assistant:", "Silencing output and standing by for your next request!")
+                    sys.exit("Exiting.")                    
+            except json.JSONDecodeError:
+                sys.exit("Lock file is corrupt. Exiting.")
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                sys.exit("Permission denied to kill process. Exiting.")
 
 def create_lock(ffmpeg_pid=None):
-    lock_data = {'script_pid': os.getpid(), 'ffmpeg_pid': ffmpeg_pid}
+    lock_data = {
+        'script_pid': os.getpid(),
+        'ffmpeg_pid': ffmpeg_pid
+    }
     with open(lock_file_path, 'w') as lock_file:
         json.dump(lock_data, lock_file)
 
@@ -107,8 +118,7 @@ def calculate_rms(data):
     return rms if np.isfinite(rms) else 0
 
 def is_silence(data_chunk, threshold=THRESHOLD):
-    rms = calculate_rms(data_chunk)
-    return rms < threshold
+    return calculate_rms(data_chunk) < threshold
 
 def record_audio(file_path):
     audio = pyaudio.PyAudio()
@@ -140,14 +150,17 @@ def record_audio(file_path):
 def transcribe_audio(client, audio_file_path):
     try:
         with open(audio_file_path, "rb") as audio_file:
-            response = client.Audio.transcriptions.create(model="whisper-1", file=audio_file, response_format="text")
-        return response
-    except Exception:
+            response = client.Audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+        return response['text']
+    except openai.error.OpenAIError:
         handle_api_error()
-        sys.exit("Failed to authenticate with OpenAI. Exiting.")
 
 def create_assistant(client):
-    return client.beta.assistants.create(
+    return client.Assistants.create(
         name="NixOS Assistant",
         instructions="You are an assistant helping with various tasks.",
         tools=[{"type": "code_interpreter"}],
@@ -155,10 +168,10 @@ def create_assistant(client):
     )
 
 def create_thread(client):
-    return client.beta.threads.create()
+    return client.Threads.create()
 
 def add_message_to_thread(client, thread_id, message_content):
-    return client.beta.threads.messages.create(
+    return client.Threads.messages.create(
         thread_id=thread_id,
         role="user",
         content=message_content
@@ -183,7 +196,7 @@ class MyEventHandler(AssistantEventHandler):
 
 def stream_run(client, thread_id, assistant_id):
     event_handler = MyEventHandler()
-    with client.beta.threads.runs.stream(
+    with client.Threads.runs.stream(
         thread_id=thread_id,
         assistant_id=assistant_id,
         event_handler=event_handler,
@@ -197,7 +210,12 @@ def play_audio(file_path):
     update_lock_for_ffmpeg_completion()
 
 def synthesize_speech(client, text, speech_file_path):
-    response = client.Audio.speech.create(model="tts-1-hd", voice="nova", response_format="opus", input=text)
+    response = client.Audio.speech.create(
+        model="tts-1-hd",
+        voice="nova",
+        response_format="opus",
+        input=text
+    )
     response.stream_to_file(speech_file_path)
 
 def main():
@@ -208,7 +226,8 @@ def main():
     try:
         create_lock()
         api_key = load_api_key()
-        client = openai.Client(api_key=api_key)
+        openai.api_key = api_key
+        client = openai
 
         assistant = create_assistant(client)
         thread = create_thread(client)
@@ -236,4 +255,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Version 0.4
+# Version 0.5 
