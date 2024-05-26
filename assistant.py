@@ -13,6 +13,7 @@ import json
 import keyring
 from pathlib import Path
 import openai
+from openai import OpenAI, AssistantEventHandler
 
 # Configuration for silence detection
 CHUNK = 1024
@@ -227,25 +228,24 @@ def main():
         create_lock()
         api_key = load_api_key()
         openai.api_key = api_key
-        client = openai
 
-        assistant = create_assistant(client)
-        thread = create_thread(client)
+        assistant = create_assistant(openai)
+        thread = create_thread(openai)
 
         play_audio(welcome_file_path)
         send_notification("NixOS Assistant:", "Recording")
         record_audio(recorded_audio_path)
         play_audio(process_file_path)
 
-        transcript = transcribe_audio(client, recorded_audio_path)
+        transcript = transcribe_audio(openai, recorded_audio_path)
         send_notification("You asked:", transcript)
-        add_message_to_thread(client, thread.id, transcript)
+        add_message_to_thread(openai, thread.id, transcript)
 
-        stream_run(client, thread.id, assistant.id)
+        stream_run(openai, thread.id, assistant.id)
 
         play_audio(gotit_file_path)
-        response_text = transcribe_audio(client, recorded_audio_path)
-        synthesize_speech(client, response_text, speech_file_path)
+        response_text = transcribe_audio(openai, recorded_audio_path)
+        synthesize_speech(openai, response_text, speech_file_path)
         send_notification("NixOS Assistant:", "Audio Received")
         play_audio(speech_file_path)
 
@@ -255,4 +255,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Version 0.5 
+# V 0.6
