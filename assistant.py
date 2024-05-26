@@ -8,12 +8,10 @@ import notify2
 import datetime
 import signal
 import numpy as np
-import audioop  # For calculating the RMS
 import sys
 import csv
-import json  # For handling lock file content as JSON
+import json
 import keyring
-from collections import deque
 from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
 
@@ -93,8 +91,8 @@ def check_and_kill_existing_process():
                 if script_pid:
                     os.kill(script_pid, signal.SIGTERM)
                     print(f"Terminated existing script process with PID {script_pid}.")
-                    send_notification("NixOS Assistant:","Silencing output and standing by for your next request!")
-                    sys.exit("Exiting.")                    
+                    send_notification("NixOS Assistant", "Silencing output and standing by for your next request!")
+                    sys.exit("Exiting.")
             except json.JSONDecodeError:
                 print("Lock file is corrupt. Exiting.")
                 sys.exit(1)
@@ -142,7 +140,7 @@ def send_notification(title, message):
     notify2.init('Assistant')
 
     # Create a Notification object
-    n = notify2.Notification(title, message)
+    n = notify2.Notification(str(title), str(message))
     n.set_timeout(30000)  # Time in milliseconds
 
     # Display the notification
@@ -150,13 +148,11 @@ def send_notification(title, message):
 
 def calculate_rms(data):
     """Calculate the root mean square of the audio data."""
-    rms = audioop.rms(data, 2)  # Calculate RMS of the given audio chunk
+    rms = np.sqrt(np.mean(np.square(np.frombuffer(data, dtype=np.int16))))
     return rms
 
 def is_silence(data_chunk, threshold=THRESHOLD):
-    """Check if the given audio data_chunk contains silence defined by the threshold.
-    Simple implementation could be based on average volume."""
-    # Assuming data_chunk is in format pyaudio.paInt16
+    """Check if the given audio data_chunk contains silence defined by the threshold."""
     as_ints = np.frombuffer(data_chunk, dtype=np.int16)
     if np.max(np.abs(as_ints)) < threshold:
         print(np.max(np.abs(as_ints)))
@@ -175,7 +171,6 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
 
     while True:
         data = stream.read(chunk, exception_on_overflow=False)
-        rms = audioop.rms(data, 2)  # Calculate RMS of the audio chunk, 2 because FORMAT is paInt16
         frames.append(data)
         
         if is_silence(data):
@@ -215,7 +210,7 @@ def transcribe_audio(client, audio_file_path):
         
         # Notify the user of the error
         notify2.init('Assistant Error')
-        n = notify2.Notification("NisOS Assistant: API Key Error",
+        n = notify2.Notification("NixOS Assistant: API Key Error",
                                  "Failed to authenticate with the provided API Key. It has been deleted. Please rerun the script and enter a valid API Key.")
         n.show()
         
@@ -306,7 +301,7 @@ def main():
         play_audio(welcome_file_path)
 
         # Record audio
-        send_notification("NixOS Assistant:","Recording")
+        send_notification("NixOS Assistant", "Recording")
         record_audio(recorded_audio_path)
 
         # Play processing audio
@@ -314,12 +309,12 @@ def main():
 
         # Transcribe audio to text
         transcript = transcribe_audio(client, recorded_audio_path)
-        send_notification("You asked:",transcript)
+        send_notification("You asked:", transcript)
         print(f"Transcript: {transcript}")
 
         # Generate a response
         response_text = generate_response(client, assistant.id, thread.id, transcript)
-        send_notification("NixOS Assistant:",response_text)
+        send_notification("NixOS Assistant", response_text)
         print(f"Response: {response_text}")
         log_interaction(transcript, response_text)
 
@@ -330,7 +325,7 @@ def main():
         synthesize_speech(client, response_text, speech_file_path)
 
         # Play the synthesized speech
-        send_notification("NixOS Assistant:","Audio Received")
+        send_notification("NixOS Assistant", "Audio Received")
         play_audio(speech_file_path)
 
     finally:
