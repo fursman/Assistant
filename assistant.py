@@ -244,7 +244,7 @@ def generate_response(client, assistant_id, thread_id, transcript):
                         if output.type == "logs":
                             print(f"\n{output.logs}", flush=True)
 
-    with client.beta.threads.runs.stream(
+    with client.beta.threads.runs.with_streaming_response(
       thread_id=thread_id,
       assistant_id=assistant_id,
       instructions="Please address the user as Jane Doe. The user has a premium account.",
