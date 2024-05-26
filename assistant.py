@@ -13,7 +13,7 @@ import json
 import keyring
 from pathlib import Path
 import openai
-from openai import OpenAI, AssistantEventHandler
+from openai import AssistantEventHandler
 
 # Configuration for silence detection
 CHUNK = 1024
@@ -160,19 +160,19 @@ def transcribe_audio(client, audio_file_path):
     except openai.error.OpenAIError:
         handle_api_error()
 
-def create_assistant(client):
-    return client.Assistants.create(
+def create_assistant():
+    return openai.Assistant.create(
         name="NixOS Assistant",
         instructions="You are an assistant helping with various tasks.",
         tools=[{"type": "code_interpreter"}],
         model="gpt-4"
     )
 
-def create_thread(client):
-    return client.Threads.create()
+def create_thread():
+    return openai.Thread.create()
 
-def add_message_to_thread(client, thread_id, message_content):
-    return client.Threads.messages.create(
+def add_message_to_thread(thread_id, message_content):
+    return openai.Message.create(
         thread_id=thread_id,
         role="user",
         content=message_content
@@ -195,9 +195,9 @@ class MyEventHandler(AssistantEventHandler):
                     if output.type == "logs":
                         print(f"\n{output.logs}", flush=True)
 
-def stream_run(client, thread_id, assistant_id):
+def stream_run(thread_id, assistant_id):
     event_handler = MyEventHandler()
-    with client.Threads.runs.stream(
+    with openai.Thread.stream(
         thread_id=thread_id,
         assistant_id=assistant_id,
         event_handler=event_handler,
@@ -210,8 +210,8 @@ def play_audio(file_path):
     process.wait()
     update_lock_for_ffmpeg_completion()
 
-def synthesize_speech(client, text, speech_file_path):
-    response = client.Audio.speech.create(
+def synthesize_speech(text, speech_file_path):
+    response = openai.Audio.speech.create(
         model="tts-1-hd",
         voice="nova",
         response_format="opus",
@@ -229,8 +229,8 @@ def main():
         api_key = load_api_key()
         openai.api_key = api_key
 
-        assistant = create_assistant(openai)
-        thread = create_thread(openai)
+        assistant = create_assistant()
+        thread = create_thread()
 
         play_audio(welcome_file_path)
         send_notification("NixOS Assistant:", "Recording")
@@ -239,13 +239,13 @@ def main():
 
         transcript = transcribe_audio(openai, recorded_audio_path)
         send_notification("You asked:", transcript)
-        add_message_to_thread(openai, thread.id, transcript)
+        add_message_to_thread(thread.id, transcript)
 
-        stream_run(openai, thread.id, assistant.id)
+        stream_run(thread.id, assistant.id)
 
         play_audio(gotit_file_path)
         response_text = transcribe_audio(openai, recorded_audio_path)
-        synthesize_speech(openai, response_text, speech_file_path)
+        synthesize_speech(response_text, speech_file_path)
         send_notification("NixOS Assistant:", "Audio Received")
         play_audio(speech_file_path)
 
@@ -255,4 +255,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# V 0.6
+# V 0.7
