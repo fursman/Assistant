@@ -37,7 +37,6 @@ assets_directory.mkdir(parents=True, exist_ok=True)  # Ensure the directory exis
 now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 log_csv_path = base_log_dir / "interaction_log.csv"
 recorded_audio_path = base_log_dir / f"input_{now}.wav"
-speech_file_path = base_log_dir / f"response_{now}.mp3"
 lock_file_path = base_log_dir / "script.lock"
 
 welcome_file_path = assets_directory / "welcome.mp3"
@@ -195,78 +194,24 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
     wf.writeframes(b''.join(frames))
     wf.close()
 
-def transcribe_audio(client, audio_file_path):
-    try:
-        with open(audio_file_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text"
-            )
-        return response
-    except Exception as e:  # Catch a broad exception if you're not using openai.error
-        # Delete the stored API key using keyring
-        keyring.delete_password("NixOSAssistant", "APIKey")
-        
-        # Notify the user of the error
-        notify2.init('Assistant Error')
-        n = notify2.Notification("NixOS Assistant: API Key Error",
-                                 "Failed to authenticate with the provided API Key. It has been deleted. Please rerun the script and enter a valid API Key.")
-        n.show()
-        
-        # Exit the script
-        sys.exit("Failed to authenticate with OpenAI. Exiting.")
-
-def generate_response(client, assistant_id, thread_id, transcript):
-    message = client.beta.threads.messages.create(
-      thread_id=thread_id,
-      role="user",
-      content=transcript
-    )
-
-    class EventHandler(AssistantEventHandler):
-        def on_text_created(self, text) -> None:
-            print(f"\nassistant > ", end="", flush=True)
-          
-        def on_text_delta(self, delta, snapshot):
-            print(delta.value, end="", flush=True)
-          
-        def on_tool_call_created(self, tool_call):
-            print(f"\nassistant > {tool_call.type}\n", flush=True)
-      
-        def on_tool_call_delta(self, delta, snapshot):
-            if delta.type == 'code_interpreter':
-                if delta.code_interpreter.input:
-                    print(delta.code_interpreter.input, end="", flush=True)
-                if delta.code_interpreter.outputs:
-                    print(f"\n\noutput >", flush=True)
-                    for output in delta.code_interpreter.outputs:
-                        if output.type == "logs":
-                            print(f"\n{output.logs}", flush=True)
-
-    with client.beta.threads.runs.stream(
-      thread_id=thread_id,
-      assistant_id=assistant_id,
-      instructions="Please address the user as Jane Doe. The user has a premium account.",
-      event_handler=EventHandler(),
-    ) as stream:
-        stream.until_done()
-
-def synthesize_speech(client, text, speech_file_path):
-    response = client.audio.speech.create(
-        model="tts-1-hd",
-        voice="nova",
-        response_format="opus",
-        input=text
-    )
-    response.stream_to_file(speech_file_path)
-
 def play_audio(speech_file_path):
     """Play audio using ffmpeg and update lock file for process management."""
     process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'])
     create_lock(ffmpeg_pid=process.pid)  # Update lock file with ffmpeg PID
     process.wait()  # Wait for the ffmpeg process to finish
     update_lock_for_ffmpeg_completion()  # Remove ffmpeg PID from lock file
+
+class AudioEventHandler(AssistantEventHandler):
+    def __init__(self, audio_output_path):
+        self.audio_output_path = audio_output_path
+        self.audio_file = open(audio_output_path, 'wb')
+
+    def on_audio_delta(self, delta, snapshot):
+        self.audio_file.write(delta.audio.data)
+
+    def on_complete(self):
+        self.audio_file.close()
+        play_audio(self.audio_output_path)
 
 def main():
     # Register signal handlers to ensure clean exit
@@ -307,26 +252,22 @@ def main():
         # Play processing audio
         play_audio(process_file_path)
 
-        # Transcribe audio to text
-        transcript = transcribe_audio(client, recorded_audio_path)
-        send_notification("You asked:", transcript)
-        print(f"Transcript: {transcript}")
+        # Read the recorded audio file
+        with open(recorded_audio_path, "rb") as audio_file:
+            audio_data = audio_file.read()
 
-        # Generate a response
-        response_text = generate_response(client, assistant.id, thread.id, transcript)
-        send_notification("NixOS Assistant", response_text)
-        print(f"Response: {response_text}")
-        log_interaction(transcript, response_text)
+        # Create an event handler for streaming audio
+        audio_output_path = base_log_dir / f"response_audio_{now}.wav"
+        event_handler = AudioEventHandler(audio_output_path)
 
-        # Play gotit audio
-        play_audio(gotit_file_path)
-
-        # Synthesize speech from the response
-        synthesize_speech(client, response_text, speech_file_path)
-
-        # Play the synthesized speech
-        send_notification("NixOS Assistant", "Audio Received")
-        play_audio(speech_file_path)
+        # Stream the audio to the assistant and receive the audio response
+        with client.beta.threads.runs.stream(
+            thread_id=thread.id,
+            assistant_id=assistant.id,
+            audio=audio_data,
+            event_handler=event_handler,
+        ) as stream:
+            stream.until_done()
 
     finally:
         # Ensure the lock file is deleted even if an error occurs
