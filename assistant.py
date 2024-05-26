@@ -218,7 +218,7 @@ def transcribe_audio(client, audio_file_path):
         sys.exit("Failed to authenticate with OpenAI. Exiting.")
 
 def generate_response(client, assistant_id, thread_id, transcript):
-    message = client.beta.threads.messages.create(
+    client.beta.threads.messages.create(
       thread_id=thread_id,
       role="user",
       content=transcript
@@ -229,7 +229,7 @@ def generate_response(client, assistant_id, thread_id, transcript):
             print(f"\nassistant > ", end="", flush=True)
           
         def on_text_delta(self, delta, snapshot):
-            print(delta.value, end="", flush=True)
+            print(delta, end="", flush=True)
           
         def on_tool_call_created(self, tool_call):
             print(f"\nassistant > {tool_call.type}\n", flush=True)
@@ -251,8 +251,13 @@ def generate_response(client, assistant_id, thread_id, transcript):
       event_handler=EventHandler(),
     )
 
+    response_text = []
     with run as stream:
-        stream.until_done()
+        for event in stream:
+            if event['type'] == 'text':
+                response_text.append(event['delta'])
+    
+    return ''.join(response_text)
 
 def synthesize_speech(client, text, speech_file_path):
     if not text:
@@ -297,7 +302,7 @@ def main():
           name="NixOS Assistant",
           instructions="You are a helpful assistant.",
           tools=[],
-          model="gpt-4o",
+          model="gpt-4-turbo",
         )
 
         # Create a thread
