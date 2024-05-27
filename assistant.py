@@ -240,6 +240,7 @@ def add_message(client, thread_id, content):
 
 class CustomEventHandler(AssistantEventHandler):
     def __init__(self):
+        super().__init__()
         self.response_text = ""
 
     def on_text_created(self, text) -> None:
