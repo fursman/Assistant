@@ -245,11 +245,11 @@ class CustomEventHandler(AssistantEventHandler):
 
     def on_text_created(self, text) -> None:
         print(f"\nassistant > ", end="", flush=True)
-        self.response_text += text
+        self.response_text += str(text)
 
     def on_text_delta(self, delta, snapshot):
         print(delta.value, end="", flush=True)
-        self.response_text += delta.value
+        self.response_text += str(delta.value)
 
 def run_assistant(client, thread_id, assistant_id):
     event_handler = CustomEventHandler()
