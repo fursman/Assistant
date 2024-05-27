@@ -187,7 +187,7 @@ def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
         instructions="You are a helpful assistant.",
-        model="gpt-4o"
+        model="gpt-4-turbo-preview"
     )
     return assistant
 
@@ -218,11 +218,16 @@ def generate_response(client, assistant_id, thread_id, transcript):
         assistant_id=assistant_id
     )
 
-    if hasattr(response, 'choices') and response.choices:
-        response_text = response.choices[0].message.content.strip()
-    else:
-        response_text = "I'm sorry, I could not generate a response. Please try again."
-        log_interaction("Error", str(response))
+    # Improved error handling and logging
+    try:
+        if hasattr(response, 'choices') and response.choices:
+            response_text = response.choices[0].message.content.strip()
+        else:
+            response_text = "I'm sorry, I could not generate a response. Please try again."
+            log_interaction("Error", str(response))
+    except Exception as e:
+        response_text = f"An error occurred: {str(e)}"
+        log_interaction("Exception", response_text)
 
     return response_text
 
