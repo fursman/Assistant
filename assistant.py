@@ -8,10 +8,9 @@ import notify2
 import datetime
 import signal
 import numpy as np
-import audioop  # For calculating the RMS
 import sys
 import csv
-import json  # For handling lock file content as JSON
+import json
 import select
 import keyring
 from collections import deque
@@ -151,11 +150,6 @@ def send_notification(title, message):
     # Display the notification
     n.show()
 
-def calculate_rms(data):
-    """Calculate the root mean square of the audio data."""
-    rms = audioop.rms(data, 2)  # Calculate RMS of the given audio chunk
-    return rms
-
 def is_silence(data_chunk, threshold=THRESHOLD):
     """Check if the given audio data_chunk contains silence defined by the threshold.
     Simple implementation could be based on average volume."""
@@ -178,7 +172,6 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
 
     while True:
         data = stream.read(chunk, exception_on_overflow=False)
-        rms = audioop.rms(data, 2)  # Calculate RMS of the audio chunk, 2 because FORMAT is paInt16
         frames.append(data)
         
         if is_silence(data):
@@ -229,14 +222,15 @@ def synthesize_speech(client, text, speech_file_path):
     response = client.audio.speech.create(
         model="tts-1-hd",
         voice="nova",
-        response_format="opus",
+        response_format="mp3",
         input=text
     )
-    response.stream_to_file(speech_file_path)
+    with open(speech_file_path, "wb") as file:
+        file.write(response)
 
-def play_audio(speech_file_path):
+def play_audio(audio_file_path):
     """Play audio using ffmpeg and update lock file for process management."""
-    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'])
+    process = subprocess.Popen(['ffmpeg', '-i', str(audio_file_path), '-f', 'alsa', 'default'])
     create_lock(ffmpeg_pid=process.pid)  # Update lock file with ffmpeg PID
     process.wait()  # Wait for the ffmpeg process to finish
     update_lock_for_ffmpeg_completion()  # Remove ffmpeg PID from lock file
@@ -266,8 +260,8 @@ class EventHandler(AssistantEventHandler):
 def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
-        instructions="You are an assistant integrated into a NixOS environment helping a user with their requests.",
-        model="gpt-4o"
+        instructions="You are an assistant integrated into a NixOS environment.",
+        model="gpt-4-turbo"
     )
     return assistant
 
