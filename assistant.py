@@ -220,11 +220,12 @@ def generate_response(client, assistant_id, thread_id, transcript):
 
     # Improved error handling and logging
     try:
-        if hasattr(response, 'choices') and response.choices:
-            response_text = response.choices[0].message.content.strip()
+        response_data = response.to_dict()
+        if 'choices' in response_data and response_data['choices']:
+            response_text = response_data['choices'][0]['message']['content'].strip()
         else:
             response_text = "I'm sorry, I could not generate a response. Please try again."
-            log_interaction("Error", str(response))
+            log_interaction("Error", json.dumps(response_data))
     except Exception as e:
         response_text = f"An error occurred: {str(e)}"
         log_interaction("Exception", response_text)
