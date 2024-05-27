@@ -13,6 +13,7 @@ import csv
 import json  # For handling lock file content as JSON
 import select
 import keyring
+import re
 from collections import deque
 from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
@@ -22,7 +23,7 @@ CHUNK = 1024  # Number of bytes to read from the mic per sample
 FORMAT = pyaudio.paInt16  # Audio format
 CHANNELS = 1  # Number of audio channels
 RATE = 22050  # Sampling rate
-THRESHOLD = 40  # Threshold for silence/noise
+THRESHOLD = 1000  # Threshold for silence/noise
 SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
@@ -245,11 +246,11 @@ class CustomEventHandler(AssistantEventHandler):
 
     def on_text_created(self, text) -> None:
         print(f"\nassistant > ", end="", flush=True)
-        self.response_text += str(text)
+        self.response_text += text.value
 
     def on_text_delta(self, delta, snapshot):
         print(delta.value, end="", flush=True)
-        self.response_text += str(delta.value)
+        self.response_text += delta.value
 
 def run_assistant(client, thread_id, assistant_id):
     event_handler = CustomEventHandler()
@@ -264,12 +265,8 @@ def run_assistant(client, thread_id, assistant_id):
     return event_handler.response_text
 
 def clean_response_text(response_text):
-    # This function should be adjusted based on the specific format of the responses.
-    # For example, if the response text includes metadata prefixed with "text annotation" or similar,
-    # we can strip that out here. Adjust the logic as needed.
-    lines = response_text.split('\n')
-    cleaned_lines = [line for line in lines if not line.lower().startswith("TEXT(annotations")]
-    return ' '.join(cleaned_lines).strip()
+    # Since we are now directly capturing the value of the text, no need to clean it
+    return response_text
 
 def synthesize_speech(client, text, speech_file_path):
     response = client.audio.speech.create(
