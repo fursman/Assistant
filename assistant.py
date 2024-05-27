@@ -23,7 +23,7 @@ CHUNK = 1024  # Number of bytes to read from the mic per sample
 FORMAT = pyaudio.paInt16  # Audio format
 CHANNELS = 1  # Number of audio channels
 RATE = 22050  # Sampling rate
-THRESHOLD = 1000  # Threshold for silence/noise
+THRESHOLD = 20  # Threshold for silence/noise
 SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
