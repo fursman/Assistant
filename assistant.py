@@ -38,6 +38,7 @@ log_csv_path = base_log_dir / "interaction_log.csv"
 recorded_audio_path = base_log_dir / f"input_{now}.wav"
 speech_file_path = base_log_dir / f"response_{now}.mp3"
 lock_file_path = base_log_dir / "script.lock"
+assistant_data_file = base_log_dir / "assistant_data.json"
 
 welcome_file_path = assets_directory / "welcome.mp3"
 process_file_path = assets_directory / "process.mp3"
@@ -236,14 +237,23 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     check_and_kill_existing_process()
-    
+
     try:
         create_lock()
-        
+
         api_key = load_api_key()
         client = OpenAI(api_key=api_key)
-        assistant_id = create_assistant(client)
-        thread_id = create_thread(client)
+
+        if assistant_data_file.exists():
+            with open(assistant_data_file, 'r') as f:
+                assistant_data = json.load(f)
+            assistant_id = assistant_data['assistant_id']
+            thread_id = assistant_data['thread_id']
+        else:
+            assistant_id = create_assistant(client)
+            thread_id = create_thread(client)
+            with open(assistant_data_file, 'w') as f:
+                json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
 
         play_audio(welcome_file_path)
         send_notification("NixOS Assistant:", "Recording")
