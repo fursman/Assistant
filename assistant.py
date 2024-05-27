@@ -11,7 +11,6 @@ import numpy as np
 import sys
 import csv
 import json
-import select
 import keyring
 from collections import deque
 from pathlib import Path
@@ -95,8 +94,8 @@ def check_and_kill_existing_process():
                 if script_pid:
                     os.kill(script_pid, signal.SIGTERM)
                     print(f"Terminated existing script process with PID {script_pid}.")
-                    send_notification("NixOS Assistant:","Silencing output and standing by for your next request!")
-                    sys.exit("Exiting.")                    
+                    send_notification("NixOS Assistant:", "Silencing output and standing by for your next request!")
+                    sys.exit("Exiting.")
             except json.JSONDecodeError:
                 print("Lock file is corrupt. Exiting.")
                 sys.exit(1)
@@ -144,7 +143,7 @@ def send_notification(title, message):
     notify2.init('Assistant')
 
     # Create a Notification object
-    n = notify2.Notification(title, message)
+    n = notify2.Notification(title, str(message))
     n.set_timeout(30000)  # Time in milliseconds
 
     # Display the notification
@@ -226,7 +225,7 @@ def synthesize_speech(client, text, speech_file_path):
         input=text
     )
     with open(speech_file_path, "wb") as file:
-        file.write(response)
+        file.write(response.content)
 
 def play_audio(audio_file_path):
     """Play audio using ffmpeg and update lock file for process management."""
@@ -261,7 +260,7 @@ def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
         instructions="You are an assistant integrated into a NixOS environment.",
-        model="gpt-4-turbo"
+        model="gpt-4o"
     )
     return assistant
 
@@ -299,7 +298,7 @@ def main():
 
         # Transcribe audio to text
         transcript = transcribe_audio(client, recorded_audio_path)
-        send_notification("You asked:",transcript)
+        send_notification("You asked:", transcript)
         print(f"Transcript: {transcript}")
 
         # Add message to thread
@@ -319,7 +318,7 @@ def main():
 
         # Extract the final response from the thread
         response_text = message.content
-        send_notification("NixOS Assistant:",response_text)
+        send_notification("NixOS Assistant:", response_text)
         print(f"Response: {response_text}")
         log_interaction(transcript, response_text)
 
@@ -330,7 +329,7 @@ def main():
         synthesize_speech(client, response_text, speech_file_path)
 
         # Play the synthesized speech
-        send_notification("NixOS Assistant:","Audio Received")
+        send_notification("NixOS Assistant:", "Audio Received")
         play_audio(speech_file_path)
 
     finally:
