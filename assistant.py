@@ -260,9 +260,17 @@ def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
         instructions="You are an assistant integrated into a NixOS environment.",
-        model="gpt-4o"
+        model="gpt-4-turbo"
     )
     return assistant
+
+def extract_text_from_response(response):
+    # Extract the content from the response object
+    if 'choices' in response and len(response['choices']) > 0:
+        message = response['choices'][0]['message']
+        if 'content' in message:
+            return message['content']
+    return ""
 
 def main():
     # Register signal handlers to ensure clean exit
@@ -316,8 +324,8 @@ def main():
         ) as stream:
             stream.until_done()
 
-        # Extract the final response from the thread
-        response_text = message.content
+        # Extract the final response text
+        response_text = extract_text_from_response(message)
         send_notification("NixOS Assistant:", response_text)
         print(f"Response: {response_text}")
         log_interaction(transcript, response_text)
