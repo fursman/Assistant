@@ -267,11 +267,9 @@ def create_assistant(client):
     )
     return assistant
 
-def extract_text_from_response(response):
-    # Extract the content from the response object
-    if 'choices' in response and len(response['choices']) > 0:
-        message = response['choices'][0]['message']
-        if 'content' in message:
+def extract_text_from_messages(messages):
+    for message in messages:
+        if message['role'] == 'assistant' and 'content' in message:
             return message['content']
     return ""
 
@@ -313,7 +311,7 @@ def main():
         print(f"Transcript: {transcript}")
 
         # Add message to thread
-        message = client.beta.threads.messages.create(
+        client.beta.threads.messages.create(
             thread_id=thread.id,
             role="user",
             content=transcript
@@ -327,8 +325,10 @@ def main():
         ) as stream:
             stream.until_done()
 
-        # Extract the final response text
-        response_text = extract_text_from_response(message)
+        # Fetch the final response text
+        thread_messages = client.beta.threads.messages.list(thread_id=thread.id)
+        response_text = extract_text_from_messages(thread_messages)
+
         if not response_text.strip():
             raise ValueError("The assistant's response text is empty.")
         
