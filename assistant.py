@@ -246,7 +246,11 @@ class CustomEventHandler(AssistantEventHandler):
 
     def on_text_created(self, text) -> None:
         print(f"\nassistant > ", end="", flush=True)
-        self.response_text += text.value
+        if not self.initialized:
+            self.response_text = text.value
+            self.initialized = True
+        else:
+            self.response_text += text.value
 
     def on_text_delta(self, delta, snapshot):
         print(delta.value, end="", flush=True)
