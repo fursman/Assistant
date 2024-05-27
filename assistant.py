@@ -218,6 +218,9 @@ def transcribe_audio(client, audio_file_path):
         sys.exit("Failed to authenticate with OpenAI. Exiting.")
 
 def synthesize_speech(client, text, speech_file_path):
+    if not text.strip():
+        raise ValueError("Response text is empty.")
+    
     response = client.audio.speech.create(
         model="tts-1-hd",
         voice="nova",
@@ -326,6 +329,9 @@ def main():
 
         # Extract the final response text
         response_text = extract_text_from_response(message)
+        if not response_text.strip():
+            raise ValueError("The assistant's response text is empty.")
+        
         send_notification("NixOS Assistant:", response_text)
         print(f"Response: {response_text}")
         log_interaction(transcript, response_text)
