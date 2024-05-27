@@ -264,10 +264,6 @@ def run_assistant(client, thread_id, assistant_id):
 
     return event_handler.response_text
 
-def clean_response_text(response_text):
-    # Since we are now directly capturing the value of the text, no need to clean it
-    return response_text
-
 def synthesize_speech(client, text, speech_file_path):
     response = client.audio.speech.create(
         model="tts-1-hd",
@@ -325,16 +321,15 @@ def main():
         # Add user message and run assistant
         add_message(client, thread_id, transcript)
         response_text = run_assistant(client, thread_id, assistant_id)
-        cleaned_response_text = clean_response_text(response_text)
-        send_notification("NixOS Assistant:", cleaned_response_text)
-        print(f"Response: {cleaned_response_text}")
-        log_interaction(transcript, cleaned_response_text)
+        send_notification("NixOS Assistant:", response_text)
+        print(f"Response: {response_text}")
+        log_interaction(transcript, response_text)
 
         # Play gotit audio
         play_audio(gotit_file_path)
 
         # Synthesize speech from the response
-        synthesize_speech(client, cleaned_response_text, speech_file_path)
+        synthesize_speech(client, response_text, speech_file_path)
 
         # Play the synthesized speech
         send_notification("NixOS Assistant:", "Audio Received")
