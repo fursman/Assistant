@@ -268,7 +268,7 @@ def clean_response_text(response_text):
     # For example, if the response text includes metadata prefixed with "text annotation" or similar,
     # we can strip that out here. Adjust the logic as needed.
     lines = response_text.split('\n')
-    cleaned_lines = [line for line in lines if not line.lower().startswith("text annotation")]
+    cleaned_lines = [line for line in lines if not line.lower().startswith("TEXT(annotations")]
     return ' '.join(cleaned_lines).strip()
 
 def synthesize_speech(client, text, speech_file_path):
