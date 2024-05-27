@@ -225,7 +225,8 @@ def synthesize_speech(client, text, speech_file_path):
         f.write(response.content)
 
 def play_audio(speech_file_path):
-    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'])
+    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     create_lock(ffmpeg_pid=process.pid)
     process.wait()
     update_lock_for_ffmpeg_completion()
