@@ -22,7 +22,7 @@ CHUNK = 1024  # Number of bytes to read from the mic per sample
 FORMAT = pyaudio.paInt16  # Audio format
 CHANNELS = 1  # Number of audio channels
 RATE = 22050  # Sampling rate
-THRESHOLD = 70  # Threshold for silence/noise
+THRESHOLD = 40  # Threshold for silence/noise
 SILENCE_LIMIT = 1  # Maximum length of silence in seconds before stopping
 PREV_AUDIO_DURATION = 0.5  # Duration of audio to keep before detected speech
 
@@ -263,6 +263,14 @@ def run_assistant(client, thread_id, assistant_id):
 
     return event_handler.response_text
 
+def clean_response_text(response_text):
+    # This function should be adjusted based on the specific format of the responses.
+    # For example, if the response text includes metadata prefixed with "text annotation" or similar,
+    # we can strip that out here. Adjust the logic as needed.
+    lines = response_text.split('\n')
+    cleaned_lines = [line for line in lines if not line.lower().startswith("text annotation")]
+    return ' '.join(cleaned_lines).strip()
+
 def synthesize_speech(client, text, speech_file_path):
     response = client.audio.speech.create(
         model="tts-1-hd",
@@ -320,15 +328,16 @@ def main():
         # Add user message and run assistant
         add_message(client, thread_id, transcript)
         response_text = run_assistant(client, thread_id, assistant_id)
-        send_notification("NixOS Assistant:", response_text)
-        print(f"Response: {response_text}")
-        log_interaction(transcript, response_text)
+        cleaned_response_text = clean_response_text(response_text)
+        send_notification("NixOS Assistant:", cleaned_response_text)
+        print(f"Response: {cleaned_response_text}")
+        log_interaction(transcript, cleaned_response_text)
 
         # Play gotit audio
         play_audio(gotit_file_path)
 
         # Synthesize speech from the response
-        synthesize_speech(client, response_text, speech_file_path)
+        synthesize_speech(client, cleaned_response_text, speech_file_path)
 
         # Play the synthesized speech
         send_notification("NixOS Assistant:", "Audio Received")
