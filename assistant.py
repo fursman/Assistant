@@ -232,6 +232,14 @@ def play_audio(speech_file_path):
     process.wait()
     update_lock_for_ffmpeg_completion()
 
+def get_context(question):
+    context = question
+    if "nixos" in question.lower():
+        with open('/etc/nixos/flake.nix', 'r') as file:
+            nixos_config = file.read()
+        context += f"\n\nIn case the user asks about their system, this is the current flake.nix configuration:\n{nixos_config}"
+    return context
+
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -261,8 +269,9 @@ def main():
         play_audio(process_file_path)
 
         transcript = transcribe_audio(client, recorded_audio_path)
+        context = get_context(transcript)
         send_notification("You asked:", transcript)
-        add_message(client, thread_id, transcript)
+        add_message(client, thread_id, context)
         response_text = run_assistant(client, thread_id, assistant_id)
         send_notification("NixOS Assistant:", response_text)
         log_interaction(transcript, response_text)
