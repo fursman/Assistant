@@ -62,7 +62,7 @@ def load_api_key():
         play_audio(apikey_file_path)
         input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
         api_key = subprocess.check_output(input_cmd, shell=True, text=True).strip()
-
+        
         # Store the new API key securely
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
@@ -150,19 +150,15 @@ def send_notification(title, message):
 
 def calculate_rms(data):
     """Calculate the root mean square of the audio data."""
-    rms = audioop.rms(data, 2)  # Calculate RMS of the given audio chunk
+    as_ints = np.frombuffer(data, dtype=np.int16)
+    rms = np.sqrt(np.mean(np.square(as_ints)))
     return rms
 
 def is_silence(data_chunk, threshold=THRESHOLD):
-    """Check if the given audio data_chunk contains silence defined by the threshold.
-    Simple implementation could be based on average volume."""
-    # Assuming data_chunk is in format pyaudio.paInt16
-    as_ints = np.frombuffer(data_chunk, dtype=np.int16)
-    if np.max(np.abs(as_ints)) < threshold:
-        print(np.max(np.abs(as_ints)))
-        return True
-    print(np.max(np.abs(as_ints)))
-    return False
+    """Check if the given audio data_chunk contains silence defined by the threshold."""
+    rms = calculate_rms(data_chunk)
+    print(f"RMS: {rms}")
+    return rms < threshold
 
 def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
     audio = pyaudio.PyAudio()
@@ -175,7 +171,6 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
 
     while True:
         data = stream.read(chunk, exception_on_overflow=False)
-        rms = audioop.rms(data, 2)  # Calculate RMS of the audio chunk, 2 because FORMAT is paInt16
         frames.append(data)
         
         if is_silence(data):
