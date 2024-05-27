@@ -238,22 +238,29 @@ def add_message(client, thread_id, content):
     )
     return message
 
+class CustomEventHandler(AssistantEventHandler):
+    def __init__(self):
+        self.response_text = ""
+
+    def on_text_created(self, text) -> None:
+        print(f"\nassistant > ", end="", flush=True)
+        self.response_text += text
+
+    def on_text_delta(self, delta, snapshot):
+        print(delta.value, end="", flush=True)
+        self.response_text += delta.value
+
 def run_assistant(client, thread_id, assistant_id):
-    class EventHandler(AssistantEventHandler):
-        def on_text_created(self, text) -> None:
-            print(f"\nassistant > ", end="", flush=True)
-        
-        def on_text_delta(self, delta, snapshot):
-            print(delta.value, end="", flush=True)
-    
+    event_handler = CustomEventHandler()
+
     with client.beta.threads.runs.stream(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        event_handler=EventHandler(),
+        event_handler=event_handler,
     ) as stream:
         stream.until_done()
-        response_text = stream.get_final_response().text
-    return response_text
+
+    return event_handler.response_text
 
 def synthesize_speech(client, text, speech_file_path):
     response = client.audio.speech.create(
@@ -262,7 +269,8 @@ def synthesize_speech(client, text, speech_file_path):
         response_format="opus",
         input=text
     )
-    response.stream_to_file(speech_file_path)
+    with open(speech_file_path, 'wb') as f:
+        f.write(response.content)
 
 def play_audio(speech_file_path):
     """Play audio using ffmpeg and update lock file for process management."""
