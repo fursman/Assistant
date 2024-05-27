@@ -15,8 +15,6 @@ import keyring
 from collections import deque
 from pathlib import Path
 from openai import OpenAI
-from openai import AssistantEventHandler
-from typing_extensions import override
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024  # Number of bytes to read from the mic per sample
@@ -237,32 +235,6 @@ def play_audio(audio_file_path):
     process.wait()  # Wait for the ffmpeg process to finish
     update_lock_for_ffmpeg_completion()  # Remove ffmpeg PID from lock file
 
-class EventHandler(AssistantEventHandler):    
-    @override
-    def on_text_created(self, text) -> None:
-        print(f"\nassistant > ", end="", flush=True)
-
-    @override
-    def on_text_delta(self, delta, snapshot):
-        print(delta.value, end="", flush=True)
-        # Ensure response text is updated dynamically
-        if 'response_text' not in snapshot:
-            snapshot['response_text'] = ''
-        snapshot['response_text'] += delta.value
-
-    def on_tool_call_created(self, tool_call):
-        print(f"\nassistant > {tool_call.type}\n", flush=True)
-
-    def on_tool_call_delta(self, delta, snapshot):
-        if delta.type == 'code_interpreter':
-            if delta.code_interpreter.input:
-                print(delta.code_interpreter.input, end="", flush=True)
-            if delta.code_interpreter.outputs:
-                print(f"\n\noutput >", flush=True)
-                for output in delta.code_interpreter.outputs:
-                    if output.type == "logs":
-                        print(f"\n{output.logs}", flush=True)
-
 def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
@@ -315,17 +287,14 @@ def main():
             content=transcript
         )
 
-        # Create and stream a run
-        event_handler = EventHandler()
-        with client.beta.threads.runs.stream(
+        # Get the assistant's response
+        response = client.beta.threads.runs.create(
             thread_id=thread.id,
-            assistant_id=assistant.id,
-            event_handler=event_handler,
-        ) as stream:
-            stream.until_done()
+            assistant_id=assistant.id
+        )
 
-        # Fetch the final response text from the event handler
-        response_text = event_handler.snapshot.get('response_text', '')
+        # Extract the response text
+        response_text = response['choices'][0]['message']['content']
 
         if not response_text.strip():
             raise ValueError("The assistant's response text is empty.")
