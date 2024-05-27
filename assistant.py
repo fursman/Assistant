@@ -245,6 +245,10 @@ class EventHandler(AssistantEventHandler):
     @override
     def on_text_delta(self, delta, snapshot):
         print(delta.value, end="", flush=True)
+        # Ensure response text is updated dynamically
+        if 'response_text' not in snapshot:
+            snapshot['response_text'] = ''
+        snapshot['response_text'] += delta.value
 
     def on_tool_call_created(self, tool_call):
         print(f"\nassistant > {tool_call.type}\n", flush=True)
@@ -266,12 +270,6 @@ def create_assistant(client):
         model="gpt-4-turbo"
     )
     return assistant
-
-def extract_text_from_messages(messages):
-    for message in messages:
-        if message['role'] == 'assistant' and 'content' in message:
-            return message['content']
-    return ""
 
 def main():
     # Register signal handlers to ensure clean exit
@@ -318,16 +316,16 @@ def main():
         )
 
         # Create and stream a run
+        event_handler = EventHandler()
         with client.beta.threads.runs.stream(
             thread_id=thread.id,
             assistant_id=assistant.id,
-            event_handler=EventHandler(),
+            event_handler=event_handler,
         ) as stream:
             stream.until_done()
 
-        # Fetch the final response text
-        thread_messages = client.beta.threads.messages.list(thread_id=thread.id)
-        response_text = extract_text_from_messages(thread_messages)
+        # Fetch the final response text from the event handler
+        response_text = event_handler.snapshot.get('response_text', '')
 
         if not response_text.strip():
             raise ValueError("The assistant's response text is empty.")
