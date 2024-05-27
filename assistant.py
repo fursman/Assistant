@@ -187,7 +187,7 @@ def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
         instructions="You are a helpful assistant.",
-        model="gpt-4-turbo-preview"
+        model="gpt-4o"
     )
     return assistant
 
@@ -218,7 +218,12 @@ def generate_response(client, assistant_id, thread_id, transcript):
         assistant_id=assistant_id
     )
 
-    response_text = response.choices[0].message.content.strip()
+    if hasattr(response, 'choices') and response.choices:
+        response_text = response.choices[0].message.content.strip()
+    else:
+        response_text = "I'm sorry, I could not generate a response. Please try again."
+        log_interaction("Error", str(response))
+
     return response_text
 
 def synthesize_speech(client, text, speech_file_path):
