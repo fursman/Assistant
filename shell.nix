@@ -6,7 +6,7 @@
 
 (pkgs.mkShell.override { stdenv = pkgs.gcc11Stdenv; }) {
   buildInputs = [
-    (pkgs.python3.withPackages (ps: [ ps.numpy ps.pyaudio ps.notify2 ps.keyring ]))
+    (pkgs.python3.withPackages (ps: [ ps.numpy ps.pyaudio ps.notify2 ps.keyring ps.requests ps.openai ]))
     pkgs.virtualenv
     pkgs.portaudio
     pkgs.ffmpeg-full
