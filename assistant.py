@@ -240,10 +240,12 @@ def get_context(question):
         context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
     if "clipboard" in question.lower():
         try:
-            clipboard_content = subprocess.check_output(['xclip', '-selection', 'clipboard', '-o'], text=True)
+            clipboard_content = subprocess.check_output(['wl-paste'], text=True)
             context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
         except subprocess.CalledProcessError as e:
-            context += "\n\nFailed to retrieve clipboard content."
+            context += "\n\nFailed to retrieve clipboard content. The clipboard might be empty or contain non-text data."
+        except Exception as e:
+            context += f"\n\nAn unexpected error occurred while retrieving clipboard content: {e}"
     return context
 
 def main():
