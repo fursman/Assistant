@@ -10,6 +10,7 @@
     pkgs.virtualenv
     pkgs.portaudio
     pkgs.ffmpeg-full
+    pkgs.gnome.zenity
   ];
   shellHook = ''
     DIR="${builtins.toPath ./.}"
