@@ -11,7 +11,7 @@
     pkgs.portaudio
     pkgs.ffmpeg-full
     pkgs.gnome.zenity
-    pkgs.xclip
+    pkgs.wl-clipboard
   ];
   shellHook = ''
     DIR="${builtins.toPath ./.}"
