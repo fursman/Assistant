@@ -237,7 +237,13 @@ def get_context(question):
     if "nixos" in question.lower():
         with open('/etc/nixos/flake.nix', 'r') as file:
             nixos_config = file.read()
-        context += f"\n\nIn case the user asks about their system, this is the current flake.nix configuration:\n{nixos_config}"
+        context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
+    if "clipboard" in question.lower():
+        try:
+            clipboard_content = subprocess.check_output(['xclip', '-selection', 'clipboard', '-o'], text=True)
+            context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
+        except subprocess.CalledProcessError as e:
+            context += "\n\nFailed to retrieve clipboard content."
     return context
 
 def main():
