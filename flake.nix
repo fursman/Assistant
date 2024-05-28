@@ -34,7 +34,7 @@
             pythonEnv
             pkgs.ffmpeg-full
             pkgs.portaudio
-            pkgs.xclip
+            pkgs.wl-clipboard
             pkgs.gnome.zenity
           ];
 
