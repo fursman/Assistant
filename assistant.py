@@ -14,6 +14,17 @@ import json
 import keyring
 from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Redirect stderr to /dev/null
+class DevNull:
+    def write(self, msg):
+        pass
+
+sys.stderr = DevNull()
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
