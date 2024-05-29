@@ -22,6 +22,7 @@
           ps.numpy
           ps.notify2
           ps.keyring
+          ps.pygame
           ps.openai
         ]);
 
