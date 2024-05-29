@@ -147,8 +147,9 @@ def is_silence(data_chunk, threshold=THRESHOLD):
     return rms < threshold
 
 def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
-    audio = pyaudio.PyAudio()
-    stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
+    with suppress_output():
+        audio = pyaudio.PyAudio()
+        stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
 
     frames = []
     silent_frames = 0
@@ -245,11 +246,12 @@ def synthesize_speech(client, text, speech_file_path):
         f.write(response.content)
 
 def play_audio(speech_file_path):
-    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    create_lock(ffmpeg_pid=process.pid)
-    process.wait()
-    update_lock_for_ffmpeg_completion()
+    with suppress_output():
+        process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        create_lock(ffmpeg_pid=process.pid)
+        process.wait()
+        update_lock_for_ffmpeg_completion()
 
 def get_context(question):
     context = question
@@ -269,48 +271,48 @@ def get_context(question):
 
 def main():
     with suppress_output():
-      signal.signal(signal.SIGINT, signal_handler)
-      signal.signal(signal.SIGTERM, signal_handler)
-  
-      check_and_kill_existing_process()
-  
-      try:
-          create_lock()
-  
-          api_key = load_api_key()
-          client = OpenAI(api_key=api_key)
-  
-          if assistant_data_file.exists():
-              with open(assistant_data_file, 'r') as f:
-                  assistant_data = json.load(f)
-              assistant_id = assistant_data['assistant_id']
-              thread_id = assistant_data['thread_id']
-          else:
-              assistant_id = create_assistant(client)
-              thread_id = create_thread(client)
-              with open(assistant_data_file, 'w') as f:
-                  json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
-  
-          play_audio(welcome_file_path)
-          send_notification("NixOS Assistant:", "Recording")
-          record_audio(recorded_audio_path)
-          play_audio(process_file_path)
-  
-          transcript = transcribe_audio(client, recorded_audio_path)
-          context = get_context(transcript)
-          send_notification("You asked:", transcript)
-          add_message(client, thread_id, context)
-          response_text = run_assistant(client, thread_id, assistant_id)
-          send_notification("NixOS Assistant:", response_text)
-          log_interaction(transcript, response_text)
-  
-          play_audio(gotit_file_path)
-          synthesize_speech(client, response_text, speech_file_path)
-          send_notification("NixOS Assistant:", "Audio Received")
-          play_audio(speech_file_path)
-  
-      finally:
-          delete_lock()
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        check_and_kill_existing_process()
+
+        try:
+            create_lock()
+
+            api_key = load_api_key()
+            client = OpenAI(api_key=api_key)
+
+            if assistant_data_file.exists():
+                with open(assistant_data_file, 'r') as f:
+                    assistant_data = json.load(f)
+                assistant_id = assistant_data['assistant_id']
+                thread_id = assistant_data['thread_id']
+            else:
+                assistant_id = create_assistant(client)
+                thread_id = create_thread(client)
+                with open(assistant_data_file, 'w') as f:
+                    json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
+
+            play_audio(welcome_file_path)
+            send_notification("NixOS Assistant:", "Recording")
+            record_audio(recorded_audio_path)
+            play_audio(process_file_path)
+
+            transcript = transcribe_audio(client, recorded_audio_path)
+            context = get_context(transcript)
+            send_notification("You asked:", transcript)
+            add_message(client, thread_id, context)
+            response_text = run_assistant(client, thread_id, assistant_id)
+            send_notification("NixOS Assistant:", response_text)
+            log_interaction(transcript, response_text)
+
+            play_audio(gotit_file_path)
+            synthesize_speech(client, response_text, speech_file_path)
+            send_notification("NixOS Assistant:", "Audio Received")
+            play_audio(speech_file_path)
+
+        finally:
+            delete_lock()
 
 if __name__ == "__main__":
     main()
