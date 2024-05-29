@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import warnings
 import os
 import pyaudio
 import wave
@@ -14,23 +15,13 @@ import json
 import keyring
 from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
-import warnings
-import contextlib
-import logging
 
-# Suppress specific warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+# Suppress ALSA lib warnings
+os.environ["PYTHONWARNINGS"] = "ignore"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Set up logging to capture all stderr output
-logging.basicConfig(level=logging.CRITICAL, handlers=[logging.FileHandler("/dev/null")])
-
-# Function to suppress stderr and stdout
-@contextlib.contextmanager
-def suppress_output():
-    with open(os.devnull, 'w') as devnull:
-        with contextlib.redirect_stderr(devnull):
-            with contextlib.redirect_stdout(devnull):
-                yield
+# Suppress ALSA lib warnings by redirecting stderr
+sys.stderr = open(os.devnull, 'w')
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -71,8 +62,7 @@ def load_api_key():
     if not api_key:
         play_audio(apikey_file_path)
         input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
-        with suppress_output():
-            api_key = subprocess.check_output(input_cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+        api_key = subprocess.check_output(input_cmd, shell=True, text=True).strip()
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
         else:
@@ -146,27 +136,26 @@ def is_silence(data_chunk, threshold=THRESHOLD):
     return rms < threshold
 
 def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
-    with suppress_output():
-        audio = pyaudio.PyAudio()
-        stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
 
-        frames = []
-        silent_frames = 0
-        silence_threshold = int(rate / chunk * silence_limit)
+    frames = []
+    silent_frames = 0
+    silence_threshold = int(rate / chunk * silence_limit)
 
-        while True:
-            data = stream.read(chunk, exception_on_overflow=False)
-            frames.append(data)
-            if is_silence(data):
-                silent_frames += 1
-                if silent_frames >= silence_threshold:
-                    break
-            else:
-                silent_frames = 0
+    while True:
+        data = stream.read(chunk, exception_on_overflow=False)
+        frames.append(data)
+        if is_silence(data):
+            silent_frames += 1
+            if silent_frames >= silence_threshold:
+                break
+        else:
+            silent_frames = 0
 
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
+    stream.stop_stream()
+    stream.close()
+    audio.terminate()
 
     wf = wave.open(str(file_path), 'wb')
     wf.setnchannels(channels)
@@ -245,12 +234,11 @@ def synthesize_speech(client, text, speech_file_path):
         f.write(response.content)
 
 def play_audio(speech_file_path):
-    with suppress_output():
-        process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        create_lock(ffmpeg_pid=process.pid)
-        process.wait()
-        update_lock_for_ffmpeg_completion()
+    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    create_lock(ffmpeg_pid=process.pid)
+    process.wait()
+    update_lock_for_ffmpeg_completion()
 
 def get_context(question):
     context = question
@@ -260,7 +248,7 @@ def get_context(question):
         context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
     if "clipboard" in question.lower():
         try:
-            clipboard_content = subprocess.check_output(['wl-paste'], text=True, stderr=subprocess.DEVNULL)
+            clipboard_content = subprocess.check_output(['wl-paste'], text=True)
             context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
         except subprocess.CalledProcessError as e:
             context += "\n\nFailed to retrieve clipboard content. The clipboard might be empty or contain non-text data."
