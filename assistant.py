@@ -20,6 +20,9 @@ import contextlib
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
+# Redirect stderr globally to /dev/null
+sys.stderr = open(os.devnull, 'w')
+
 # Configuration for silence detection and volume meter
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
@@ -50,20 +53,6 @@ process_file_path = assets_directory / "process.mp3"
 gotit_file_path = assets_directory / "gotit.mp3"
 apikey_file_path = assets_directory / "apikey.mp3"
 
-# Context manager to redirect stdout and stderr to /dev/null
-@contextlib.contextmanager
-def suppress_output():
-    with open(os.devnull, 'w') as devnull:
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = devnull
-        sys.stderr = devnull
-        try:
-            yield
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-
 def signal_handler(sig, frame):
     delete_lock()
     sys.exit(0)
@@ -73,7 +62,7 @@ def load_api_key():
     if not api_key:
         play_audio(apikey_file_path)
         input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
-        api_key = subprocess.check_output(input_cmd, shell=True, text=True).strip()
+        api_key = subprocess.check_output(input_cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
         else:
@@ -147,9 +136,8 @@ def is_silence(data_chunk, threshold=THRESHOLD):
     return rms < threshold
 
 def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
-    with suppress_output():
-        audio = pyaudio.PyAudio()
-        stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
 
     frames = []
     silent_frames = 0
@@ -246,12 +234,11 @@ def synthesize_speech(client, text, speech_file_path):
         f.write(response.content)
 
 def play_audio(speech_file_path):
-    with suppress_output():
-        process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        create_lock(ffmpeg_pid=process.pid)
-        process.wait()
-        update_lock_for_ffmpeg_completion()
+    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    create_lock(ffmpeg_pid=process.pid)
+    process.wait()
+    update_lock_for_ffmpeg_completion()
 
 def get_context(question):
     context = question
@@ -261,7 +248,7 @@ def get_context(question):
         context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
     if "clipboard" in question.lower():
         try:
-            clipboard_content = subprocess.check_output(['wl-paste'], text=True)
+            clipboard_content = subprocess.check_output(['wl-paste'], text=True, stderr=subprocess.DEVNULL)
             context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
         except subprocess.CalledProcessError as e:
             context += "\n\nFailed to retrieve clipboard content. The clipboard might be empty or contain non-text data."
@@ -270,49 +257,48 @@ def get_context(question):
     return context
 
 def main():
-    with suppress_output():
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-        check_and_kill_existing_process()
+    check_and_kill_existing_process()
 
-        try:
-            create_lock()
+    try:
+        create_lock()
 
-            api_key = load_api_key()
-            client = OpenAI(api_key=api_key)
+        api_key = load_api_key()
+        client = OpenAI(api_key=api_key)
 
-            if assistant_data_file.exists():
-                with open(assistant_data_file, 'r') as f:
-                    assistant_data = json.load(f)
-                assistant_id = assistant_data['assistant_id']
-                thread_id = assistant_data['thread_id']
-            else:
-                assistant_id = create_assistant(client)
-                thread_id = create_thread(client)
-                with open(assistant_data_file, 'w') as f:
-                    json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
+        if assistant_data_file.exists():
+            with open(assistant_data_file, 'r') as f:
+                assistant_data = json.load(f)
+            assistant_id = assistant_data['assistant_id']
+            thread_id = assistant_data['thread_id']
+        else:
+            assistant_id = create_assistant(client)
+            thread_id = create_thread(client)
+            with open(assistant_data_file, 'w') as f:
+                json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
 
-            play_audio(welcome_file_path)
-            send_notification("NixOS Assistant:", "Recording")
-            record_audio(recorded_audio_path)
-            play_audio(process_file_path)
+        play_audio(welcome_file_path)
+        send_notification("NixOS Assistant:", "Recording")
+        record_audio(recorded_audio_path)
+        play_audio(process_file_path)
 
-            transcript = transcribe_audio(client, recorded_audio_path)
-            context = get_context(transcript)
-            send_notification("You asked:", transcript)
-            add_message(client, thread_id, context)
-            response_text = run_assistant(client, thread_id, assistant_id)
-            send_notification("NixOS Assistant:", response_text)
-            log_interaction(transcript, response_text)
+        transcript = transcribe_audio(client, recorded_audio_path)
+        context = get_context(transcript)
+        send_notification("You asked:", transcript)
+        add_message(client, thread_id, context)
+        response_text = run_assistant(client, thread_id, assistant_id)
+        send_notification("NixOS Assistant:", response_text)
+        log_interaction(transcript, response_text)
 
-            play_audio(gotit_file_path)
-            synthesize_speech(client, response_text, speech_file_path)
-            send_notification("NixOS Assistant:", "Audio Received")
-            play_audio(speech_file_path)
+        play_audio(gotit_file_path)
+        synthesize_speech(client, response_text, speech_file_path)
+        send_notification("NixOS Assistant:", "Audio Received")
+        play_audio(speech_file_path)
 
-        finally:
-            delete_lock()
+    finally:
+        delete_lock()
 
 if __name__ == "__main__":
     main()
