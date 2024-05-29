@@ -15,13 +15,11 @@ import json
 import keyring
 from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
+import pygame
 
 # Suppress ALSA lib warnings
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-# Suppress ALSA lib warnings by redirecting stderr
-sys.stderr = open(os.devnull, 'w')
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -31,6 +29,9 @@ RATE = 22050
 THRESHOLD = 20
 SILENCE_LIMIT = 1
 PREV_AUDIO_DURATION = 0.5
+
+# Initialize pygame mixer
+pygame.mixer.init()
 
 # Determine the base directory for logs based on an environment variable or fallback to a directory in /tmp
 base_log_dir = Path(os.getenv('LOG_DIR', "/tmp/logs/assistant/"))
@@ -234,11 +235,10 @@ def synthesize_speech(client, text, speech_file_path):
         f.write(response.content)
 
 def play_audio(speech_file_path):
-    process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    create_lock(ffmpeg_pid=process.pid)
-    process.wait()
-    update_lock_for_ffmpeg_completion()
+    pygame.mixer.music.load(speech_file_path)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        pygame.time.Clock().tick(10)
 
 def get_context(question):
     context = question
