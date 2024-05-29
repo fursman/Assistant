@@ -28,15 +28,9 @@ logging.basicConfig(level=logging.CRITICAL, handlers=[logging.FileHandler("/dev/
 @contextlib.contextmanager
 def suppress_output():
     with open(os.devnull, 'w') as devnull:
-        old_stderr = sys.stderr
-        old_stdout = sys.stdout
-        sys.stderr = devnull
-        sys.stdout = devnull
-        try:
-            yield
-        finally:
-            sys.stderr = old_stderr
-            sys.stdout = old_stdout
+        with contextlib.redirect_stderr(devnull):
+            with contextlib.redirect_stdout(devnull):
+                yield
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -275,49 +269,48 @@ def get_context(question):
     return context
 
 def main():
-    with suppress_output():
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-        check_and_kill_existing_process()
+    check_and_kill_existing_process()
 
-        try:
-            create_lock()
+    try:
+        create_lock()
 
-            api_key = load_api_key()
-            client = OpenAI(api_key=api_key)
+        api_key = load_api_key()
+        client = OpenAI(api_key=api_key)
 
-            if assistant_data_file.exists():
-                with open(assistant_data_file, 'r') as f:
-                    assistant_data = json.load(f)
-                assistant_id = assistant_data['assistant_id']
-                thread_id = assistant_data['thread_id']
-            else:
-                assistant_id = create_assistant(client)
-                thread_id = create_thread(client)
-                with open(assistant_data_file, 'w') as f:
-                    json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
+        if assistant_data_file.exists():
+            with open(assistant_data_file, 'r') as f:
+                assistant_data = json.load(f)
+            assistant_id = assistant_data['assistant_id']
+            thread_id = assistant_data['thread_id']
+        else:
+            assistant_id = create_assistant(client)
+            thread_id = create_thread(client)
+            with open(assistant_data_file, 'w') as f:
+                json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
 
-            play_audio(welcome_file_path)
-            send_notification("NixOS Assistant:", "Recording")
-            record_audio(recorded_audio_path)
-            play_audio(process_file_path)
+        play_audio(welcome_file_path)
+        send_notification("NixOS Assistant:", "Recording")
+        record_audio(recorded_audio_path)
+        play_audio(process_file_path)
 
-            transcript = transcribe_audio(client, recorded_audio_path)
-            context = get_context(transcript)
-            send_notification("You asked:", transcript)
-            add_message(client, thread_id, context)
-            response_text = run_assistant(client, thread_id, assistant_id)
-            send_notification("NixOS Assistant:", response_text)
-            log_interaction(transcript, response_text)
+        transcript = transcribe_audio(client, recorded_audio_path)
+        context = get_context(transcript)
+        send_notification("You asked:", transcript)
+        add_message(client, thread_id, context)
+        response_text = run_assistant(client, thread_id, assistant_id)
+        send_notification("NixOS Assistant:", response_text)
+        log_interaction(transcript, response_text)
 
-            play_audio(gotit_file_path)
-            synthesize_speech(client, response_text, speech_file_path)
-            send_notification("NixOS Assistant:", "Audio Received")
-            play_audio(speech_file_path)
+        play_audio(gotit_file_path)
+        synthesize_speech(client, response_text, speech_file_path)
+        send_notification("NixOS Assistant:", "Audio Received")
+        play_audio(speech_file_path)
 
-        finally:
-            delete_lock()
+    finally:
+        delete_lock()
 
 if __name__ == "__main__":
     main()
