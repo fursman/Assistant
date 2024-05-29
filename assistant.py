@@ -16,24 +16,27 @@ from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
 import warnings
 import contextlib
+import logging
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-# Set environment variables to suppress ALSA and Jack messages
-os.environ["ALSA_CARD"] = "null"
-os.environ["JACK_NO_START_SERVER"] = "1"
+# Set up logging to capture all stderr output
+logging.basicConfig(level=logging.CRITICAL, handlers=[logging.FileHandler("/dev/null")])
 
-# Function to suppress stderr
+# Function to suppress stderr and stdout
 @contextlib.contextmanager
-def suppress_stderr():
+def suppress_output():
     with open(os.devnull, 'w') as devnull:
         old_stderr = sys.stderr
+        old_stdout = sys.stdout
         sys.stderr = devnull
+        sys.stdout = devnull
         try:
             yield
         finally:
             sys.stderr = old_stderr
+            sys.stdout = old_stdout
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -74,7 +77,7 @@ def load_api_key():
     if not api_key:
         play_audio(apikey_file_path)
         input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
-        with suppress_stderr():
+        with suppress_output():
             api_key = subprocess.check_output(input_cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
@@ -149,7 +152,7 @@ def is_silence(data_chunk, threshold=THRESHOLD):
     return rms < threshold
 
 def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
-    with suppress_stderr():
+    with suppress_output():
         audio = pyaudio.PyAudio()
         stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
 
@@ -248,7 +251,7 @@ def synthesize_speech(client, text, speech_file_path):
         f.write(response.content)
 
 def play_audio(speech_file_path):
-    with suppress_stderr():
+    with suppress_output():
         process = subprocess.Popen(['ffmpeg', '-i', str(speech_file_path), '-f', 'alsa', 'default'],
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         create_lock(ffmpeg_pid=process.pid)
@@ -272,7 +275,7 @@ def get_context(question):
     return context
 
 def main():
-    with suppress_stderr():
+    with suppress_output():
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
