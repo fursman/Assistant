@@ -12,8 +12,12 @@ import sys
 import csv
 import json
 import keyring
+import warnings
 from pathlib import Path
 from openai import OpenAI, AssistantEventHandler
+
+# Suppress all warnings
+warnings.filterwarnings(""ignore"")
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
