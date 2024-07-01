@@ -11,6 +11,7 @@ import numpy as np
 import sys
 import csv
 import re
+import logging
 import json
 import keyring
 from pathlib import Path
@@ -18,6 +19,9 @@ from openai import OpenAI, AssistantEventHandler
 from typing_extensions import override
 import threading
 import queue
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration for silence detection and volume meter
 CHUNK = 1024
@@ -200,8 +204,6 @@ def run_assistant(client, thread_id, assistant_id, tts_queue):
     tts_queue.put(None)  # Signal end of text
     return event_handler.response_text
 
-import re
-
 def stream_speech(client, text_queue):
     full_text = ""
     buffer = ""
@@ -209,44 +211,59 @@ def stream_speech(client, text_queue):
 
     def send_chunk_to_tts(chunk):
         nonlocal process
-        response = client.audio.speech.create(
-            model="tts-1-hd",
-            voice="nova",
-            input=chunk
-        )
-        if not process:
-            process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
-        for audio_chunk in response.iter_bytes(chunk_size=4096):
-            if audio_chunk:
-                process.stdin.write(audio_chunk)
-                process.stdin.flush()
+        try:
+            response = client.audio.speech.create(
+                model="tts-1-hd",
+                voice="nova",
+                input=chunk
+            )
+            if not process:
+                process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
+            for audio_chunk in response.iter_bytes(chunk_size=4096):
+                if audio_chunk:
+                    process.stdin.write(audio_chunk)
+                    process.stdin.flush()
+        except Exception as e:
+            logger.error(f"Error in TTS or audio playback: {str(e)}")
 
-    while True:
-        text_chunk = text_queue.get()
-        if text_chunk is None:
-            break
-        full_text += text_chunk
-        buffer += text_chunk
+    try:
+        while True:
+            try:
+                text_chunk = text_queue.get(timeout=5)  # Wait for 5 seconds for new text
+            except queue.Empty:
+                if buffer:  # If there's remaining text in the buffer, send it
+                    send_chunk_to_tts(buffer)
+                    buffer = ""
+                break
 
-        # Split the buffer into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', buffer)
+            if text_chunk is None:
+                break
 
-        # If we have more than 100 words or the last sentence is complete
-        if len(buffer.split()) > 100 or (sentences and sentences[-1][-1] in '.!?'):
-            # Join all complete sentences
-            complete_sentences = ' '.join(sentences[:-1]) if sentences[-1][-1] not in '.!?' else ' '.join(sentences)
-            
-            if complete_sentences:
-                send_chunk_to_tts(complete_sentences)
-                buffer = sentences[-1] if sentences[-1][-1] not in '.!?' else ""
+            full_text += text_chunk
+            buffer += text_chunk
 
-    # Send any remaining text in the buffer
-    if buffer:
-        send_chunk_to_tts(buffer)
+            # Split the buffer into sentences
+            sentences = re.split(r'(?<=[.!?])\s+', buffer)
 
-    if process:
-        process.stdin.close()
-        process.wait()
+            # If we have more than 100 words or the last sentence is complete
+            if len(buffer.split()) > 100 or (len(sentences) > 1 and sentences[-2][-1] in '.!?'):
+                # Join all complete sentences
+                complete_sentences = ' '.join(sentences[:-1])
+                
+                if complete_sentences:
+                    send_chunk_to_tts(complete_sentences)
+                    buffer = sentences[-1]
+
+        # Send any remaining text in the buffer
+        if buffer:
+            send_chunk_to_tts(buffer)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in stream_speech: {str(e)}")
+    finally:
+        if process:
+            process.stdin.close()
+            process.wait()
 
 def get_context(question):
     context = question
