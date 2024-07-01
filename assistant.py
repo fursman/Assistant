@@ -74,9 +74,9 @@ def check_and_kill_existing_process():
             try:
                 lock_data = json.load(lock_file)
                 script_pid = lock_data.get('script_pid')
-                ffplay_pid = lock_data.get('ffplay_pid')
-                if ffplay_pid:
-                    os.kill(ffplay_pid, signal.SIGTERM)
+                ffmpeg_pid = lock_data.get('ffmpeg_pid')
+                if ffmpeg_pid:
+                    os.kill(ffmpeg_pid, signal.SIGTERM)
                 if script_pid:
                     os.kill(script_pid, signal.SIGTERM)
                     send_notification("NixOS Assistant:", "Silencing output and standing by for your next request!")
@@ -84,22 +84,13 @@ def check_and_kill_existing_process():
             except (json.JSONDecodeError, ProcessLookupError, PermissionError):
                 sys.exit(1)
 
-def create_lock(ffplay_pid=None):
+def create_lock(ffmpeg_pid=None):
     lock_data = {
         'script_pid': os.getpid(),
-        'ffplay_pid': ffplay_pid
+        'ffmpeg_pid': ffmpeg_pid
     }
     with open(lock_file_path, 'w') as lock_file:
         json.dump(lock_data, lock_file)
-
-def update_lock_for_ffplay_completion():
-    if lock_file_path.exists():
-        with open(lock_file_path, 'r+') as lock_file:
-            lock_data = json.load(lock_file)
-            lock_data['ffplay_pid'] = None
-            lock_file.seek(0)
-            json.dump(lock_data, lock_file)
-            lock_file.truncate()
 
 def delete_lock():
     try:
@@ -207,62 +198,109 @@ def run_assistant(client, thread_id, assistant_id, tts_queue):
 
     tts_queue.put(None)  # Signal end of text
     return event_handler.response_text
-    
+
 def stream_speech(client, text_queue):
     full_text = ""
-    ffplay_process = None
-    end_of_sentence_punctuation = ('.', '!', '?')
+    speech_stream = None
 
-    try:
-        while True:
-            text_chunk = text_queue.get()
-            if text_chunk is None:
-                break
-            full_text += text_chunk
+    while True:
+        text_chunk = text_queue.get()
+        if text_chunk is None:
+            break
+        full_text += text_chunk
 
-            # Check if we have a complete sentence or a significant amount of text
-            if (any(full_text.endswith(punct) for punct in end_of_sentence_punctuation) and len(full_text) > 50) or len(full_text) > 200:
-                response = client.audio.speech.create(
-                    model="tts-1-hd",
-                    voice="nova",
-                    input=full_text
-                )
-
-                if ffplay_process is None or ffplay_process.poll() is not None:
-                    ffplay_process = subprocess.Popen(['ffplay', '-nodisp', '-autoexit', '-'], stdin=subprocess.PIPE)
-                    create_lock(ffplay_process.pid)
-
-                for chunk in response.iter_bytes(chunk_size=4096):
-                    if chunk:
-                        ffplay_process.stdin.write(chunk)
-                        ffplay_process.stdin.flush()
-
-                full_text = ""  # Reset the text buffer
-
-        # Process any remaining text
-        if full_text:
-            response = client.audio.speech.create(
+        if not speech_stream:
+            speech_stream = client.audio.speech.create(
                 model="tts-1-hd",
                 voice="nova",
-                input=full_text
+                input=full_text,
+                stream=True
+            )
+            process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
+
+        for chunk in speech_stream:
+            if chunk:
+                process.stdin.write(chunk)
+                process.stdin.flush()
+
+    if process:
+        process.stdin.close()
+        process.wait()
+
+def get_context(question):
+    context = question
+    if "nixos" in question.lower():
+        with open('/etc/nixos/flake.nix', 'r') as file:
+            nixos_config = file.read()
+        context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
+    if "clipboard" in question.lower():
+        try:
+            clipboard_content = subprocess.check_output(['wl-paste'], text=True)
+            context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
+        except subprocess.CalledProcessError as e:
+            context += "\n\nFailed to retrieve clipboard content. The clipboard might be empty or contain non-text data."
+        except Exception as e:
+            context += f"\n\nAn unexpected error occurred while retrieving clipboard content: {e}"
+    return context
+
+def play_audio(file_path):
+    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(file_path)], check=True)
+
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    check_and_kill_existing_process()
+
+    try:
+        create_lock()
+
+        api_key = load_api_key()
+        client = OpenAI(api_key=api_key)
+
+        if assistant_data_file.exists():
+            with open(assistant_data_file, 'r') as f:
+                assistant_data = json.load(f)
+            assistant_id = assistant_data['assistant_id']
+            thread_id = assistant_data['thread_id']
+        else:
+            assistant_id = create_assistant(client)
+            thread_id = create_thread(client)
+            with open(assistant_data_file, 'w') as f:
+                json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
+
+        play_audio(welcome_file_path)
+        send_notification("NixOS Assistant:", "Recording")
+        record_audio(recorded_audio_path)
+        play_audio(process_file_path)
+
+        with open(recorded_audio_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
             )
 
-            if ffplay_process is None or ffplay_process.poll() is not None:
-                ffplay_process = subprocess.Popen(['ffplay', '-nodisp', '-autoexit', '-'], stdin=subprocess.PIPE)
-                create_lock(ffplay_process.pid)
+        context = get_context(transcript)
+        send_notification("You asked:", transcript)
+        add_message(client, thread_id, context)
 
-            for chunk in response.iter_bytes(chunk_size=4096):
-                if chunk:
-                    ffplay_process.stdin.write(chunk)
-                    ffplay_process.stdin.flush()
+        tts_queue = queue.Queue()
+        assistant_thread = threading.Thread(target=run_assistant, args=(client, thread_id, assistant_id, tts_queue))
+        tts_thread = threading.Thread(target=stream_speech, args=(client, tts_queue))
 
+        assistant_thread.start()
+        tts_thread.start()
+
+        assistant_thread.join()
+        tts_thread.join()
+
+        log_interaction(transcript, "Response logged (streaming)")
+
+    except Exception as e:
+        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
     finally:
-        if ffplay_process and ffplay_process.poll() is None:
-            ffplay_process.stdin.close()
-            ffplay_process.wait()
-        update_lock_for_ffplay_completion()
-
-# ... [rest of the code remains unchanged]
+        delete_lock()
 
 if __name__ == "__main__":
     main()
