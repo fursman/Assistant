@@ -20,6 +20,13 @@ import queue
 
 # ... [Previous imports and configurations remain the same]
 
+def signal_handler(sig, frame):
+    print("\nExiting gracefully...")
+    delete_lock()
+    sys.exit(0)
+
+# ... [Other functions remain the same]
+
 class CustomEventHandler(AssistantEventHandler):
     def __init__(self, tts_queue):
         super().__init__()
