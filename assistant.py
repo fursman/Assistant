@@ -201,6 +201,7 @@ def run_assistant(client, thread_id, assistant_id, tts_queue):
 
 def stream_speech(client, text_queue):
     full_text = ""
+    response = None
     process = None
 
     while True:
@@ -209,13 +210,19 @@ def stream_speech(client, text_queue):
             break
         full_text += text_chunk
 
-        if not process:
+        if not response:
             response = client.audio.speech.create(
                 model="tts-1-hd",
                 voice="nova",
                 input=full_text
             )
             process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
+        else:
+            response = client.audio.speech.create(
+                model="tts-1-hd",
+                voice="nova",
+                input=text_chunk
+            )
 
         for chunk in response.iter_bytes(chunk_size=4096):
             if chunk:
