@@ -10,6 +10,7 @@ import signal
 import numpy as np
 import sys
 import csv
+import re
 import json
 import keyring
 from pathlib import Path
@@ -199,35 +200,49 @@ def run_assistant(client, thread_id, assistant_id, tts_queue):
     tts_queue.put(None)  # Signal end of text
     return event_handler.response_text
 
+import re
+
 def stream_speech(client, text_queue):
     full_text = ""
-    response = None
+    buffer = ""
     process = None
+
+    def send_chunk_to_tts(chunk):
+        nonlocal process
+        response = client.audio.speech.create(
+            model="tts-1-hd",
+            voice="nova",
+            input=chunk
+        )
+        if not process:
+            process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
+        for audio_chunk in response.iter_bytes(chunk_size=4096):
+            if audio_chunk:
+                process.stdin.write(audio_chunk)
+                process.stdin.flush()
 
     while True:
         text_chunk = text_queue.get()
         if text_chunk is None:
             break
         full_text += text_chunk
+        buffer += text_chunk
 
-        if not response:
-            response = client.audio.speech.create(
-                model="tts-1-hd",
-                voice="nova",
-                input=full_text
-            )
-            process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
-        else:
-            response = client.audio.speech.create(
-                model="tts-1-hd",
-                voice="nova",
-                input=text_chunk
-            )
+        # Split the buffer into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', buffer)
 
-        for chunk in response.iter_bytes(chunk_size=4096):
-            if chunk:
-                process.stdin.write(chunk)
-                process.stdin.flush()
+        # If we have more than 100 words or the last sentence is complete
+        if len(buffer.split()) > 100 or (sentences and sentences[-1][-1] in '.!?'):
+            # Join all complete sentences
+            complete_sentences = ' '.join(sentences[:-1]) if sentences[-1][-1] not in '.!?' else ' '.join(sentences)
+            
+            if complete_sentences:
+                send_chunk_to_tts(complete_sentences)
+                buffer = sentences[-1] if sentences[-1][-1] not in '.!?' else ""
+
+    # Send any remaining text in the buffer
+    if buffer:
+        send_chunk_to_tts(buffer)
 
     if process:
         process.stdin.close()
