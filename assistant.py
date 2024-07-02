@@ -21,6 +21,8 @@ import threading
 import queue
 
 logging.basicConfig(level=logging.INFO)
+# Set the logging level to WARNING to suppress INFO messages
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Configuration for silence detection and volume meter
