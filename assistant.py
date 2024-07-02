@@ -178,6 +178,7 @@ class CustomEventHandler(AssistantEventHandler):
         super().__init__()
         self.response_text = ""
         self.text_queue = queue.Queue()
+        self.is_text_input = False
 
     @override
     def on_text_created(self, text) -> None:
@@ -187,9 +188,12 @@ class CustomEventHandler(AssistantEventHandler):
     def on_text_delta(self, delta, snapshot):
         self.response_text += delta.value
         self.text_queue.put(delta.value)
+        if self.is_text_input:
+            print(delta.value, end='', flush=True)
 
-def run_assistant(client, thread_id, assistant_id):
+def run_assistant(client, thread_id, assistant_id, is_text_input=False):
     event_handler = CustomEventHandler()
+    event_handler.is_text_input = is_text_input
 
     tts_thread = threading.Thread(target=stream_speech, args=(client, event_handler.text_queue))
     tts_thread.start()
@@ -343,10 +347,10 @@ def main():
             send_notification("You asked:", transcript)
         add_message(client, thread_id, context)
 
-        response = run_assistant(client, thread_id, assistant_id)
+        response = run_assistant(client, thread_id, assistant_id, is_text_input)
         
         if is_text_input:
-            print(f"assistant > {response.strip()}")
+            print(f"\nassistant > {response.strip()}")
         else:
             send_notification("NixOS Assistant:", response)
             
