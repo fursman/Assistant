@@ -15,11 +15,8 @@ import logging
 import json
 import keyring
 from pathlib import Path
-from openai import OpenAI
-from openai.types.beta import Assistant
-from openai.types.beta.threads import ThreadMessage
-from openai.types.beta.threads.runs import Run
-from typing import List, Optional
+from openai import OpenAI, AssistantEventHandler
+from typing_extensions import override
 import threading
 import queue
 
@@ -27,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Configuration for silence detection and volume meter
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -81,15 +78,13 @@ def check_and_kill_existing_process():
                 lock_data = json.load(lock_file)
                 script_pid = lock_data.get('script_pid')
                 ffmpeg_pid = lock_data.get('ffmpeg_pid')
-                for pid in [ffmpeg_pid, script_pid]:
-                    if pid:
-                        try:
-                            os.kill(pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
-                send_notification("NixOS Assistant:", "Silencing output and standing by for your next request!")
-                sys.exit("Exiting.")
-            except (json.JSONDecodeError, PermissionError):
+                if ffmpeg_pid:
+                    os.kill(ffmpeg_pid, signal.SIGTERM)
+                if script_pid:
+                    os.kill(script_pid, signal.SIGTERM)
+                    send_notification("NixOS Assistant:", "Silencing output and standing by for your next request!")
+                    sys.exit("Exiting.")
+            except (json.JSONDecodeError, ProcessLookupError, PermissionError):
                 sys.exit(1)
 
 def create_lock(ffmpeg_pid=None):
@@ -157,8 +152,8 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
     wf.writeframes(b''.join(frames))
     wf.close()
 
-def create_assistant(client: OpenAI) -> str:
-    assistant: Assistant = client.beta.assistants.create(
+def create_assistant(client):
+    assistant = client.beta.assistants.create(
         name="NixOS Assistant",
         instructions="You are a helpful assistant integrated with NixOS. Provide concise and accurate information. If asked about system configurations or clipboard content, refer to the additional context provided.",
         tools=[],
@@ -166,11 +161,11 @@ def create_assistant(client: OpenAI) -> str:
     )
     return assistant.id
 
-def create_thread(client: OpenAI) -> str:
+def create_thread(client):
     thread = client.beta.threads.create()
     return thread.id
 
-def add_message(client: OpenAI, thread_id: str, content: str) -> ThreadMessage:
+def add_message(client, thread_id, content):
     message = client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
@@ -178,29 +173,32 @@ def add_message(client: OpenAI, thread_id: str, content: str) -> ThreadMessage:
     )
     return message
 
-def run_assistant(client: OpenAI, thread_id: str, assistant_id: str, tts_queue: queue.Queue) -> str:
-    run: Run = client.beta.threads.runs.create(
+class CustomEventHandler(AssistantEventHandler):
+    def __init__(self):
+        super().__init__()
+        self.response_text = ""
+
+    @override
+    def on_text_created(self, text) -> None:
+        pass
+
+    @override
+    def on_text_delta(self, delta, snapshot):
+        self.response_text += delta.value
+
+def run_assistant(client, thread_id, assistant_id):
+    event_handler = CustomEventHandler()
+
+    with client.beta.threads.runs.stream(
         thread_id=thread_id,
-        assistant_id=assistant_id
-    )
+        assistant_id=assistant_id,
+        event_handler=event_handler,
+    ) as stream:
+        stream.until_done()
 
-    while True:
-        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-        if run.status == "completed":
-            break
-        time.sleep(0.5)
-
-    messages: List[ThreadMessage] = client.beta.threads.messages.list(thread_id=thread_id)
-    assistant_message = next((msg for msg in messages if msg.role == "assistant"), None)
-
-    if assistant_message and assistant_message.content:
-        content = assistant_message.content[0].text.value
-        for chunk in content.split():
-            tts_queue.put(chunk + ' ')
-        return content
-    return ""
-
-def stream_speech(client: OpenAI, text_queue: queue.Queue):
+    return event_handler.response_text
+def stream_speech(client, text_queue):
+    full_text = ""
     buffer = ""
     process = None
     sentence_end_pattern = re.compile(r'(?<=[.!?])\s+')
@@ -225,31 +223,37 @@ def stream_speech(client: OpenAI, text_queue: queue.Queue):
     try:
         while True:
             try:
-                text_chunk = text_queue.get(timeout=0.05)
+                text_chunk = text_queue.get(timeout=0.1)  # Reduced timeout for faster processing
             except queue.Empty:
                 if buffer:
-                    sentences = sentence_end_pattern.split(buffer)
-                    if len(sentences) > 1 and len(buffer.split()) >= 50:
-                        chunk_to_send = sentence_end_pattern.join(sentences[:-1])
-                        send_chunk_to_tts(chunk_to_send.strip())
-                        buffer = sentences[-1]
-                continue
+                    send_chunk_to_tts(buffer)
+                    buffer = ""
+                break
 
             if text_chunk is None:
                 break
 
+            full_text += text_chunk
             buffer += text_chunk
 
+            # Split the buffer into sentences
             sentences = sentence_end_pattern.split(buffer)
-            complete_sentences = sentences[:-1]
-            
-            if complete_sentences and len(' '.join(complete_sentences).split()) >= 50:
-                chunk_to_send = sentence_end_pattern.join(complete_sentences)
-                send_chunk_to_tts(chunk_to_send.strip())
-                buffer = sentences[-1]
 
+            # Process complete sentences if we have more than 100 words
+            chunk_to_send = ""
+            while len(sentences) > 1 and len(chunk_to_send.split()) < 100:
+                chunk_to_send += sentences.pop(0) + " "
+
+            # If we have at least 100 words and a complete sentence, send it
+            if len(chunk_to_send.split()) >= 100:
+                send_chunk_to_tts(chunk_to_send.strip())
+                buffer = ''.join(sentences)
+            else:
+                buffer = chunk_to_send + ''.join(sentences)
+
+        # Send any remaining text in the buffer
         if buffer:
-            send_chunk_to_tts(buffer.strip())
+            send_chunk_to_tts(buffer)
 
     except Exception as e:
         logger.error(f"Unexpected error in stream_speech: {str(e)}")
@@ -272,12 +276,10 @@ def get_context(question):
 
     if "clipboard" in question.lower():
         try:
-            clipboard_content = subprocess.check_output(['wl-paste'], text=True, timeout=2)
+            clipboard_content = subprocess.check_output(['wl-paste'], text=True)
             context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
             context += "\n\nFailed to retrieve clipboard content. The clipboard might be empty or contain non-text data."
-        except subprocess.TimeoutExpired:
-            context += "\n\nTimeout occurred while trying to retrieve clipboard content."
         except Exception as e:
             context += f"\n\nAn unexpected error occurred while retrieving clipboard content: {e}"
     return context
@@ -332,19 +334,18 @@ def main():
             send_notification("You asked:", transcript)
         add_message(client, thread_id, context)
 
-        tts_queue = queue.Queue()
-        tts_thread = threading.Thread(target=stream_speech, args=(client, tts_queue))
-        tts_thread.start()
-
-        response = run_assistant(client, thread_id, assistant_id, tts_queue)
+        response = run_assistant(client, thread_id, assistant_id)
         
         if is_text_input:
             print(f"assistant > {response.strip()}")
         else:
             send_notification("NixOS Assistant:", response)
-        
-        tts_queue.put(None)  # Signal the TTS thread to finish
-        tts_thread.join()
+            
+            tts_queue = queue.Queue()
+            for chunk in response.split():
+                tts_queue.put(chunk + ' ')
+            tts_queue.put(None)
+            stream_speech(client, tts_queue)
 
         log_interaction(transcript, response)
 
