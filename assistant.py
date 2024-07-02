@@ -15,8 +15,11 @@ import logging
 import json
 import keyring
 from pathlib import Path
-from openai import OpenAI, AssistantEventHandler
-from typing_extensions import override
+from openai import OpenAI
+from openai.types.beta import Assistant
+from openai.types.beta.threads import ThreadMessage
+from openai.types.beta.threads.runs import Run
+from typing import List, Optional
 import threading
 import queue
 
@@ -154,8 +157,8 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
     wf.writeframes(b''.join(frames))
     wf.close()
 
-def create_assistant(client):
-    assistant = client.beta.assistants.create(
+def create_assistant(client: OpenAI) -> str:
+    assistant: Assistant = client.beta.assistants.create(
         name="NixOS Assistant",
         instructions="You are a helpful assistant integrated with NixOS. Provide concise and accurate information. If asked about system configurations or clipboard content, refer to the additional context provided.",
         tools=[],
@@ -163,11 +166,11 @@ def create_assistant(client):
     )
     return assistant.id
 
-def create_thread(client):
+def create_thread(client: OpenAI) -> str:
     thread = client.beta.threads.create()
     return thread.id
 
-def add_message(client, thread_id, content):
+def add_message(client: OpenAI, thread_id: str, content: str) -> ThreadMessage:
     message = client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
@@ -175,34 +178,29 @@ def add_message(client, thread_id, content):
     )
     return message
 
-class CustomEventHandler(AssistantEventHandler):
-    def __init__(self, tts_queue):
-        super().__init__()
-        self.response_text = ""
-        self.tts_queue = tts_queue
-
-    @override
-    def on_text_created(self, text) -> None:
-        pass
-
-    @override
-    def on_text_delta(self, delta, snapshot):
-        self.response_text += delta.value
-        self.tts_queue.put(delta.value)
-
-def run_assistant(client, thread_id, assistant_id, tts_queue):
-    event_handler = CustomEventHandler(tts_queue)
-
-    with client.beta.threads.runs.stream(
+def run_assistant(client: OpenAI, thread_id: str, assistant_id: str, tts_queue: queue.Queue) -> str:
+    run: Run = client.beta.threads.runs.create(
         thread_id=thread_id,
-        assistant_id=assistant_id,
-        event_handler=event_handler,
-    ) as stream:
-        stream.until_done()
+        assistant_id=assistant_id
+    )
 
-    return event_handler.response_text
+    while True:
+        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        if run.status == "completed":
+            break
+        time.sleep(0.5)
 
-def stream_speech(client, text_queue):
+    messages: List[ThreadMessage] = client.beta.threads.messages.list(thread_id=thread_id)
+    assistant_message = next((msg for msg in messages if msg.role == "assistant"), None)
+
+    if assistant_message and assistant_message.content:
+        content = assistant_message.content[0].text.value
+        for chunk in content.split():
+            tts_queue.put(chunk + ' ')
+        return content
+    return ""
+
+def stream_speech(client: OpenAI, text_queue: queue.Queue):
     buffer = ""
     process = None
     sentence_end_pattern = re.compile(r'(?<=[.!?])\s+')
@@ -227,7 +225,7 @@ def stream_speech(client, text_queue):
     try:
         while True:
             try:
-                text_chunk = text_queue.get(timeout=0.05)  # Reduced timeout for faster processing
+                text_chunk = text_queue.get(timeout=0.05)
             except queue.Empty:
                 if buffer:
                     sentences = sentence_end_pattern.split(buffer)
