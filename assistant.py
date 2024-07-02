@@ -309,6 +309,8 @@ def main():
     try:
         create_lock()
 
+        print()
+
         api_key = load_api_key()
         client = OpenAI(api_key=api_key)
 
@@ -350,7 +352,7 @@ def main():
         response = run_assistant(client, thread_id, assistant_id, is_text_input)
         
         if is_text_input:
-            
+            print()
         else:
             send_notification("NixOS Assistant:", response)
             
