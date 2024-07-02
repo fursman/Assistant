@@ -30,7 +30,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 22050
 THRESHOLD = 30
-SILENCE_LIMIT = 2
+SILENCE_LIMIT = 10
 PREV_AUDIO_DURATION = 0.5
 
 base_log_dir = Path(os.getenv('LOG_DIR', "/tmp/logs/assistant/"))
