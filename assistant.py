@@ -177,6 +177,7 @@ class CustomEventHandler(AssistantEventHandler):
     def __init__(self):
         super().__init__()
         self.response_text = ""
+        self.text_queue = queue.Queue()
 
     @override
     def on_text_created(self, text) -> None:
@@ -185,9 +186,13 @@ class CustomEventHandler(AssistantEventHandler):
     @override
     def on_text_delta(self, delta, snapshot):
         self.response_text += delta.value
+        self.text_queue.put(delta.value)
 
 def run_assistant(client, thread_id, assistant_id):
     event_handler = CustomEventHandler()
+
+    tts_thread = threading.Thread(target=stream_speech, args=(client, event_handler.text_queue))
+    tts_thread.start()
 
     with client.beta.threads.runs.stream(
         thread_id=thread_id,
@@ -196,7 +201,11 @@ def run_assistant(client, thread_id, assistant_id):
     ) as stream:
         stream.until_done()
 
+    event_handler.text_queue.put(None)  # Signal TTS thread to complete
+    tts_thread.join()
+
     return event_handler.response_text
+
 def stream_speech(client, text_queue):
     full_text = ""
     buffer = ""
@@ -239,13 +248,13 @@ def stream_speech(client, text_queue):
             # Split the buffer into sentences
             sentences = sentence_end_pattern.split(buffer)
 
-            # Process complete sentences if we have more than 100 words
+            # Process complete sentences if we have more than 50 words
             chunk_to_send = ""
-            while len(sentences) > 1 and len(chunk_to_send.split()) < 100:
+            while len(sentences) > 1 and len(chunk_to_send.split()) < 50:
                 chunk_to_send += sentences.pop(0) + " "
 
-            # If we have at least 100 words and a complete sentence, send it
-            if len(chunk_to_send.split()) >= 100:
+            # If we have at least 50 words and a complete sentence, send it
+            if len(chunk_to_send.split()) >= 50:
                 send_chunk_to_tts(chunk_to_send.strip())
                 buffer = ''.join(sentences)
             else:
