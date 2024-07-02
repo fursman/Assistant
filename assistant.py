@@ -159,7 +159,7 @@ def create_assistant(client):
         name="NixOS Assistant",
         instructions="You are a helpful assistant integrated with NixOS. Provide concise and accurate information. If asked about system configurations or clipboard content, refer to the additional context provided.",
         tools=[],
-        model="gpt-4o"
+        model="gpt-4-1106-preview"
     )
     return assistant.id
 
@@ -307,20 +307,26 @@ def main():
             with open(assistant_data_file, 'w') as f:
                 json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
 
-        play_audio(welcome_file_path)
-        send_notification("NixOS Assistant:", "Recording")
-        record_audio(recorded_audio_path)
-        play_audio(process_file_path)
+        if len(sys.argv) > 1:
+            # Command-line input
+            transcript = " ".join(sys.argv[1:])
+        else:
+            # Audio input
+            play_audio(welcome_file_path)
+            send_notification("NixOS Assistant:", "Recording")
+            record_audio(recorded_audio_path)
+            play_audio(process_file_path)
 
-        with open(recorded_audio_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text"
-            )
+            with open(recorded_audio_path, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
 
         context = get_context(transcript)
         send_notification("You asked:", transcript)
+        print(f"You asked: {transcript}")
         add_message(client, thread_id, context)
 
         tts_queue = queue.Queue()
@@ -333,7 +339,8 @@ def main():
         assistant_thread.join()
         tts_thread.join()
 
-        log_interaction(transcript, "Response logged (streaming)")
+        response = assistant_thread.join()
+        log_interaction(transcript, response)
 
     except Exception as e:
         send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
