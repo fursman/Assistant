@@ -220,7 +220,7 @@ def stream_speech(client, text_queue):
         nonlocal process
         try:
             response = client.audio.speech.create(
-                model="tts-1-hd",
+                model="tts-1",
                 voice="nova",
                 input=chunk
             )
@@ -350,7 +350,7 @@ def main():
         response = run_assistant(client, thread_id, assistant_id, is_text_input)
         
         if is_text_input:
-            print(f"\nassistant > {response.strip()}")
+            
         else:
             send_notification("NixOS Assistant:", response)
             
