@@ -35,7 +35,7 @@
             pkgs.ffmpeg-full
             pkgs.portaudio
             pkgs.wl-clipboard
-            pkgs.gnome.zenity
+            pkgs.zenity
           ];
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
