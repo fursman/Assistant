@@ -10,7 +10,7 @@
     pkgs.virtualenv
     pkgs.portaudio
     pkgs.ffmpeg-full
-    pkgs.gnome.zenity
+    pkgs.zenity
     pkgs.wl-clipboard
   ];
   shellHook = ''
