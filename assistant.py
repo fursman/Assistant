@@ -20,9 +20,9 @@ import numpy as np
 import keyring
 import notify2
 
-# Import the latest OpenAI SDK
+# Import the OpenAI SDK and handle exceptions
+import openai
 from openai import OpenAI, AssistantEventHandler
-from openai.error import AuthenticationError, OpenAIError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -266,12 +266,16 @@ def run_assistant(client, thread_id, assistant_id, is_text_input=False):
             event_handler=event_handler,
         ) as stream:
             stream.until_done()
-    except AuthenticationError:
+    except openai.error.AuthenticationError:
         handle_api_error()
         sys.exit(1)
-    except OpenAIError as e:
+    except openai.error.OpenAIError as e:
         logger.error(f"OpenAI API Error: {e}")
         send_notification("NixOS Assistant Error", f"OpenAI API Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        send_notification("NixOS Assistant Error", f"An unexpected error occurred: {e}")
         sys.exit(1)
 
     if tts_thread:
@@ -425,15 +429,15 @@ def main():
 
         log_interaction(transcript, response)
 
-    except AuthenticationError:
+    except openai.error.AuthenticationError:
         handle_api_error()
         sys.exit(1)
-    except OpenAIError as e:
+    except openai.error.OpenAIError as e:
         logger.error(f"OpenAI API Error: {e}")
         send_notification("NixOS Assistant Error", f"OpenAI API Error: {e}")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
+        send_notification("NixOS Assistant Error", f"An error occurred: {e}")
     finally:
         delete_lock()
         if ffmpeg_process and ffmpeg_process.poll() is None:
