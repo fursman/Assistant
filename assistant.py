@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 
 import os
-import pyaudio
-import wave
-import subprocess
-import notify2
-import datetime
-import signal
-import numpy as np
 import sys
+import json
 import csv
 import re
+import signal
 import logging
-import json
-import keyring
-from pathlib import Path
-from openai import OpenAI, AssistantEventHandler
-from typing import Optional
 import threading
 import queue
-import contextlib
-import asyncio
+import datetime
+import subprocess
+from pathlib import Path
+from typing_extensions import override
+
+import pyaudio
+import wave
+import numpy as np
+import keyring
+import notify2
+
+# Import the latest OpenAI SDK
+from openai import OpenAI, AssistantEventHandler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
-# Audio recording settings
+# Audio configurations
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -42,28 +43,26 @@ BASE_LOG_DIR.mkdir(parents=True, exist_ok=True)
 ASSETS_DIR = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-NOW = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 LOG_CSV_PATH = BASE_LOG_DIR / "interaction_log.csv"
-RECORDED_AUDIO_PATH = BASE_LOG_DIR / f"input_{NOW}.wav"
+RECORDED_AUDIO_PATH = BASE_LOG_DIR / f"input_{now}.wav"
 LOCK_FILE_PATH = BASE_LOG_DIR / "script.lock"
 ASSISTANT_DATA_FILE = BASE_LOG_DIR / "assistant_data.json"
 
-AUDIO_FILES = {
-    'welcome': ASSETS_DIR / "welcome.mp3",
-    'processing': ASSETS_DIR / "process.mp3",
-    'apikey': ASSETS_DIR / "apikey.mp3",
-}
+WELCOME_FILE_PATH = ASSETS_DIR / "welcome.mp3"
+PROCESS_FILE_PATH = ASSETS_DIR / "process.mp3"
+APIKEY_FILE_PATH = ASSETS_DIR / "apikey.mp3"
 
+# Signal handling for graceful exit
 def signal_handler(sig, frame):
-    """Handle termination signals to clean up resources."""
     delete_lock()
     sys.exit(0)
 
-def load_api_key() -> str:
-    """Load the OpenAI API key from keyring or prompt the user."""
+# Load or prompt for OpenAI API key
+def load_api_key():
     api_key = keyring.get_password("NixOSAssistant", "APIKey")
     if not api_key:
-        play_audio(AUDIO_FILES['apikey'])
+        play_audio(APIKEY_FILE_PATH)
         api_key = prompt_for_api_key()
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
@@ -72,90 +71,86 @@ def load_api_key() -> str:
             sys.exit(1)
     return api_key
 
-def prompt_for_api_key() -> Optional[str]:
-    """Prompt the user to enter their OpenAI API key."""
+def prompt_for_api_key():
+    input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
     try:
-        input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
         api_key = subprocess.check_output(input_cmd, shell=True, text=True).strip()
         return api_key
     except subprocess.CalledProcessError:
         return None
 
+# Handle invalid API key
 def handle_api_error():
-    """Handle invalid API key errors."""
     keyring.delete_password("NixOSAssistant", "APIKey")
     send_notification("NixOS Assistant Error", "Invalid API Key. Please re-enter your API key.")
 
+# Ensure only one instance is running
 def check_and_kill_existing_process():
-    """Ensure that no other instance of the script is running."""
     if LOCK_FILE_PATH.exists():
-        with LOCK_FILE_PATH.open('r') as lock_file:
+        with open(LOCK_FILE_PATH, 'r') as lock_file:
             try:
                 lock_data = json.load(lock_file)
                 script_pid = lock_data.get('script_pid')
                 if script_pid and script_pid != os.getpid():
                     os.kill(script_pid, signal.SIGTERM)
-                    send_notification("NixOS Assistant", "Previous instance terminated.")
-            except Exception as e:
-                logger.error(f"Error terminating existing process: {e}")
-        delete_lock()
+                    send_notification("NixOS Assistant:", "Previous instance terminated.")
+            except (json.JSONDecodeError, ProcessLookupError, PermissionError) as e:
+                logger.error(f"Error handling lock file: {e}")
+                LOCK_FILE_PATH.unlink()
 
+# Create and delete lock files
 def create_lock():
-    """Create a lock file with the current process ID."""
     lock_data = {'script_pid': os.getpid()}
-    with LOCK_FILE_PATH.open('w') as lock_file:
+    with open(LOCK_FILE_PATH, 'w') as lock_file:
         json.dump(lock_data, lock_file)
 
 def delete_lock():
-    """Delete the lock file if it exists."""
-    LOCK_FILE_PATH.unlink(missing_ok=True)
+    if LOCK_FILE_PATH.exists():
+        LOCK_FILE_PATH.unlink()
 
-def log_interaction(question: str, response: str):
-    """Log the question and response to a CSV file."""
+# Log user interactions
+def log_interaction(question, response):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        with LOG_CSV_PATH.open(mode='a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([now, "Question", question])
-            writer.writerow([now, "Response", response])
-    except Exception as e:
-        logger.error(f"Failed to log interaction: {e}")
+    with open(LOG_CSV_PATH, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([now, "Question", question])
+        writer.writerow([now, "Response", response])
 
-def send_notification(title: str, message: str):
-    """Send a desktop notification."""
-    notify2.init('Assistant')
-    notification = notify2.Notification(title, message)
-    notification.set_timeout(30000)
-    notification.show()
+# Send desktop notifications
+def send_notification(title, message):
+    notify2.init('NixOS Assistant')
+    n = notify2.Notification(title, message)
+    n.set_timeout(30000)
+    n.show()
 
-def calculate_rms(data: bytes) -> float:
-    """Calculate the RMS of audio data."""
+# Calculate RMS for silence detection
+def calculate_rms(data):
     as_ints = np.frombuffer(data, dtype=np.int16)
     rms = np.sqrt(np.mean(np.square(as_ints)))
     return rms
 
-def is_silence(data_chunk: bytes, threshold: int = THRESHOLD) -> bool:
-    """Determine if the audio chunk is silent."""
-    return calculate_rms(data_chunk) < threshold
+def is_silence(data_chunk, threshold=THRESHOLD):
+    rms = calculate_rms(data_chunk)
+    return rms < threshold
 
-def record_audio(file_path: Path):
-    """Record audio from the microphone until silence is detected."""
+# Record audio until silence is detected
+def record_audio(file_path):
     audio = pyaudio.PyAudio()
+    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
     frames = []
-    silent_chunks = 0
-    silence_chunk_limit = int(RATE / CHUNK * SILENCE_LIMIT)
+    silent_frames = 0
+    silence_threshold = int(RATE / CHUNK * SILENCE_LIMIT)
 
     try:
-        stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
         while True:
             data = stream.read(CHUNK, exception_on_overflow=False)
             frames.append(data)
             if is_silence(data):
-                silent_chunks += 1
-                if silent_chunks > silence_chunk_limit:
+                silent_frames += 1
+                if silent_frames >= silence_threshold:
                     break
             else:
-                silent_chunks = 0
+                silent_frames = 0
     except Exception as e:
         logger.error(f"Error recording audio: {e}")
     finally:
@@ -169,119 +164,117 @@ def record_audio(file_path: Path):
         wf.setframerate(RATE)
         wf.writeframes(b''.join(frames))
 
-def create_assistant(client: OpenAI) -> str:
-    """Create an assistant instance via the OpenAI API."""
-    assistant = client.assistant.create(
+# Create assistant using OpenAI Assistants API
+def create_assistant(client):
+    assistant = client.beta.assistants.create(
         name="NixOS Assistant",
-        description="An assistant integrated with NixOS.",
+        instructions="You are a helpful assistant integrated with NixOS...",
+        tools=[],
         model="gpt-4"
     )
     return assistant.id
 
-def create_thread(client: OpenAI) -> str:
-    """Create a conversation thread."""
-    thread = client.thread.create()
+# Create a new conversation thread
+def create_thread(client):
+    thread = client.beta.threads.create()
     return thread.id
 
-def add_message(client: OpenAI, thread_id: str, content: str):
-    """Add a message to the conversation thread."""
-    client.message.create(thread_id=thread_id, role="user", content=content)
+# Add user message to the thread
+def add_message(client, thread_id, content):
+    message = client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=content
+    )
+    return message
 
+# Custom event handler for assistant responses
 class CustomEventHandler(AssistantEventHandler):
-    """Custom event handler for processing assistant responses."""
-
     def __init__(self):
         super().__init__()
         self.response_text = ""
         self.text_queue = queue.Queue()
 
+    @override
     def on_text_delta(self, delta, snapshot):
         self.response_text += delta.value
         self.text_queue.put(delta.value)
 
-async def run_assistant(client: OpenAI, thread_id: str, assistant_id: str, is_text_input: bool = False) -> str:
-    """Run the assistant and handle the response."""
+# Run the assistant and handle responses
+def run_assistant(client, thread_id, assistant_id):
     event_handler = CustomEventHandler()
-    tts_task = asyncio.create_task(stream_speech(client, event_handler.text_queue))
+    tts_thread = threading.Thread(target=stream_speech, args=(event_handler.text_queue,))
+    tts_thread.start()
 
-    await client.assistant.run(
+    with client.beta.threads.runs.stream(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        event_handler=event_handler
-    )
+        event_handler=event_handler,
+    ) as stream:
+        stream.until_done()
 
-    event_handler.text_queue.put(None)
-    await tts_task
+    event_handler.text_queue.put(None)  # Signal TTS thread to complete
+    tts_thread.join()
 
     return event_handler.response_text
 
-async def stream_speech(client: OpenAI, text_queue: queue.Queue):
-    """Stream text-to-speech as text is generated."""
+# Stream speech output using TTS
+def stream_speech(text_queue):
+    full_text = ""
     buffer = ""
     process = None
+    sentence_end_pattern = re.compile(r'(?<=[.!?])\s+')
+
+    def send_chunk_to_tts(chunk):
+        nonlocal process
+        try:
+            tts_process = subprocess.Popen(
+                ['espeak', '-v', 'en-us', chunk],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            tts_process.communicate()
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
 
     try:
         while True:
             text_chunk = text_queue.get()
             if text_chunk is None:
                 break
+            full_text += text_chunk
             buffer += text_chunk
-
-            if len(buffer.split()) >= 10:
-                await synthesize_and_play(client, buffer)
-                buffer = ""
-        if buffer:
-            await synthesize_and_play(client, buffer)
+            sentences = sentence_end_pattern.split(buffer)
+            if len(sentences) > 1:
+                send_chunk_to_tts(sentences[0])
+                buffer = ''.join(sentences[1:])
     except Exception as e:
         logger.error(f"Error in stream_speech: {e}")
-    finally:
-        if process:
-            process.terminate()
 
-async def synthesize_and_play(client: OpenAI, text: str):
-    """Synthesize text to speech and play it."""
-    try:
-        audio_data = await client.audio.synthesize(text=text)
-        play_audio_stream(audio_data)
-    except Exception as e:
-        logger.error(f"Error synthesizing speech: {e}")
-
-def play_audio(file_path: Path):
-    """Play an audio file."""
-    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(file_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def play_audio_stream(audio_data: bytes):
-    """Play audio data using ffplay."""
-    process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        process.stdin.write(audio_data)
-        process.stdin.close()
-        process.wait()
-    except Exception as e:
-        logger.error(f"Error playing audio stream: {e}")
-    finally:
-        process.terminate()
-
-def get_context(question: str) -> str:
-    """Gather additional context if the question pertains to NixOS or clipboard."""
+# Augment user question with additional context
+def get_context(question):
     context = question
     if "nixos" in question.lower():
         try:
             with open('/etc/nixos/flake.nix', 'r') as file:
                 nixos_config = file.read()
-            context += f"\n\nCurrent flake.nix configuration:\n{nixos_config}"
-        except Exception as e:
-            logger.error(f"Error reading flake.nix: {e}")
+            context += f"\n\nFlake.nix configuration:\n{nixos_config}"
+        except FileNotFoundError:
+            context += "\n\nFlake.nix configuration file not found."
     if "clipboard" in question.lower():
         try:
             clipboard_content = subprocess.check_output(['wl-paste'], text=True)
             context += f"\n\nClipboard content:\n{clipboard_content}"
-        except Exception as e:
-            logger.error(f"Error accessing clipboard: {e}")
+        except subprocess.CalledProcessError:
+            context += "\n\nClipboard is empty or unavailable."
     return context
 
+# Play audio files
+def play_audio(file_path):
+    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(file_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# Main function to orchestrate the assistant interaction
 def main():
-    """Main function to execute the assistant script."""
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -293,47 +286,48 @@ def main():
         client = OpenAI(api_key=api_key)
 
         if ASSISTANT_DATA_FILE.exists():
-            with ASSISTANT_DATA_FILE.open('r') as f:
+            with open(ASSISTANT_DATA_FILE, 'r') as f:
                 assistant_data = json.load(f)
             assistant_id = assistant_data['assistant_id']
             thread_id = assistant_data['thread_id']
         else:
             assistant_id = create_assistant(client)
             thread_id = create_thread(client)
-            with ASSISTANT_DATA_FILE.open('w') as f:
+            with open(ASSISTANT_DATA_FILE, 'w') as f:
                 json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
 
         if len(sys.argv) > 1:
+            # Command-line input
             transcript = " ".join(sys.argv[1:])
             is_text_input = True
         else:
+            # Audio input
             is_text_input = False
-            play_audio(AUDIO_FILES['welcome'])
-            send_notification("NixOS Assistant", "Recording...")
+            play_audio(WELCOME_FILE_PATH)
+            send_notification("NixOS Assistant:", "Recording")
             record_audio(RECORDED_AUDIO_PATH)
-            play_audio(AUDIO_FILES['processing'])
+            play_audio(PROCESS_FILE_PATH)
 
-            with RECORDED_AUDIO_PATH.open("rb") as audio_file:
-                transcript = client.audio.transcribe(audio_file)
-        
+            with open(RECORDED_AUDIO_PATH, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
+
         context = get_context(transcript)
+        if not is_text_input:
+            send_notification("You asked:", transcript)
         add_message(client, thread_id, context)
 
-        if not is_text_input:
-            send_notification("You asked", transcript)
+        response = run_assistant(client, thread_id, assistant_id)
+        send_notification("NixOS Assistant:", response)
 
-        response = asyncio.run(run_assistant(client, thread_id, assistant_id, is_text_input))
-
-        if is_text_input:
-            print(response)
-        else:
-            send_notification("NixOS Assistant", response)
-        
         log_interaction(transcript, response)
 
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        send_notification("NixOS Assistant Error", f"An error occurred: {e}")
+        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
     finally:
         delete_lock()
 
