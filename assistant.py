@@ -22,6 +22,7 @@ import notify2
 
 # Import the latest OpenAI SDK
 from openai import OpenAI, AssistantEventHandler
+from openai.error import AuthenticationError, OpenAIError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +34,7 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 22050
-THRESHOLD = 30
+THRESHOLD = 30  # Initial silence threshold
 SILENCE_LIMIT = 4
 
 # Paths and directories
@@ -53,9 +54,14 @@ WELCOME_FILE_PATH = ASSETS_DIR / "welcome.mp3"
 PROCESS_FILE_PATH = ASSETS_DIR / "process.mp3"
 APIKEY_FILE_PATH = ASSETS_DIR / "apikey.mp3"
 
+# Global variable to store ffmpeg process ID
+ffmpeg_process = None
+
 # Signal handling for graceful exit
 def signal_handler(sig, frame):
     delete_lock()
+    if ffmpeg_process and ffmpeg_process.poll() is None:
+        ffmpeg_process.terminate()
     sys.exit(0)
 
 # Load or prompt for OpenAI API key
@@ -91,6 +97,12 @@ def check_and_kill_existing_process():
             try:
                 lock_data = json.load(lock_file)
                 script_pid = lock_data.get('script_pid')
+                ffmpeg_pid = lock_data.get('ffmpeg_pid')
+                if ffmpeg_pid:
+                    try:
+                        os.kill(ffmpeg_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 if script_pid and script_pid != os.getpid():
                     os.kill(script_pid, signal.SIGTERM)
                     send_notification("NixOS Assistant:", "Previous instance terminated.")
@@ -99,8 +111,11 @@ def check_and_kill_existing_process():
                 LOCK_FILE_PATH.unlink()
 
 # Create and delete lock files
-def create_lock():
-    lock_data = {'script_pid': os.getpid()}
+def create_lock(ffmpeg_pid=None):
+    lock_data = {
+        'script_pid': os.getpid(),
+        'ffmpeg_pid': ffmpeg_pid
+    }
     with open(LOCK_FILE_PATH, 'w') as lock_file:
         json.dump(lock_data, lock_file)
 
@@ -129,12 +144,31 @@ def calculate_rms(data):
     rms = np.sqrt(np.mean(np.square(as_ints)))
     return rms
 
-def is_silence(data_chunk, threshold=THRESHOLD):
+def is_silence(data_chunk, threshold):
     rms = calculate_rms(data_chunk)
     return rms < threshold
 
+# Record ambient noise to adjust threshold
+def adjust_threshold():
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    try:
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        rms = calculate_rms(data)
+        adjusted_threshold = rms + 10  # Add a buffer to the ambient noise level
+        logger.info(f"Adjusted silence threshold: {adjusted_threshold}")
+        return adjusted_threshold
+    except Exception as e:
+        logger.error(f"Error adjusting threshold: {e}")
+        return THRESHOLD  # Use default if adjustment fails
+    finally:
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
+
 # Record audio until silence is detected
 def record_audio(file_path):
+    threshold = adjust_threshold()
     audio = pyaudio.PyAudio()
     stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
     frames = []
@@ -145,7 +179,7 @@ def record_audio(file_path):
         while True:
             data = stream.read(CHUNK, exception_on_overflow=False)
             frames.append(data)
-            if is_silence(data):
+            if is_silence(data, threshold):
                 silent_frames += 1
                 if silent_frames >= silence_threshold:
                     break
@@ -168,7 +202,10 @@ def record_audio(file_path):
 def create_assistant(client):
     assistant = client.beta.assistants.create(
         name="NixOS Assistant",
-        instructions="You are a helpful assistant integrated with NixOS...",
+        instructions=(
+            "You are a helpful assistant integrated with NixOS. Provide concise and accurate information. "
+            "If asked about system configurations or clipboard content, refer to the additional context provided."
+        ),
         tools=[],
         model="gpt-4"
     )
@@ -190,36 +227,61 @@ def add_message(client, thread_id, content):
 
 # Custom event handler for assistant responses
 class CustomEventHandler(AssistantEventHandler):
-    def __init__(self):
+    def __init__(self, is_text_input=False):
         super().__init__()
         self.response_text = ""
         self.text_queue = queue.Queue()
+        self.is_text_input = is_text_input
+
+    @override
+    def on_text_created(self, text) -> None:
+        if self.is_text_input:
+            print("\nAssistant:", end=' ', flush=True)
 
     @override
     def on_text_delta(self, delta, snapshot):
         self.response_text += delta.value
-        self.text_queue.put(delta.value)
+        if self.is_text_input:
+            print(delta.value, end='', flush=True)
+        else:
+            self.text_queue.put(delta.value)
+
+    @override
+    def on_run_end(self):
+        if not self.is_text_input:
+            self.text_queue.put(None)  # Signal TTS thread to complete
 
 # Run the assistant and handle responses
-def run_assistant(client, thread_id, assistant_id):
-    event_handler = CustomEventHandler()
-    tts_thread = threading.Thread(target=stream_speech, args=(event_handler.text_queue,))
-    tts_thread.start()
+def run_assistant(client, thread_id, assistant_id, is_text_input=False):
+    event_handler = CustomEventHandler(is_text_input)
+    tts_thread = None
+    if not is_text_input:
+        tts_thread = threading.Thread(target=stream_speech, args=(client, event_handler.text_queue))
+        tts_thread.start()
 
-    with client.beta.threads.runs.stream(
-        thread_id=thread_id,
-        assistant_id=assistant_id,
-        event_handler=event_handler,
-    ) as stream:
-        stream.until_done()
+    try:
+        with client.beta.threads.runs.stream(
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            event_handler=event_handler,
+        ) as stream:
+            stream.until_done()
+    except AuthenticationError:
+        handle_api_error()
+        sys.exit(1)
+    except OpenAIError as e:
+        logger.error(f"OpenAI API Error: {e}")
+        send_notification("NixOS Assistant Error", f"OpenAI API Error: {e}")
+        sys.exit(1)
 
-    event_handler.text_queue.put(None)  # Signal TTS thread to complete
-    tts_thread.join()
+    if tts_thread:
+        tts_thread.join()
 
     return event_handler.response_text
 
-# Stream speech output using TTS
-def stream_speech(text_queue):
+# Stream speech output using OpenAI's TTS API
+def stream_speech(client, text_queue):
+    global ffmpeg_process
     full_text = ""
     buffer = ""
     process = None
@@ -228,28 +290,58 @@ def stream_speech(text_queue):
     def send_chunk_to_tts(chunk):
         nonlocal process
         try:
-            tts_process = subprocess.Popen(
-                ['espeak', '-v', 'en-us', chunk],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+            response = client.audio.speech.create(
+                model="tts-1",
+                voice="nova",
+                input=chunk
             )
-            tts_process.communicate()
+            if not process:
+                process = subprocess.Popen(
+                    ['ffplay', '-autoexit', '-nodisp', '-'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                ffmpeg_process = process  # Store global ffmpeg_process
+                create_lock(ffmpeg_pid=process.pid)
+            for audio_chunk in response.iter_bytes(chunk_size=4096):
+                if audio_chunk:
+                    process.stdin.write(audio_chunk)
+                    process.stdin.flush()
         except Exception as e:
-            logger.error(f"TTS error: {e}")
+            logger.error(f"Error in TTS or audio playback: {str(e)}")
 
     try:
         while True:
-            text_chunk = text_queue.get()
+            try:
+                text_chunk = text_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
             if text_chunk is None:
                 break
+
             full_text += text_chunk
             buffer += text_chunk
+
+            # Split the buffer into sentences
             sentences = sentence_end_pattern.split(buffer)
-            if len(sentences) > 1:
-                send_chunk_to_tts(sentences[0])
-                buffer = ''.join(sentences[1:])
+            # Process complete sentences
+            while len(sentences) > 1:
+                chunk_to_send = sentences.pop(0)
+                send_chunk_to_tts(chunk_to_send)
+            buffer = sentences[0] if sentences else ''
+        # Send any remaining text in the buffer
+        if buffer:
+            send_chunk_to_tts(buffer)
     except Exception as e:
-        logger.error(f"Error in stream_speech: {e}")
+        logger.error(f"Unexpected error in stream_speech: {str(e)}")
+    finally:
+        if process:
+            process.stdin.close()
+            process.wait()
+            ffmpeg_process = None
+            create_lock()  # Update lock file without ffmpeg_pid
 
 # Augment user question with additional context
 def get_context(question):
@@ -258,20 +350,25 @@ def get_context(question):
         try:
             with open('/etc/nixos/flake.nix', 'r') as file:
                 nixos_config = file.read()
-            context += f"\n\nFlake.nix configuration:\n{nixos_config}"
+            context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
         except FileNotFoundError:
-            context += "\n\nFlake.nix configuration file not found."
+            context += "\n\nUnable to find the flake.nix configuration file."
+        except Exception as e:
+            context += f"\n\nAn error occurred while reading the flake.nix configuration: {str(e)}"
     if "clipboard" in question.lower():
         try:
             clipboard_content = subprocess.check_output(['wl-paste'], text=True)
-            context += f"\n\nClipboard content:\n{clipboard_content}"
+            context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
         except subprocess.CalledProcessError:
             context += "\n\nClipboard is empty or unavailable."
+        except Exception as e:
+            context += f"\n\nAn unexpected error occurred while retrieving clipboard content: {e}"
     return context
 
 # Play audio files
 def play_audio(file_path):
-    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(file_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(file_path)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # Main function to orchestrate the assistant interaction
 def main():
@@ -320,16 +417,27 @@ def main():
             send_notification("You asked:", transcript)
         add_message(client, thread_id, context)
 
-        response = run_assistant(client, thread_id, assistant_id)
-        send_notification("NixOS Assistant:", response)
+        response = run_assistant(client, thread_id, assistant_id, is_text_input=is_text_input)
+        if is_text_input:
+            print()
+        else:
+            send_notification("NixOS Assistant:", response)
 
         log_interaction(transcript, response)
 
+    except AuthenticationError:
+        handle_api_error()
+        sys.exit(1)
+    except OpenAIError as e:
+        logger.error(f"OpenAI API Error: {e}")
+        send_notification("NixOS Assistant Error", f"OpenAI API Error: {e}")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
         send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
     finally:
         delete_lock()
+        if ffmpeg_process and ffmpeg_process.poll() is None:
+            ffmpeg_process.terminate()
 
 if __name__ == "__main__":
     main()
