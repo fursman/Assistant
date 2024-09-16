@@ -23,7 +23,6 @@ import notify2
 # Import the OpenAI SDK and exceptions
 import openai
 from openai import OpenAIError, AuthenticationError
-from openai import OpenAI, AssistantEventHandler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +31,8 @@ logger = logging.getLogger(__name__)
 
 # Suppress ALSA warnings
 os.environ["PYTHONWARNINGS"] = "ignore"
-os.environ["ALSA_NO_CONFIGURE"] = "1"
+os.environ["ALSA_LOG_LEVEL"] = "quiet"
+os.environ["SDL_AUDIODRIVER"] = "dsp"
 
 # Audio configurations
 CHUNK = 1024
@@ -146,6 +146,8 @@ def send_notification(title, message):
 # Calculate RMS for silence detection
 def calculate_rms(data):
     as_ints = np.frombuffer(data, dtype=np.int16)
+    if len(as_ints) == 0:
+        return 0
     rms = np.sqrt(np.mean(np.square(as_ints)))
     return rms
 
@@ -203,72 +205,48 @@ def record_audio(file_path):
         wf.setframerate(RATE)
         wf.writeframes(b''.join(frames))
 
-# Create assistant using OpenAI Assistants API
-def create_assistant(client):
-    assistant = client.beta.assistants.create(
-        name="NixOS Assistant",
-        instructions=(
-            "You are a helpful assistant integrated with NixOS. Provide concise and accurate information. "
-            "If asked about system configurations or clipboard content, refer to the additional context provided."
-        ),
-        tools=[],
-        model="gpt-4"
-    )
-    return assistant.id
-
-# Create a new conversation thread
-def create_thread(client):
-    thread = client.beta.threads.create()
-    return thread.id
-
-# Add user message to the thread
-def add_message(client, thread_id, content):
-    message = client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=content
-    )
-    return message
+# Create assistant using OpenAI's Chat API
+def create_assistant():
+    # For OpenAI's Chat API, assistant creation is not required
+    pass
 
 # Custom event handler for assistant responses
-class CustomEventHandler(AssistantEventHandler):
+class CustomEventHandler:
     def __init__(self, is_text_input=False):
-        super().__init__()
         self.response_text = ""
         self.text_queue = queue.Queue()
         self.is_text_input = is_text_input
 
-    @override
-    def on_text_created(self, text) -> None:
-        print("\nAssistant:", end=' ', flush=True)
-
-    @override
-    def on_text_delta(self, delta, snapshot):
-        self.response_text += delta.value
-        print(delta.value, end='', flush=True)
+    def handle_response(self, content):
+        self.response_text += content
+        print(content, end='', flush=True)
         if not self.is_text_input:
-            self.text_queue.put(delta.value)
+            self.text_queue.put(content)
 
-    @override
-    def on_run_end(self):
+    def finish(self):
         if not self.is_text_input:
             self.text_queue.put(None)  # Signal TTS thread to complete
 
 # Run the assistant and handle responses
-def run_assistant(client, thread_id, assistant_id, is_text_input=False):
+def run_assistant(prompt, is_text_input=False):
     event_handler = CustomEventHandler(is_text_input)
     tts_thread = None
     if not is_text_input:
-        tts_thread = threading.Thread(target=stream_speech, args=(client, event_handler.text_queue))
+        tts_thread = threading.Thread(target=stream_speech, args=(event_handler.text_queue,))
         tts_thread.start()
 
     try:
-        with client.beta.threads.runs.stream(
-            thread_id=thread_id,
-            assistant_id=assistant_id,
-            event_handler=event_handler,
-        ) as stream:
-            stream.until_done()
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=prompt,
+            stream=True
+        )
+        print("\nAssistant:", end=' ', flush=True)
+        for chunk in response:
+            if 'choices' in chunk:
+                delta = chunk['choices'][0]['delta'].get('content', '')
+                event_handler.handle_response(delta)
+        event_handler.finish()
     except AuthenticationError:
         handle_api_error()
         sys.exit(1)
@@ -286,8 +264,8 @@ def run_assistant(client, thread_id, assistant_id, is_text_input=False):
 
     return event_handler.response_text
 
-# Stream speech output using OpenAI's TTS API
-def stream_speech(client, text_queue):
+# Stream speech output using a TTS engine
+def stream_speech(text_queue):
     global ffmpeg_process
     buffer = ""
     process = None
@@ -296,34 +274,29 @@ def stream_speech(client, text_queue):
     def send_chunk_to_tts(chunk):
         nonlocal process
         try:
-            response = client.audio.speech.create(
-                model="tts-1",
-                voice="nova",
-                input=chunk
-            )
+            tts_command = ['espeak', '-s', '150', '-v', 'en-us', '--stdout']
             if not process:
                 process = subprocess.Popen(
-                    ['ffplay', '-autoexit', '-nodisp', '-'],
+                    tts_command,
                     stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL
+                )
+                ffmpeg_process = subprocess.Popen(
+                    ['ffplay', '-autoexit', '-nodisp', '-'],
+                    stdin=process.stdout,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
-                ffmpeg_process = process  # Store global ffmpeg_process
-                create_lock(ffmpeg_pid=process.pid)
-            for audio_chunk in response.iter_bytes(chunk_size=4096):
-                if audio_chunk:
-                    process.stdin.write(audio_chunk)
-                    process.stdin.flush()
+                create_lock(ffmpeg_pid=ffmpeg_process.pid)
+            process.stdin.write(chunk.encode('utf-8') + b'\n')
+            process.stdin.flush()
         except Exception as e:
             logger.error(f"Error in TTS or audio playback: {str(e)}")
 
     try:
         while True:
-            try:
-                text_chunk = text_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
+            text_chunk = text_queue.get()
             if text_chunk is None:
                 break
 
@@ -332,19 +305,20 @@ def stream_speech(client, text_queue):
             # Split the buffer into sentences
             sentences = sentence_end_pattern.split(buffer)
             # Process complete sentences
-            while len(sentences) > 1:
-                chunk_to_send = sentences.pop(0)
-                send_chunk_to_tts(chunk_to_send)
-            buffer = sentences[0] if sentences else ''
+            for sentence in sentences[:-1]:
+                send_chunk_to_tts(sentence)
+            buffer = sentences[-1]
         # Send any remaining text in the buffer
-        if buffer:
+        if buffer.strip():
             send_chunk_to_tts(buffer)
     except Exception as e:
-        logger.error(f"Unexpected error in stream_speech: {str(e)}")
+        logger.error(f"Unexpected error in stream_speech: {e}")
     finally:
         if process:
             process.stdin.close()
             process.wait()
+        if ffmpeg_process:
+            ffmpeg_process.wait()
             ffmpeg_process = None
             create_lock()  # Update lock file without ffmpeg_pid
 
@@ -385,18 +359,7 @@ def main():
 
     try:
         api_key = load_api_key()
-        client = OpenAI(api_key=api_key)
-
-        if ASSISTANT_DATA_FILE.exists():
-            with open(ASSISTANT_DATA_FILE, 'r') as f:
-                assistant_data = json.load(f)
-            assistant_id = assistant_data['assistant_id']
-            thread_id = assistant_data['thread_id']
-        else:
-            assistant_id = create_assistant(client)
-            thread_id = create_thread(client)
-            with open(ASSISTANT_DATA_FILE, 'w') as f:
-                json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
+        openai.api_key = api_key  # Set the API key for the openai package
 
         if len(sys.argv) > 1:
             # Command-line input
@@ -411,20 +374,29 @@ def main():
             play_audio(PROCESS_FILE_PATH)
 
             with open(RECORDED_AUDIO_PATH, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="text"
+                transcript_response = openai.Audio.transcribe(
+                    "whisper-1",
+                    audio_file
                 )
+                transcript = transcript_response['text']
 
         context = get_context(transcript)
         if not is_text_input:
             send_notification("You asked:", transcript)
-        add_message(client, thread_id, context)
 
-        response = run_assistant(client, thread_id, assistant_id, is_text_input=is_text_input)
+        # Prepare messages for OpenAI ChatCompletion
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant integrated with NixOS. Provide concise and accurate information. If asked about system configurations or clipboard content, refer to the additional context provided."},
+            {"role": "user", "content": context}
+        ]
 
-        log_interaction(transcript, response)
+        response_text = run_assistant(messages, is_text_input=is_text_input)
+        print()  # For a new line after assistant's response
+
+        # Send notification with the assistant's response
+        send_notification("NixOS Assistant:", response_text)
+
+        log_interaction(transcript, response_text)
 
     except AuthenticationError:
         handle_api_error()
@@ -438,9 +410,9 @@ def main():
         send_notification("NixOS Assistant Error", f"An error occurred: {e}")
         sys.exit(1)
     finally:
-        delete_lock()
         if ffmpeg_process and ffmpeg_process.poll() is None:
             ffmpeg_process.terminate()
+        delete_lock()
 
 if __name__ == "__main__":
     main()
