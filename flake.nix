@@ -24,6 +24,7 @@
           ps.keyring
           ps.openai
           ps.sounddevice
+          ps.soundfile
         ]);
 
       in {
