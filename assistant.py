@@ -23,11 +23,16 @@ import notify2
 # Import the OpenAI SDK and handle exceptions
 import openai
 from openai import OpenAI, AssistantEventHandler
+from openai.error import AuthenticationError, OpenAIError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# Suppress ALSA warnings
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["ALSA_NO_CONFIGURE"] = "1"
 
 # Audio configurations
 CHUNK = 1024
@@ -235,15 +240,14 @@ class CustomEventHandler(AssistantEventHandler):
 
     @override
     def on_text_created(self, text) -> None:
-        if self.is_text_input:
+        if self.is_text_input or not self.is_text_input:
             print("\nAssistant:", end=' ', flush=True)
 
     @override
     def on_text_delta(self, delta, snapshot):
         self.response_text += delta.value
-        if self.is_text_input:
-            print(delta.value, end='', flush=True)
-        else:
+        print(delta.value, end='', flush=True)
+        if not self.is_text_input:
             self.text_queue.put(delta.value)
 
     @override
@@ -266,10 +270,10 @@ def run_assistant(client, thread_id, assistant_id, is_text_input=False):
             event_handler=event_handler,
         ) as stream:
             stream.until_done()
-    except openai.error.AuthenticationError:
+    except AuthenticationError:
         handle_api_error()
         sys.exit(1)
-    except openai.error.OpenAIError as e:
+    except OpenAIError as e:
         logger.error(f"OpenAI API Error: {e}")
         send_notification("NixOS Assistant Error", f"OpenAI API Error: {e}")
         sys.exit(1)
@@ -429,15 +433,17 @@ def main():
 
         log_interaction(transcript, response)
 
-    except openai.error.AuthenticationError:
+    except AuthenticationError:
         handle_api_error()
         sys.exit(1)
-    except openai.error.OpenAIError as e:
+    except OpenAIError as e:
         logger.error(f"OpenAI API Error: {e}")
         send_notification("NixOS Assistant Error", f"OpenAI API Error: {e}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"An error occurred: {e}")
         send_notification("NixOS Assistant Error", f"An error occurred: {e}")
+        sys.exit(1)
     finally:
         delete_lock()
         if ffmpeg_process and ffmpeg_process.poll() is None:
