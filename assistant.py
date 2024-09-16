@@ -20,10 +20,10 @@ import numpy as np
 import keyring
 import notify2
 
-# Import the OpenAI SDK and handle exceptions
+# Import the OpenAI SDK and exceptions
 import openai
+from openai import OpenAIError, AuthenticationError
 from openai import OpenAI, AssistantEventHandler
-from openai.error import AuthenticationError, OpenAIError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,7 +59,7 @@ WELCOME_FILE_PATH = ASSETS_DIR / "welcome.mp3"
 PROCESS_FILE_PATH = ASSETS_DIR / "process.mp3"
 APIKEY_FILE_PATH = ASSETS_DIR / "apikey.mp3"
 
-# Global variable to store ffmpeg process ID
+# Global variable to store ffmpeg process
 ffmpeg_process = None
 
 # Signal handling for graceful exit
@@ -240,8 +240,7 @@ class CustomEventHandler(AssistantEventHandler):
 
     @override
     def on_text_created(self, text) -> None:
-        if self.is_text_input or not self.is_text_input:
-            print("\nAssistant:", end=' ', flush=True)
+        print("\nAssistant:", end=' ', flush=True)
 
     @override
     def on_text_delta(self, delta, snapshot):
@@ -290,7 +289,6 @@ def run_assistant(client, thread_id, assistant_id, is_text_input=False):
 # Stream speech output using OpenAI's TTS API
 def stream_speech(client, text_queue):
     global ffmpeg_process
-    full_text = ""
     buffer = ""
     process = None
     sentence_end_pattern = re.compile(r'(?<=[.!?])\s+')
@@ -329,7 +327,6 @@ def stream_speech(client, text_queue):
             if text_chunk is None:
                 break
 
-            full_text += text_chunk
             buffer += text_chunk
 
             # Split the buffer into sentences
@@ -426,10 +423,6 @@ def main():
         add_message(client, thread_id, context)
 
         response = run_assistant(client, thread_id, assistant_id, is_text_input=is_text_input)
-        if is_text_input:
-            print()
-        else:
-            send_notification("NixOS Assistant:", response)
 
         log_interaction(transcript, response)
 
