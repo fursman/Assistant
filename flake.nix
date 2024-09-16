@@ -23,6 +23,7 @@
           ps.notify2
           ps.keyring
           ps.openai
+          ps.sounddevice
         ]);
 
       in {
