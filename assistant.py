@@ -178,13 +178,15 @@ def send_text_input(ws, text):
     # Request a response
     ws.send(json.dumps({"type": "response.create"}))
 
-def handle_server_events(ws, is_text_input=False):
+def handle_server_events(message_queue, is_text_input=False):
     response_text = ""
     tts_process = None
 
     while True:
         try:
-            data = ws.recv()
+            data = message_queue.get(timeout=1)
+            if data is None:
+                break  # Exit loop when None is received
             event = json.loads(data)
             event_type = event.get('type')
 
@@ -218,10 +220,8 @@ def handle_server_events(ws, is_text_input=False):
                 break
             else:
                 pass  # Handle other event types if needed
-        except websocket.WebSocketTimeoutException:
+        except queue.Empty:
             continue
-        except websocket.WebSocketConnectionClosedException:
-            break
         except Exception as e:
             logger.error(f"Error receiving data: {str(e)}")
             break
@@ -272,13 +272,27 @@ def main():
             "OpenAI-Beta": "realtime=v1",
         }
 
+        message_queue = queue.Queue()
+
+        def on_open(ws):
+            logger.info("Connected to Realtime API.")
+
+        def on_message(ws, message):
+            message_queue.put(message)
+
+        def on_error(ws, error):
+            logger.error(f"WebSocket error: {error}")
+
+        def on_close(ws, close_status_code, close_msg):
+            logger.info("WebSocket connection closed.")
+
         ws = websocket.WebSocketApp(
             url,
             header=headers,
-            on_open=lambda ws: logger.info("Connected to Realtime API."),
-            on_message=lambda ws, msg: None,  # We'll handle messages in a loop
-            on_error=lambda ws, err: logger.error(f"WebSocket error: {err}"),
-            on_close=lambda ws: logger.info("WebSocket connection closed."),
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
         )
 
         # Start WebSocket in a thread
@@ -320,7 +334,7 @@ def main():
             play_audio(process_file_path)
 
         # Handle server events
-        response_text = handle_server_events(ws, is_text_input)
+        response_text = handle_server_events(message_queue, is_text_input)
 
         if not is_text_input:
             send_notification("NixOS Assistant:", response_text)
