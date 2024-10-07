@@ -223,7 +223,7 @@ def main():
             transcript = " ".join(sys.argv[1:])
             logger.info(f"Sending text input: {transcript}")
             if is_ws_connected():
-                session.ws_app.send(json.dumps({
+                message_payload = {
                     "type": "conversation.item.create",
                     "item": {
                         "type": "message",
@@ -233,9 +233,11 @@ def main():
                             "text": transcript
                         }]
                     }
-                }))
+                }
+                logger.debug(f"Sending message payload: {json.dumps(message_payload)}")
+                session.ws_app.send(json.dumps(message_payload))
                 # Wait for the response to be received
-                response_received_event.wait(timeout=30)
+                response_received_event.wait(timeout=60)  # Increase timeout to 60 seconds
                 if response_received_event.is_set():
                     print("Response from Assistant:", " ".join(session.response_text).strip())
                 else:
