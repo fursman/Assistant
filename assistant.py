@@ -170,32 +170,35 @@ def on_open(ws):
     ws.send(json.dumps({
         "type": "response.create",
         "response": {
-            "modalities": ["text", "audio"],
+            "modalities": ["text"],  # Ensure only text responses are requested for text queries
             "instructions": "Please assist the user."
         }
     }))
 
 def on_message(ws, message):
     logger.debug(f"Received message: {message}")
-    response = json.loads(message)
+    try:
+        response = json.loads(message)
+    except json.JSONDecodeError:
+        logger.error("Failed to decode message from server.")
+        return
+
     response_type = response.get("type")
 
     if response_type == "conversation.item.create":
-        content = response["item"]["content"][0]
-        if content["type"] == "input_text":
-            logger.info(f"Received text response: {content['text']}")
-            print("Response from Assistant:", content["text"])
-        elif content["type"] == "input_audio":
-            logger.info("Received audio response, playing audio.")
-            audio_bytes = base64.b64decode(content["audio"])
-            play_audio_from_bytes(audio_bytes)
+        content = response.get("item", {}).get("content", [{}])[0]
+        if content.get("type") == "input_text":
+            text = content.get("text", "")
+            logger.info(f"Received text response: {text}")
+            print("Response from Assistant:", text)
+        else:
+            logger.warning(f"Unexpected content type received: {content.get('type')}")
     elif response_type == "response.audio_transcript.delta":
         # Handle incremental text transcript updates
-        delta_text = response["delta"]["text"]
-        logger.info(f"Transcript delta: {delta_text}")
-        print(delta_text, end='', flush=True)
-    elif response_type == "response.audio.done":
-        logger.info("Audio response completed.")
+        delta_text = response.get("delta", {}).get("text", "")
+        if delta_text:
+            logger.info(f"Transcript delta: {delta_text}")
+            print(delta_text, end='', flush=True)
     elif response_type == "response.done":
         logger.info("Response completed.")
         ws.close()
@@ -214,9 +217,12 @@ def on_close(ws, close_status_code, close_msg):
 
 def play_audio_from_bytes(audio_bytes):
     process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
-    process.stdin.write(audio_bytes)
-    process.stdin.close()
-    process.wait()
+    try:
+        process.stdin.write(audio_bytes)
+        process.stdin.close()
+        process.wait()
+    except BrokenPipeError:
+        logger.error("Failed to play audio due to broken pipe.")
 
 def audio_to_base64_chunks(audio_bytes, chunk_size=32000):
     for i in range(0, len(audio_bytes), chunk_size):
