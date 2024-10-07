@@ -53,6 +53,8 @@ apikey_file_path = assets_directory / "apikey.mp3"
 
 def signal_handler(sig, frame):
     delete_lock()
+    if ws_app:
+        ws_app.close()
     sys.exit(0)
 
 def load_api_key():
@@ -164,7 +166,7 @@ def start_realtime_session(api_key):
     return ws
 
 def on_open(ws):
-    print("Connected to Realtime API.")
+    logger.info("Connected to Realtime API.")
     ws.send(json.dumps({
         "type": "response.create",
         "response": {
@@ -174,14 +176,19 @@ def on_open(ws):
     }))
 
 def on_message(ws, message):
+    logger.debug(f"Received message: {message}")
     response = json.loads(message)
     if response.get("type") == "conversation.item.create":
         content = response["item"]["content"][0]
         if content["type"] == "input_text":
+            logger.info(f"Received text response: {content['text']}")
             print("Response from Assistant:", content["text"])
         elif content["type"] == "input_audio":
+            logger.info("Received audio response, playing audio.")
             audio_bytes = base64.b64decode(content["audio"])
             play_audio_from_bytes(audio_bytes)
+    else:
+        logger.warning(f"Unexpected message type received: {response.get('type')}")
 
 def on_error(ws, error):
     logger.error(f"WebSocket error: {error}")
@@ -200,6 +207,7 @@ def audio_to_base64_chunks(audio_bytes, chunk_size=32000):
         yield base64.b64encode(audio_bytes[i:i+chunk_size]).decode()
 
 def main():
+    global ws_app
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -209,15 +217,16 @@ def main():
         create_lock()
 
         api_key = load_api_key()
-        ws = start_realtime_session(api_key)
+        ws_app = start_realtime_session(api_key)
 
-        ws_thread = threading.Thread(target=ws.run_forever)
+        ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
         ws_thread.start()
 
         if len(sys.argv) > 1:
             # Command-line input
             transcript = " ".join(sys.argv[1:])
-            ws.send(json.dumps({
+            logger.info(f"Sending text input: {transcript}")
+            ws_app.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
                     "type": "message",
@@ -238,18 +247,24 @@ def main():
             with open(recorded_audio_path, "rb") as audio_file:
                 audio_bytes = audio_file.read()
                 for audio_chunk in audio_to_base64_chunks(audio_bytes):
-                    ws.send(json.dumps({
+                    logger.debug("Sending audio chunk to server.")
+                    ws_app.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": audio_chunk
                     }))
-                ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                ws.send(json.dumps({"type": "response.create"}))
+                logger.info("Committing audio buffer and requesting response.")
+                ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                ws_app.send(json.dumps({"type": "response.create"}))
 
         ws_thread.join()
     except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
         send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
     finally:
+        if ws_app:
+            ws_app.close()
         delete_lock()
 
 if __name__ == "__main__":
+    ws_app = None
     main()
