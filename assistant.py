@@ -21,6 +21,7 @@ import base64
 import time
 from pathlib import Path
 from pydub import AudioSegment
+from threading import Event
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -51,6 +52,9 @@ welcome_file_path = assets_directory / "welcome.mp3"
 process_file_path = assets_directory / "process.mp3"
 gotit_file_path = assets_directory / "gotit.mp3"
 apikey_file_path = assets_directory / "apikey.mp3"
+
+# Event to track when the WebSocket connection is open
+ws_open_event = Event()
 
 def signal_handler(sig, frame):
     delete_lock()
@@ -168,6 +172,7 @@ def start_realtime_session(api_key):
 
 def on_open(ws):
     logger.info("Connected to Realtime API.")
+    ws_open_event.set()  # Signal that the WebSocket is open
 
 def on_message(ws, message):
     logger.debug(f"Received message: {message}")
@@ -203,6 +208,7 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
     logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+    ws_open_event.clear()  # Clear the event when the WebSocket is closed
 
 def play_audio_from_bytes(audio_bytes):
     process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
@@ -241,6 +247,12 @@ def main():
 
         ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
         ws_thread.start()
+
+        # Wait until the WebSocket is open before proceeding
+        ws_open_event.wait(timeout=10)
+        if not ws_open_event.is_set():
+            logger.error("WebSocket connection timed out.")
+            return
 
         if len(sys.argv) > 1:
             # Command-line input
