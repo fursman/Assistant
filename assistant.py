@@ -187,18 +187,21 @@ def on_message(ws, message):
 
     response_type = response.get("type")
 
-    if response_type == "conversation.item.create":
+    if response_type in ("conversation.item.create", "response.content_part.added"):
         content = response.get("item", {}).get("content", [{}])[0]
         if content.get("type") == "input_text":
             text = content.get("text", "")
             logger.info(f"Received text response: {text}")
-            response_text = text
-            response_received_event.set()
-            ws.close()  # Close the WebSocket after receiving the text response
+            response_text += text + " "
+        elif content.get("type") == "text":
+            text = content.get("text", "")
+            logger.info(f"Received text content part: {text}")
+            response_text += text + " "
         else:
             logger.warning(f"Unexpected content type received: {content.get('type')}")
     elif response_type == "response.done":
         logger.info("Response completed.")
+        response_received_event.set()
         ws.close()
     else:
         logger.warning(f"Unexpected message type received: {response_type}")
@@ -277,7 +280,7 @@ def main():
                 # Wait for the response to be received
                 response_received_event.wait(timeout=30)
                 if response_received_event.is_set():
-                    print("Response from Assistant:", response_text)
+                    print("Response from Assistant:", response_text.strip())
                 else:
                     logger.error("Timeout waiting for response from server.")
                     ws_app.close()
@@ -294,29 +297,4 @@ def main():
                 audio_bytes = audio_file.read()
                 for audio_chunk in audio_to_base64_chunks(audio_bytes):
                     logger.debug("Sending audio chunk to server.")
-                    if ws_app and ws_app.sock and ws_app.sock.connected:
-                        ws_app.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": audio_chunk
-                        }))
-                    else:
-                        logger.error("WebSocket is not connected. Unable to send audio chunk.")
-                        return
-                logger.info("Committing audio buffer and requesting response.")
-                if ws_app and ws_app.sock and ws_app.sock.connected:
-                    ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    ws_app.send(json.dumps({"type": "response.create"}))
-                else:
-                    logger.error("WebSocket is not connected. Unable to commit audio buffer.")
-
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
-    finally:
-        if ws_app:
-            ws_app.close()
-        delete_lock()
-
-if __name__ == "__main__":
-    ws_app = None
-    main()
+                    if ws_app and ws_app.sock and ws_app.sock.connected
