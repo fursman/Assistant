@@ -18,6 +18,7 @@ import websocket
 import threading
 import queue
 import base64
+import time
 from pathlib import Path
 from pydub import AudioSegment
 
@@ -167,13 +168,6 @@ def start_realtime_session(api_key):
 
 def on_open(ws):
     logger.info("Connected to Realtime API.")
-    ws.send(json.dumps({
-        "type": "response.create",
-        "response": {
-            "modalities": ["text"],  # Ensure only text responses are requested for text queries
-            "instructions": "Please assist the user."
-        }
-    }))
 
 def on_message(ws, message):
     logger.debug(f"Received message: {message}")
@@ -191,14 +185,9 @@ def on_message(ws, message):
             text = content.get("text", "")
             logger.info(f"Received text response: {text}")
             print("Response from Assistant:", text)
+            ws.close()  # Close the WebSocket after receiving the text response
         else:
             logger.warning(f"Unexpected content type received: {content.get('type')}")
-    elif response_type == "response.audio_transcript.delta":
-        # Handle incremental text transcript updates
-        delta_text = response.get("delta", {}).get("text", "")
-        if delta_text:
-            logger.info(f"Transcript delta: {delta_text}")
-            print(delta_text, end='', flush=True)
     elif response_type == "response.done":
         logger.info("Response completed.")
         ws.close()
@@ -297,7 +286,15 @@ def main():
                 else:
                     logger.error("WebSocket is not connected. Unable to commit audio buffer.")
 
-        ws_thread.join()
+        # Wait for a reasonable amount of time for the response
+        start_time = time.time()
+        while ws_app.sock and ws_app.sock.connected:
+            if time.time() - start_time > 30:  # Timeout after 30 seconds
+                logger.error("Timeout waiting for response from server.")
+                ws_app.close()
+                break
+            time.sleep(1)
+
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
         send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
