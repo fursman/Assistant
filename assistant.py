@@ -135,44 +135,6 @@ def send_notification(title, message):
     n.set_timeout(30000)
     n.show()
 
-def calculate_rms(data):
-    as_ints = np.frombuffer(data, dtype=np.int16)
-    rms = np.sqrt(np.mean(np.square(as_ints)))
-    return rms
-
-def is_silence(data_chunk, threshold=THRESHOLD):
-    rms = calculate_rms(data_chunk)
-    return rms < threshold
-
-def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=CHUNK, silence_limit=SILENCE_LIMIT):
-    audio = pyaudio.PyAudio()
-    stream = audio.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk)
-
-    frames = []
-    silent_frames = 0
-    silence_threshold = int(rate / chunk * silence_limit)
-
-    try:
-        while True:
-            data = stream.read(chunk, exception_on_overflow=False)
-            frames.append(data)
-            if is_silence(data):
-                silent_frames += 1
-                if silent_frames >= silence_threshold:
-                    break
-            else:
-                silent_frames = 0
-    finally:
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
-
-    with wave.open(str(file_path), 'wb') as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(audio.get_sample_size(format))
-        wf.setframerate(rate)
-        wf.writeframes(b''.join(frames))
-
 def start_realtime_session(api_key):
     ws_url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
     headers = {
@@ -222,19 +184,6 @@ def on_error(ws, error):
 def on_close(ws, close_status_code, close_msg):
     logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
     ws_open_event.clear()  # Clear the event when the WebSocket is closed
-
-def play_audio_from_bytes(audio_bytes):
-    process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
-    try:
-        process.stdin.write(audio_bytes)
-        process.stdin.close()
-        process.wait()
-    except BrokenPipeError:
-        logger.error("Failed to play audio due to broken pipe.")
-
-def audio_to_base64_chunks(audio_bytes, chunk_size=32000):
-    for i in range(0, len(audio_bytes), chunk_size):
-        yield base64.b64encode(audio_bytes[i:i+chunk_size]).decode()
 
 def reconnect():
     if session.ws_app:
@@ -294,28 +243,14 @@ def main():
                     session.ws_app.close()
             else:
                 logger.error("WebSocket is not connected. Unable to send message.")
-        else:
-            # Audio input
-            play_audio(welcome_file_path)
-            send_notification("NixOS Assistant:", "Recording")
-            record_audio(recorded_audio_path)
-            play_audio(process_file_path)
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
+    finally:
+        if session.ws_app:
+            session.ws_app.close()
+        delete_lock()
 
-            with open(recorded_audio_path, "rb") as audio_file:
-                audio_bytes = audio_file.read()
-                for audio_chunk in audio_to_base64_chunks(audio_bytes):
-                    logger.debug("Sending audio chunk to server.")
-                    if is_ws_connected():
-                        session.ws_app.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": audio_chunk
-                        }))
-                    else:
-                        logger.error("WebSocket is not connected. Unable to send audio chunk.")
-                        return
-                logger.info("Committing audio buffer and requesting response.")
-                if is_ws_connected():
-                    session.ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    session.ws_app.send(json.dumps({"type": "response.create"}))
-                else:
-                    logger.error("WebSocket is not connected. Unable to commit audio buffer.")
+if __name__ == "__main__":
+    session = AssistantSession()
+    main()
