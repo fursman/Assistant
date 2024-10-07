@@ -14,11 +14,12 @@ import re
 import logging
 import json
 import keyring
-from pathlib import Path
-from openai import OpenAI, AssistantEventHandler
-from typing_extensions import override
+import websocket
 import threading
 import queue
+import base64
+from pathlib import Path
+from pydub import AudioSegment
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -152,153 +153,47 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
     wf.writeframes(b''.join(frames))
     wf.close()
 
-def create_assistant(client):
-    assistant = client.beta.assistants.create(
-        name="NixOS Assistant",
-        instructions="You are a helpful assistant integrated with NixOS. Provide concise and accurate information. If asked about system configurations or clipboard content, refer to the additional context provided.",
-        tools=[],
-        model="o1-mini"
-    )
-    return assistant.id
+def start_realtime_session(api_key):
+    ws_url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "OpenAI-Beta": "realtime=v1"
+    }
+    ws = websocket.WebSocketApp(ws_url, header=headers, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws.on_open = on_open
+    return ws
 
-def create_thread(client):
-    thread = client.beta.threads.create()
-    return thread.id
+def on_open(ws):
+    print("Connected to Realtime API.")
+    ws.send(json.dumps({
+        "type": "response.create",
+        "response": {
+            "modalities": ["text", "audio"],
+            "instructions": "Please assist the user."
+        }
+    }))
 
-def add_message(client, thread_id, content):
-    message = client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=content
-    )
-    return message
+def on_message(ws, message):
+    response = json.loads(message)
+    if response.get("type") == "conversation.item.create":
+        content = response["item"]["content"][0]
+        if content["type"] == "input_text":
+            print("Response from Assistant:", content["text"])
+        elif content["type"] == "input_audio":
+            audio_bytes = base64.b64decode(content["audio"])
+            play_audio_from_bytes(audio_bytes)
 
-class CustomEventHandler(AssistantEventHandler):
-    def __init__(self):
-        super().__init__()
-        self.response_text = ""
-        self.text_queue = queue.Queue()
-        self.is_text_input = False
+def on_error(ws, error):
+    logger.error(f"WebSocket error: {error}")
 
-    @override
-    def on_text_created(self, text) -> None:
-        pass
+def on_close(ws, close_status_code, close_msg):
+    logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
 
-    @override
-    def on_text_delta(self, delta, snapshot):
-        self.response_text += delta.value
-        self.text_queue.put(delta.value)
-        if self.is_text_input:
-            print(delta.value, end='', flush=True)
-
-def run_assistant(client, thread_id, assistant_id, is_text_input=False):
-    event_handler = CustomEventHandler()
-    event_handler.is_text_input = is_text_input
-
-    tts_thread = threading.Thread(target=stream_speech, args=(client, event_handler.text_queue))
-    tts_thread.start()
-
-    with client.beta.threads.runs.stream(
-        thread_id=thread_id,
-        assistant_id=assistant_id,
-        event_handler=event_handler,
-    ) as stream:
-        stream.until_done()
-
-    event_handler.text_queue.put(None)  # Signal TTS thread to complete
-    tts_thread.join()
-
-    return event_handler.response_text
-
-def stream_speech(client, text_queue):
-    full_text = ""
-    buffer = ""
-    process = None
-    sentence_end_pattern = re.compile(r'(?<=[.!?])\s+')
-
-    def send_chunk_to_tts(chunk):
-        nonlocal process
-        try:
-            response = client.audio.speech.create(
-                model="tts-1",
-                voice="nova",
-                input=chunk
-            )
-            if not process:
-                process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
-            for audio_chunk in response.iter_bytes(chunk_size=4096):
-                if audio_chunk:
-                    process.stdin.write(audio_chunk)
-                    process.stdin.flush()
-        except Exception as e:
-            logger.error(f"Error in TTS or audio playback: {str(e)}")
-
-    try:
-        while True:
-            try:
-                text_chunk = text_queue.get(timeout=0.1)  # Reduced timeout for faster processing
-            except queue.Empty:
-                if buffer:
-                    send_chunk_to_tts(buffer)
-                    buffer = ""
-                break
-
-            if text_chunk is None:
-                break
-
-            full_text += text_chunk
-            buffer += text_chunk
-
-            # Split the buffer into sentences
-            sentences = sentence_end_pattern.split(buffer)
-
-            # Process complete sentences if we have more than 50 words
-            chunk_to_send = ""
-            while len(sentences) > 1 and len(chunk_to_send.split()) < 50:
-                chunk_to_send += sentences.pop(0) + " "
-
-            # If we have at least 50 words and a complete sentence, send it
-            if len(chunk_to_send.split()) >= 50:
-                send_chunk_to_tts(chunk_to_send.strip())
-                buffer = ''.join(sentences)
-            else:
-                buffer = chunk_to_send + ''.join(sentences)
-
-        # Send any remaining text in the buffer
-        if buffer:
-            send_chunk_to_tts(buffer)
-
-    except Exception as e:
-        logger.error(f"Unexpected error in stream_speech: {str(e)}")
-    finally:
-        if process:
-            process.stdin.close()
-            process.wait()
-
-def get_context(question):
-    context = question
-    if "nixos" in question.lower():
-        try:
-            with open('/etc/nixos/flake.nix', 'r') as file:
-                nixos_config = file.read()
-            context += f"\n\nFor additional context, this is the system's current flake.nix configuration:\n{nixos_config}"
-        except FileNotFoundError:
-            context += "\n\nUnable to find the flake.nix configuration file."
-        except Exception as e:
-            context += f"\n\nAn error occurred while reading the flake.nix configuration: {str(e)}"
-
-    if "clipboard" in question.lower():
-        try:
-            clipboard_content = subprocess.check_output(['wl-paste'], text=True)
-            context += f"\n\nFor additional context, this is the current clipboard content:\n{clipboard_content}"
-        except subprocess.CalledProcessError as e:
-            context += "\n\nFailed to retrieve clipboard content. The clipboard might be empty or contain non-text data."
-        except Exception as e:
-            context += f"\n\nAn unexpected error occurred while retrieving clipboard content: {e}"
-    return context
-
-def play_audio(file_path):
-    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(file_path)], check=True)
+def play_audio_from_bytes(audio_bytes):
+    process = subprocess.Popen(['ffplay', '-autoexit', '-nodisp', '-'], stdin=subprocess.PIPE)
+    process.stdin.write(audio_bytes)
+    process.stdin.close()
+    process.wait()
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
@@ -309,61 +204,49 @@ def main():
     try:
         create_lock()
 
-        print()
-
         api_key = load_api_key()
-        client = OpenAI(api_key=api_key)
+        ws = start_realtime_session(api_key)
 
-        if assistant_data_file.exists():
-            with open(assistant_data_file, 'r') as f:
-                assistant_data = json.load(f)
-            assistant_id = assistant_data['assistant_id']
-            thread_id = assistant_data['thread_id']
-        else:
-            assistant_id = create_assistant(client)
-            thread_id = create_thread(client)
-            with open(assistant_data_file, 'w') as f:
-                json.dump({'assistant_id': assistant_id, 'thread_id': thread_id}, f)
+        ws_thread = threading.Thread(target=ws.run_forever)
+        ws_thread.start()
 
         if len(sys.argv) > 1:
             # Command-line input
             transcript = " ".join(sys.argv[1:])
-            is_text_input = True
+            ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": transcript
+                    }]
+                }
+            }))
         else:
             # Audio input
-            is_text_input = False
             play_audio(welcome_file_path)
             send_notification("NixOS Assistant:", "Recording")
             record_audio(recorded_audio_path)
             play_audio(process_file_path)
 
             with open(recorded_audio_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="text"
-                )
+                audio_bytes = audio_file.read()
+                audio_base64 = base64.b64encode(audio_bytes).decode()
+                ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_audio",
+                            "audio": audio_base64
+                        }]
+                    }
+                }))
 
-        context = get_context(transcript)
-        if not is_text_input:
-            send_notification("You asked:", transcript)
-        add_message(client, thread_id, context)
-
-        response = run_assistant(client, thread_id, assistant_id, is_text_input)
-        
-        if is_text_input:
-            print()
-        else:
-            send_notification("NixOS Assistant:", response)
-            
-            tts_queue = queue.Queue()
-            for chunk in response.split():
-                tts_queue.put(chunk + ' ')
-            tts_queue.put(None)
-            stream_speech(client, tts_queue)
-
-        log_interaction(transcript, response)
-
+        ws_thread.join()
     except Exception as e:
         send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
     finally:
