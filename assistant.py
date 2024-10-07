@@ -178,7 +178,7 @@ def send_text_input(ws, text):
     # Request a response
     ws.send(json.dumps({"type": "response.create"}))
 
-def handle_server_events(message_queue, is_text_input=False):
+def handle_server_events(message_queue, is_text_input=False, response_text_container=None):
     response_text = ""
     tts_process = None
 
@@ -187,7 +187,12 @@ def handle_server_events(message_queue, is_text_input=False):
             data = message_queue.get(timeout=1)
             if data is None:
                 break  # Exit loop when None is received
-            event = json.loads(data)
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+                logger.error(f"Received data: {data}")
+                continue  # Skip this message
             event_type = event.get('type')
 
             if event_type == 'error':
@@ -219,13 +224,15 @@ def handle_server_events(message_queue, is_text_input=False):
             elif event_type == 'response.done':
                 break
             else:
-                pass  # Handle other event types if needed
+                logger.debug(f"Unhandled event type: {event_type}")
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"Error receiving data: {str(e)}")
             break
 
+    if response_text_container is not None:
+        response_text_container.append(response_text)
     return response_text
 
 def get_context(question):
@@ -273,6 +280,8 @@ def main():
         }
 
         message_queue = queue.Queue()
+        transcript_container = []  # To store transcript
+        response_text_container = []  # To store response_text
 
         def on_open(ws):
             logger.info("Connected to Realtime API.")
@@ -291,6 +300,7 @@ def main():
             if len(sys.argv) > 1:
                 # Command-line input
                 transcript = " ".join(sys.argv[1:])
+                transcript_container.append(transcript)
                 is_text_input = True
                 context = get_context(transcript)
                 send_text_input(ws, context)
@@ -303,7 +313,7 @@ def main():
                 play_audio(process_file_path)
 
             # Start a thread to handle server events
-            threading.Thread(target=handle_server_events, args=(message_queue, is_text_input), daemon=True).start()
+            threading.Thread(target=handle_server_events, args=(message_queue, is_text_input, response_text_container), daemon=True).start()
 
         def on_message(ws, message):
             message_queue.put(message)
@@ -326,6 +336,20 @@ def main():
 
         # Run WebSocketApp (this call blocks)
         ws.run_forever(sslopt={'cert_reqs': ssl.CERT_NONE})
+
+        # After WebSocketApp finishes
+        if transcript_container and response_text_container:
+            transcript = transcript_container[0]
+            response_text = response_text_container[0]
+            if not transcript:
+                transcript = ""
+            if not response_text:
+                response_text = ""
+
+            if not is_text_input:
+                send_notification("NixOS Assistant:", response_text)
+
+            log_interaction(transcript, response_text)
 
     except Exception as e:
         send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
