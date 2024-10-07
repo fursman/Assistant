@@ -307,4 +307,16 @@ def main():
                     ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     ws_app.send(json.dumps({"type": "response.create"}))
                 else:
-                    logger.error("Web
+                    logger.error("WebSocket is not connected. Unable to commit audio buffer.")
+
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
+    finally:
+        if ws_app:
+            ws_app.close()
+        delete_lock()
+
+if __name__ == "__main__":
+    ws_app = None
+    main()
