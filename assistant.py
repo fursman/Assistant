@@ -55,6 +55,8 @@ apikey_file_path = assets_directory / "apikey.mp3"
 
 # Event to track when the WebSocket connection is open
 ws_open_event = Event()
+response_received_event = Event()
+response_text = ""
 
 def signal_handler(sig, frame):
     delete_lock()
@@ -175,6 +177,7 @@ def on_open(ws):
     ws_open_event.set()  # Signal that the WebSocket is open
 
 def on_message(ws, message):
+    global response_text
     logger.debug(f"Received message: {message}")
     try:
         response = json.loads(message)
@@ -189,7 +192,8 @@ def on_message(ws, message):
         if content.get("type") == "input_text":
             text = content.get("text", "")
             logger.info(f"Received text response: {text}")
-            print("Response from Assistant:", text)
+            response_text = text
+            response_received_event.set()
             ws.close()  # Close the WebSocket after receiving the text response
         else:
             logger.warning(f"Unexpected content type received: {content.get('type')}")
@@ -233,7 +237,7 @@ def reconnect():
     ws_thread.start()
 
 def main():
-    global ws_app
+    global ws_app, response_text
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -270,6 +274,13 @@ def main():
                         }]
                     }
                 }))
+                # Wait for the response to be received
+                response_received_event.wait(timeout=30)
+                if response_received_event.is_set():
+                    print("Response from Assistant:", response_text)
+                else:
+                    logger.error("Timeout waiting for response from server.")
+                    ws_app.close()
             else:
                 logger.error("WebSocket is not connected. Unable to send message.")
         else:
@@ -296,25 +307,4 @@ def main():
                     ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
                     ws_app.send(json.dumps({"type": "response.create"}))
                 else:
-                    logger.error("WebSocket is not connected. Unable to commit audio buffer.")
-
-        # Wait for a reasonable amount of time for the response
-        start_time = time.time()
-        while ws_app.sock and ws_app.sock.connected:
-            if time.time() - start_time > 30:  # Timeout after 30 seconds
-                logger.error("Timeout waiting for response from server.")
-                ws_app.close()
-                break
-            time.sleep(1)
-
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
-    finally:
-        if ws_app:
-            ws_app.close()
-        delete_lock()
-
-if __name__ == "__main__":
-    ws_app = None
-    main()
+                    logger.error("Web
