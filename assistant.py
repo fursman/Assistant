@@ -16,7 +16,6 @@ import json
 import keyring
 import websocket
 import threading
-import queue
 import base64
 import time
 from pathlib import Path
@@ -56,20 +55,31 @@ apikey_file_path = assets_directory / "apikey.mp3"
 # Event to track when the WebSocket connection is open
 ws_open_event = Event()
 response_received_event = Event()
-response_text = ""
 
-def signal_handler(sig, frame):
+class AssistantSession:
+    def __init__(self):
+        self.ws_app = None
+        self.response_text = []
+
+def signal_handler(sig, frame, session):
     delete_lock()
-    if ws_app:
-        ws_app.close()
+    if session.ws_app:
+        session.ws_app.close()
     sys.exit(0)
 
 def load_api_key():
     api_key = keyring.get_password("NixOSAssistant", "APIKey")
     if not api_key:
+        if not shutil.which("zenity"):
+            logger.error("Zenity is not installed, and no API key is provided.")
+            sys.exit(1)
         play_audio(apikey_file_path)
         input_cmd = 'zenity --entry --text="To begin, please enter your OpenAI API Key:" --hide-text'
-        api_key = subprocess.check_output(input_cmd, shell=True, text=True).strip()
+        try:
+            api_key = subprocess.check_output(input_cmd, shell=True, text=True).strip()
+        except subprocess.CalledProcessError:
+            logger.error("Failed to obtain API key from user.")
+            sys.exit(1)
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
         else:
@@ -119,7 +129,8 @@ def log_interaction(question, response):
         writer.writerow([now, "Response", response])
 
 def send_notification(title, message):
-    notify2.init('Assistant')
+    if not notify2.is_initted():
+        notify2.init('Assistant')
     n = notify2.Notification(title, message)
     n.set_timeout(30000)
     n.show()
@@ -141,26 +152,26 @@ def record_audio(file_path, format=FORMAT, channels=CHANNELS, rate=RATE, chunk=C
     silent_frames = 0
     silence_threshold = int(rate / chunk * silence_limit)
 
-    while True:
-        data = stream.read(chunk, exception_on_overflow=False)
-        frames.append(data)
-        if is_silence(data):
-            silent_frames += 1
-            if silent_frames >= silence_threshold:
-                break
-        else:
-            silent_frames = 0
+    try:
+        while True:
+            data = stream.read(chunk, exception_on_overflow=False)
+            frames.append(data)
+            if is_silence(data):
+                silent_frames += 1
+                if silent_frames >= silence_threshold:
+                    break
+            else:
+                silent_frames = 0
+    finally:
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
 
-    stream.stop_stream()
-    stream.close()
-    audio.terminate()
-
-    wf = wave.open(str(file_path), 'wb')
-    wf.setnchannels(channels)
-    wf.setsampwidth(audio.get_sample_size(format))
-    wf.setframerate(rate)
-    wf.writeframes(b''.join(frames))
-    wf.close()
+    with wave.open(str(file_path), 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(audio.get_sample_size(format))
+        wf.setframerate(rate)
+        wf.writeframes(b''.join(frames))
 
 def start_realtime_session(api_key):
     ws_url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
@@ -177,7 +188,6 @@ def on_open(ws):
     ws_open_event.set()  # Signal that the WebSocket is open
 
 def on_message(ws, message):
-    global response_text
     logger.debug(f"Received message: {message}")
     try:
         response = json.loads(message)
@@ -192,11 +202,11 @@ def on_message(ws, message):
         if content.get("type") == "input_text":
             text = content.get("text", "")
             logger.info(f"Received text response: {text}")
-            response_text += text + " "
+            session.response_text.append(text)
         elif content.get("type") == "text":
             text = content.get("text", "")
             logger.info(f"Received text content part: {text}")
-            response_text += text + " "
+            session.response_text.append(text)
         else:
             logger.warning(f"Unexpected content type received: {content.get('type')}")
     elif response_type == "response.done":
@@ -231,18 +241,20 @@ def audio_to_base64_chunks(audio_bytes, chunk_size=32000):
         yield base64.b64encode(audio_bytes[i:i+chunk_size]).decode()
 
 def reconnect():
-    global ws_app
-    if ws_app:
-        ws_app.close()
+    if session.ws_app:
+        session.ws_app.close()
     api_key = load_api_key()
-    ws_app = start_realtime_session(api_key)
-    ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
+    session.ws_app = start_realtime_session(api_key)
+    ws_thread = threading.Thread(target=session.ws_app.run_forever, daemon=True)
     ws_thread.start()
 
+def is_ws_connected():
+    return session.ws_app and session.ws_app.sock and session.ws_app.sock.connected
+
 def main():
-    global ws_app, response_text
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    global session
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, session))
+    signal.signal(signal.SIGTERM, lambda sig, frame: signal_handler(sig, frame, session))
 
     check_and_kill_existing_process()
 
@@ -250,9 +262,9 @@ def main():
         create_lock()
 
         api_key = load_api_key()
-        ws_app = start_realtime_session(api_key)
+        session.ws_app = start_realtime_session(api_key)
 
-        ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
+        ws_thread = threading.Thread(target=session.ws_app.run_forever, daemon=True)
         ws_thread.start()
 
         # Wait until the WebSocket is open before proceeding
@@ -265,8 +277,8 @@ def main():
             # Command-line input
             transcript = " ".join(sys.argv[1:])
             logger.info(f"Sending text input: {transcript}")
-            if ws_app and ws_app.sock and ws_app.sock.connected:
-                ws_app.send(json.dumps({
+            if is_ws_connected():
+                session.ws_app.send(json.dumps({
                     "type": "conversation.item.create",
                     "item": {
                         "type": "message",
@@ -280,10 +292,10 @@ def main():
                 # Wait for the response to be received
                 response_received_event.wait(timeout=30)
                 if response_received_event.is_set():
-                    print("Response from Assistant:", response_text.strip())
+                    print("Response from Assistant:", " ".join(session.response_text).strip())
                 else:
                     logger.error("Timeout waiting for response from server.")
-                    ws_app.close()
+                    session.ws_app.close()
             else:
                 logger.error("WebSocket is not connected. Unable to send message.")
         else:
@@ -297,4 +309,29 @@ def main():
                 audio_bytes = audio_file.read()
                 for audio_chunk in audio_to_base64_chunks(audio_bytes):
                     logger.debug("Sending audio chunk to server.")
-                    if ws_app and ws_app.sock and ws_app.sock.connected
+                    if is_ws_connected():
+                        session.ws_app.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": audio_chunk
+                        }))
+                    else:
+                        logger.error("WebSocket is not connected. Unable to send audio chunk.")
+                        return
+                logger.info("Committing audio buffer and requesting response.")
+                if is_ws_connected():
+                    session.ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    session.ws_app.send(json.dumps({"type": "response.create"}))
+                else:
+                    logger.error("WebSocket is not connected. Unable to commit audio buffer.")
+
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
+    finally:
+        if session.ws_app:
+            session.ws_app.close()
+        delete_lock()
+
+if __name__ == "__main__":
+    session = AssistantSession()
+    main()
