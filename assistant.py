@@ -195,6 +195,10 @@ def play_audio_from_bytes(audio_bytes):
     process.stdin.close()
     process.wait()
 
+def audio_to_base64_chunks(audio_bytes, chunk_size=32000):
+    for i in range(0, len(audio_bytes), chunk_size):
+        yield base64.b64encode(audio_bytes[i:i+chunk_size]).decode()
+
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -233,18 +237,13 @@ def main():
 
             with open(recorded_audio_path, "rb") as audio_file:
                 audio_bytes = audio_file.read()
-                audio_base64 = base64.b64encode(audio_bytes).decode()
-                ws.send(json.dumps({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{
-                            "type": "input_audio",
-                            "audio": audio_base64
-                        }]
-                    }
-                }))
+                for audio_chunk in audio_to_base64_chunks(audio_bytes):
+                    ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": audio_chunk
+                    }))
+                ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                ws.send(json.dumps({"type": "response.create"}))
 
         ws_thread.join()
     except Exception as e:
