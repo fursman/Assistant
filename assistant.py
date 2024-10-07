@@ -197,22 +197,18 @@ def on_message(ws, message):
 
     response_type = response.get("type")
 
-    if response_type in ("conversation.item.create", "response.content_part.added"):
-        content = response.get("item", {}).get("content", [{}])[0]
-        if content.get("type") == "input_text":
+    if response_type == "response.content_part.added":
+        content = response.get("content", [{}])[0]
+        if content.get("type") == "text":
             text = content.get("text", "")
-            logger.info(f"Received text response: {text}")
+            logger.info(f"Received partial text response: {text}")
             session.response_text.append(text)
-        elif content.get("type") == "text":
-            text = content.get("text", "")
-            logger.info(f"Received text content part: {text}")
-            session.response_text.append(text)
-        else:
-            logger.warning(f"Unexpected content type received: {content.get('type')}")
     elif response_type == "response.done":
         logger.info("Response completed.")
         response_received_event.set()
         ws.close()
+    elif response_type in ("session.created", "conversation.item.created", "response.created"):
+        logger.info(f"Received session-related message: {response_type}")
     else:
         logger.warning(f"Unexpected message type received: {response_type}")
 
@@ -323,15 +319,3 @@ def main():
                     session.ws_app.send(json.dumps({"type": "response.create"}))
                 else:
                     logger.error("WebSocket is not connected. Unable to commit audio buffer.")
-
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
-        send_notification("NixOS Assistant Error", f"An error occurred: {str(e)}")
-    finally:
-        if session.ws_app:
-            session.ws_app.close()
-        delete_lock()
-
-if __name__ == "__main__":
-    session = AssistantSession()
-    main()
