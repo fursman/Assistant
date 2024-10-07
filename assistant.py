@@ -168,11 +168,11 @@ def on_message(ws, message):
     elif response_type == "response.done":
         logger.info("Response completed.")
         response_received_event.set()
-        ws.close()
     elif response_type in ("session.created", "conversation.item.created", "response.created"):
         logger.info(f"Received session-related message: {response_type}")
     else:
         logger.warning(f"Unexpected message type received: {response_type}")
+        logger.debug(f"Full response received: {response}")
 
 def on_error(ws, error):
     logger.error(f"WebSocket error: {error}")
