@@ -192,6 +192,10 @@ def on_message(ws, message):
 
 def on_error(ws, error):
     logger.error(f"WebSocket error: {error}")
+    # Attempt to reconnect if the socket is closed unexpectedly
+    if isinstance(error, websocket.WebSocketConnectionClosedException):
+        logger.info("WebSocket closed unexpectedly, attempting to reconnect...")
+        reconnect()
 
 def on_close(ws, close_status_code, close_msg):
     logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
@@ -205,6 +209,15 @@ def play_audio_from_bytes(audio_bytes):
 def audio_to_base64_chunks(audio_bytes, chunk_size=32000):
     for i in range(0, len(audio_bytes), chunk_size):
         yield base64.b64encode(audio_bytes[i:i+chunk_size]).decode()
+
+def reconnect():
+    global ws_app
+    if ws_app:
+        ws_app.close()
+    api_key = load_api_key()
+    ws_app = start_realtime_session(api_key)
+    ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
+    ws_thread.start()
 
 def main():
     global ws_app
@@ -226,17 +239,20 @@ def main():
             # Command-line input
             transcript = " ".join(sys.argv[1:])
             logger.info(f"Sending text input: {transcript}")
-            ws_app.send(json.dumps({
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": transcript
-                    }]
-                }
-            }))
+            if ws_app and ws_app.sock and ws_app.sock.connected:
+                ws_app.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": transcript
+                        }]
+                    }
+                }))
+            else:
+                logger.error("WebSocket is not connected. Unable to send message.")
         else:
             # Audio input
             play_audio(welcome_file_path)
@@ -248,13 +264,20 @@ def main():
                 audio_bytes = audio_file.read()
                 for audio_chunk in audio_to_base64_chunks(audio_bytes):
                     logger.debug("Sending audio chunk to server.")
-                    ws_app.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": audio_chunk
-                    }))
+                    if ws_app and ws_app.sock and ws_app.sock.connected:
+                        ws_app.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": audio_chunk
+                        }))
+                    else:
+                        logger.error("WebSocket is not connected. Unable to send audio chunk.")
+                        return
                 logger.info("Committing audio buffer and requesting response.")
-                ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                ws_app.send(json.dumps({"type": "response.create"}))
+                if ws_app and ws_app.sock and ws_app.sock.connected:
+                    ws_app.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                    ws_app.send(json.dumps({"type": "response.create"}))
+                else:
+                    logger.error("WebSocket is not connected. Unable to commit audio buffer.")
 
         ws_thread.join()
     except Exception as e:
