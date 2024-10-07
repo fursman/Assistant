@@ -178,7 +178,9 @@ def on_open(ws):
 def on_message(ws, message):
     logger.debug(f"Received message: {message}")
     response = json.loads(message)
-    if response.get("type") == "conversation.item.create":
+    response_type = response.get("type")
+
+    if response_type == "conversation.item.create":
         content = response["item"]["content"][0]
         if content["type"] == "input_text":
             logger.info(f"Received text response: {content['text']}")
@@ -187,8 +189,18 @@ def on_message(ws, message):
             logger.info("Received audio response, playing audio.")
             audio_bytes = base64.b64decode(content["audio"])
             play_audio_from_bytes(audio_bytes)
+    elif response_type == "response.audio_transcript.delta":
+        # Handle incremental text transcript updates
+        delta_text = response["delta"]["text"]
+        logger.info(f"Transcript delta: {delta_text}")
+        print(delta_text, end='', flush=True)
+    elif response_type == "response.audio.done":
+        logger.info("Audio response completed.")
+    elif response_type == "response.done":
+        logger.info("Response completed.")
+        ws.close()
     else:
-        logger.warning(f"Unexpected message type received: {response.get('type')}")
+        logger.warning(f"Unexpected message type received: {response_type}")
 
 def on_error(ws, error):
     logger.error(f"WebSocket error: {error}")
