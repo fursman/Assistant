@@ -22,7 +22,7 @@ import threading  # For thread-safe event
 samplerate = 16000  # Microphone input sample rate
 assistant_samplerate = 24000  # Assistant's audio output sample rate
 channels = 1
-blocksize = 3200  # Increased blocksize to 0.2 seconds at 16 kHz
+blocksize = 3200  # 0.2 seconds at 16 kHz
 
 audio_queue = queue.Queue()  # Use thread-safe queue
 
@@ -127,6 +127,8 @@ async def send_audio(websocket, loop):
                     await websocket.send(json.dumps(commit_event))
                     data_sent_since_last_commit = False
                     print("Silence detected. Sent input_audio_buffer.commit")
+                else:
+                    print("Silence detected but no data sent since last commit. Not sending commit.")
                 silence_duration = 0
     except asyncio.CancelledError:
         print("Audio sending task cancelled.")
@@ -138,12 +140,14 @@ async def receive_messages(websocket):
             while True:
                 message = await websocket.recv()
                 event = json.loads(message)
+                print(f"Received event: {event}")  # Detailed logging
 
                 if event["type"] == "response.audio.delta":
-                    assistant_speaking_event.set()  # Assistant is speaking
                     delta = event["delta"]
                     audio_data = base64.b64decode(delta)
                     audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    print(f"Playing {len(audio_array)} samples of audio.")  # Logging audio playback
+                    assistant_speaking_event.set()  # Assistant is speaking
                     output_stream.write(audio_array)
                 elif event["type"] == "response.text.delta":
                     delta = event.get("delta", "")
@@ -157,7 +161,7 @@ async def receive_messages(websocket):
                     print(f"Error: {error_message}")
                     print(f"Full error info: {error_info}")
                 else:
-                    pass  # Handle other event types if necessary
+                    print(f"Unhandled event type: {event['type']}")
     except asyncio.CancelledError:
         print("Message receiving task cancelled.")
     except Exception as e:
@@ -186,11 +190,13 @@ async def realtime_api():
                 },
             }
             await websocket.send(json.dumps(session_update))
+            print("Sent session update.")
 
             # Start audio stream
             stream = sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16',
                                     callback=audio_callback, blocksize=blocksize)
             stream.start()
+            print("Started audio input stream.")
 
             loop = asyncio.get_running_loop()  # Get the current event loop
 
@@ -200,6 +206,8 @@ async def realtime_api():
             await asyncio.gather(send_task, receive_task)
     except KeyboardInterrupt:
         print("Program terminated by user.")
+    except Exception as e:
+        print(f"An error occurred in realtime_api: {e}")
     finally:
         print("Cleaning up...")
         if stream and not stream.stopped:
