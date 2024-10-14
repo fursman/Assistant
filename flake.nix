@@ -28,6 +28,7 @@
 
           ps.python-dotenv
           ps.sounddevice
+          ps.pydub
         ]);
 
       in {
