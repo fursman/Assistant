@@ -16,14 +16,18 @@ import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
 import queue  # Import queue module for thread-safe queue
+import threading  # For thread-safe event
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
 assistant_samplerate = 24000  # Assistant's audio output sample rate
 channels = 1
-blocksize = 1600  # 0.1 seconds at 16 kHz
+blocksize = 3200  # Increased blocksize to 0.2 seconds at 16 kHz
 
 audio_queue = queue.Queue()  # Use thread-safe queue
+
+# Create a threading.Event for assistant speaking status
+assistant_speaking_event = threading.Event()
 
 # Function to load the API key using keyring
 def load_api_key():
@@ -84,17 +88,21 @@ headers = {
 def audio_callback(indata, frames, time_info, status):
     if status:
         print(status, file=sys.stderr)
-    audio_queue.put(indata.copy())  # Put data into thread-safe queue
+    if not assistant_speaking_event.is_set():
+        audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
 async def send_audio(websocket, loop):
     silence_threshold = 0.01  # Normalized threshold
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
     chunk_duration = blocksize / samplerate  # seconds per chunk
+    data_sent_since_last_commit = False
 
     try:
         while True:
             indata = await loop.run_in_executor(None, audio_queue.get)
+            if assistant_speaking_event.is_set():
+                continue  # Skip processing audio data when assistant is speaking
             rms_value = np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768
             print(f"RMS value: {rms_value}")
 
@@ -111,12 +119,15 @@ async def send_audio(websocket, loop):
                 "audio": base64_audio,
             }
             await websocket.send(json.dumps(audio_event))
+            data_sent_since_last_commit = True  # We have sent data
 
             if silence_duration >= silence_duration_limit:
-                commit_event = {"type": "input_audio_buffer.commit"}
-                await websocket.send(json.dumps(commit_event))
+                if data_sent_since_last_commit:
+                    commit_event = {"type": "input_audio_buffer.commit"}
+                    await websocket.send(json.dumps(commit_event))
+                    data_sent_since_last_commit = False
+                    print("Silence detected. Sent input_audio_buffer.commit")
                 silence_duration = 0
-                print("Silence detected. Sent input_audio_buffer.commit")
     except asyncio.CancelledError:
         print("Audio sending task cancelled.")
 
@@ -129,6 +140,7 @@ async def receive_messages(websocket):
                 event = json.loads(message)
 
                 if event["type"] == "response.audio.delta":
+                    assistant_speaking_event.set()  # Assistant is speaking
                     delta = event["delta"]
                     audio_data = base64.b64decode(delta)
                     audio_array = np.frombuffer(audio_data, dtype=np.int16)
@@ -137,6 +149,7 @@ async def receive_messages(websocket):
                     delta = event.get("delta", "")
                     print(f"Assistant: {delta}", end='', flush=True)
                 elif event["type"] == "response.done":
+                    assistant_speaking_event.clear()  # Assistant finished speaking
                     print("\nAssistant response complete.")
                 elif event["type"] == "error":
                     error_info = event.get("error", {})
