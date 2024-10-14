@@ -26,7 +26,6 @@
           ps.pydub
           ps.openai
 
-          ps.asyncio
           ps.json
           ps.base64
           ps.dotenv
