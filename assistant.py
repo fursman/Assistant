@@ -87,7 +87,7 @@ def audio_callback(indata, frames, time_info, status):
     audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
 async def send_audio(websocket, loop):
-    silence_threshold = 0.01  # Normalized threshold
+    silence_threshold = 0.05  # Normalized threshold
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
     chunk_duration = blocksize / samplerate  # seconds per chunk
