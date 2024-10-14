@@ -15,13 +15,14 @@ import getpass
 import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
+import queue  # Import queue module for thread-safe queue
 
 # Audio configuration
 samplerate = 16000
 channels = 1
 blocksize = 1600  # 0.1 seconds at 16kHz
 
-audio_queue = asyncio.Queue()
+audio_queue = queue.Queue()  # Use thread-safe queue
 
 # Function to load the API key using keyring
 def load_api_key():
@@ -82,10 +83,9 @@ headers = {
 def audio_callback(indata, frames, time_info, status):
     if status:
         print(status, file=sys.stderr)
-    loop = asyncio.get_event_loop()
-    loop.call_soon_threadsafe(audio_queue.put_nowait, indata.copy())
+    audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
-async def send_audio(websocket):
+async def send_audio(websocket, loop):
     silence_threshold = 500  # Adjust as needed
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
@@ -93,7 +93,7 @@ async def send_audio(websocket):
 
     try:
         while True:
-            indata = await audio_queue.get()
+            indata = await loop.run_in_executor(None, audio_queue.get)  # Get data from queue without blocking event loop
             rms_value = np.sqrt(np.mean(indata**2))
             if rms_value < silence_threshold:
                 silence_duration += chunk_duration
@@ -172,7 +172,9 @@ async def realtime_api():
                                     callback=audio_callback, blocksize=blocksize)
             stream.start()
 
-            send_task = asyncio.create_task(send_audio(websocket))
+            loop = asyncio.get_running_loop()  # Get the current event loop
+
+            send_task = asyncio.create_task(send_audio(websocket, loop))
             receive_task = asyncio.create_task(receive_messages(websocket))
 
             await asyncio.gather(send_task, receive_task)
