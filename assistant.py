@@ -153,7 +153,7 @@ async def realtime_api():
             session_update = {
                 "type": "session.update",
                 "session": {
-                    "modalities": ["audio"],
+                    "modalities": ["audio", "text"],
                     "voice": "alloy",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
