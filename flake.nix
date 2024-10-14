@@ -26,9 +26,7 @@
           ps.pydub
           ps.openai
 
-          ps.json
-          ps.base64
-          ps.dotenv
+          ps.python-dotenv
           ps.sounddevice
         ]);
 
