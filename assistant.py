@@ -18,9 +18,10 @@ from pydub import AudioSegment
 import queue  # Import queue module for thread-safe queue
 
 # Audio configuration
-samplerate = 16000
+samplerate = 16000  # Microphone input sample rate
+assistant_samplerate = 24000  # Assistant's audio output sample rate
 channels = 1
-blocksize = 1600  # 0.1 seconds at 16kHz
+blocksize = 1600  # 0.1 seconds at 16 kHz
 
 audio_queue = queue.Queue()  # Use thread-safe queue
 
@@ -86,21 +87,24 @@ def audio_callback(indata, frames, time_info, status):
     audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
 async def send_audio(websocket, loop):
-    silence_threshold = 500  # Adjust as needed
+    silence_threshold = 0.01  # Normalized threshold
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
     chunk_duration = blocksize / samplerate  # seconds per chunk
 
     try:
         while True:
-            indata = await loop.run_in_executor(None, audio_queue.get)  # Get data from queue without blocking event loop
-            rms_value = np.sqrt(np.mean(indata**2))
+            indata = await loop.run_in_executor(None, audio_queue.get)
+            rms_value = np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768
+            print(f"RMS value: {rms_value}")
+
             if rms_value < silence_threshold:
                 silence_duration += chunk_duration
             else:
                 silence_duration = 0
 
             audio_bytes = indata.tobytes()
+            print(f"Sending {len(audio_bytes)} bytes of audio data.")
             base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
             audio_event = {
                 "type": "input_audio_buffer.append",
@@ -109,7 +113,6 @@ async def send_audio(websocket, loop):
             await websocket.send(json.dumps(audio_event))
 
             if silence_duration >= silence_duration_limit:
-                # Send commit event when silence is detected
                 commit_event = {"type": "input_audio_buffer.commit"}
                 await websocket.send(json.dumps(commit_event))
                 silence_duration = 0
@@ -119,25 +122,29 @@ async def send_audio(websocket, loop):
 
 async def receive_messages(websocket):
     try:
-        while True:
-            message = await websocket.recv()
-            event = json.loads(message)
+        # Initialize the OutputStream for continuous playback
+        with sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16') as output_stream:
+            while True:
+                message = await websocket.recv()
+                event = json.loads(message)
 
-            if event["type"] == "response.audio.delta":
-                delta = event["delta"]
-                audio_data = base64.b64decode(delta)
-                audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                sd.play(audio_array, samplerate=samplerate)
-            elif event["type"] == "response.text.delta":
-                delta = event.get("delta", "")
-                print(f"Assistant: {delta}", end='', flush=True)
-            elif event["type"] == "response.done":
-                print("\nAssistant response complete.")
-            elif event["type"] == "error":
-                error_message = event.get("error", {}).get("message", "")
-                print(f"Error: {error_message}")
-            else:
-                pass  # Handle other event types if necessary
+                if event["type"] == "response.audio.delta":
+                    delta = event["delta"]
+                    audio_data = base64.b64decode(delta)
+                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    output_stream.write(audio_array)
+                elif event["type"] == "response.text.delta":
+                    delta = event.get("delta", "")
+                    print(f"Assistant: {delta}", end='', flush=True)
+                elif event["type"] == "response.done":
+                    print("\nAssistant response complete.")
+                elif event["type"] == "error":
+                    error_info = event.get("error", {})
+                    error_message = error_info.get("message", "")
+                    print(f"Error: {error_message}")
+                    print(f"Full error info: {error_info}")
+                else:
+                    pass  # Handle other event types if necessary
     except asyncio.CancelledError:
         print("Message receiving task cancelled.")
     except Exception as e:
