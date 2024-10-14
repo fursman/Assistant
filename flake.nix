@@ -50,7 +50,7 @@
             mkdir -p $out/bin $out/share/assistant/assets-audio $out/share/assistant/logs
 
             # Install Python script
-            cp ${assistantSrc}/realtime-assistant.py $out/bin/assistant
+            cp ${assistantSrc}/assistant.py $out/bin/assistant
             chmod +x $out/bin/assistant
 
             # Copy audio assets
