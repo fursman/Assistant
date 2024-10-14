@@ -53,9 +53,6 @@
             cp ${assistantSrc}/assistant.py $out/bin/assistant
             chmod +x $out/bin/assistant
 
-            cp ${assistantSrc}/realtime-assistant.py $out/bin/realtime-assistant
-            chmod +x $out/bin/realtime-assistant
-
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
           '';
