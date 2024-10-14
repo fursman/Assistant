@@ -29,6 +29,7 @@
           ps.python-dotenv
           ps.sounddevice
           ps.pydub
+          ps.websockets
         ]);
 
       in {
