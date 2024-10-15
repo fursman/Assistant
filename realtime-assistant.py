@@ -14,17 +14,8 @@ import getpass
 
 import sounddevice as sd
 import numpy as np
+from pydub import AudioSegment
 import queue  # Import queue module for thread-safe queue
-import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to capture all levels of logs
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),  # Log to stdout
-    ]
-)
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
@@ -44,14 +35,13 @@ def load_api_key():
         if api_key:
             keyring.set_password("NixOSAssistant", "APIKey", api_key)
         else:
-            logging.error("No API Key provided. Exiting.")
+            print("No API Key provided. Exiting.")
             sys.exit(1)
     return api_key
 
 # Function to play audio file
 def play_audio(file_path):
     try:
-        from pydub import AudioSegment  # Moved import here to avoid import error if not needed
         audio = AudioSegment.from_file(file_path)
         samples = np.array(audio.get_array_of_samples())
         # If stereo, reshape
@@ -62,7 +52,7 @@ def play_audio(file_path):
         sd.play(samples, samplerate=audio.frame_rate)
         sd.wait()
     except Exception as e:
-        logging.error(f"Error playing audio file {file_path}: {e}")
+        print(f"Error playing audio file {file_path}: {e}")
 
 # Load environment variables
 load_dotenv()
@@ -71,7 +61,7 @@ load_dotenv()
 api_key = load_api_key()
 
 if not api_key:
-    logging.error("Please set the OPENAI_API_KEY in your .env file or enter it when prompted.")
+    print("Please set the OPENAI_API_KEY in your .env file or enter it when prompted.")
     sys.exit(1)
 
 # Define the welcome_file_path
@@ -81,7 +71,7 @@ welcome_file_path = assets_directory / "welcome.mp3"
 
 # Ensure the welcome audio file exists
 if not welcome_file_path.is_file():
-    logging.error(f"Welcome audio file not found at {welcome_file_path}")
+    print(f"Welcome audio file not found at {welcome_file_path}")
     sys.exit(1)
 
 # Define the URL and headers
@@ -93,11 +83,11 @@ headers = {
 
 def audio_callback(indata, frames, time_info, status):
     if status:
-        logging.warning(f"Audio callback status: {status}")
+        print(status, file=sys.stderr)
     audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
 async def send_audio(websocket, loop):
-    silence_threshold = 0.01  # Adjusted normalized threshold
+    silence_threshold = 0.01  # Normalized threshold
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
     chunk_duration = blocksize / samplerate  # seconds per chunk
@@ -105,40 +95,30 @@ async def send_audio(websocket, loop):
     try:
         while True:
             indata = await loop.run_in_executor(None, audio_queue.get)
-
-            # Normalize the audio data
-            normalized_data = indata.astype(np.float32) / 32768
-            rms_value = np.sqrt(np.mean(normalized_data ** 2))
-
-            logging.debug(f"RMS value: {rms_value}")
+            rms_value = np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768
+            print(f"RMS value: {rms_value}")
 
             if rms_value < silence_threshold:
                 silence_duration += chunk_duration
             else:
                 silence_duration = 0
 
-            # Only send audio if there's sound detected
-            if rms_value >= silence_threshold:
-                audio_bytes = indata.tobytes()
-                logging.debug(f"Sending {len(audio_bytes)} bytes of audio data.")
-                base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
-                audio_event = {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64_audio,
-                }
-                await websocket.send(json.dumps(audio_event))
-            else:
-                logging.debug("Silence detected, not sending audio chunk.")
+            audio_bytes = indata.tobytes()
+            print(f"Sending {len(audio_bytes)} bytes of audio data.")
+            base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+            audio_event = {
+                "type": "input_audio_buffer.append",
+                "audio": base64_audio,
+            }
+            await websocket.send(json.dumps(audio_event))
 
             if silence_duration >= silence_duration_limit:
                 commit_event = {"type": "input_audio_buffer.commit"}
                 await websocket.send(json.dumps(commit_event))
                 silence_duration = 0
-                logging.info("Silence duration exceeded limit. Sent input_audio_buffer.commit")
+                print("Silence detected. Sent input_audio_buffer.commit")
     except asyncio.CancelledError:
-        logging.info("Audio sending task cancelled.")
-    except Exception as e:
-        logging.exception(f"Exception in send_audio: {e}")
+        print("Audio sending task cancelled.")
 
 async def receive_messages(websocket):
     try:
@@ -147,39 +127,34 @@ async def receive_messages(websocket):
             while True:
                 message = await websocket.recv()
                 event = json.loads(message)
-                event_type = event.get("type")
 
-                logging.debug(f"Received event: {event_type}")
-
-                if event_type == "response.audio.delta":
+                if event["type"] == "response.audio.delta":
                     delta = event["delta"]
                     audio_data = base64.b64decode(delta)
                     audio_array = np.frombuffer(audio_data, dtype=np.int16)
                     output_stream.write(audio_array)
-                elif event_type == "response.text.delta":
+                elif event["type"] == "response.text.delta":
                     delta = event.get("delta", "")
-                    logging.info(f"Assistant (delta): {delta}")
-                    print(f"{delta}", end='', flush=True)
-                elif event_type == "response.done":
-                    logging.info("Assistant response complete.")
+                    print(f"Assistant: {delta}", end='', flush=True)
+                elif event["type"] == "response.done":
                     print("\nAssistant response complete.")
-                elif event_type == "error":
+                elif event["type"] == "error":
                     error_info = event.get("error", {})
                     error_message = error_info.get("message", "")
-                    logging.error(f"Error: {error_message}")
-                    logging.error(f"Full error info: {error_info}")
+                    print(f"Error: {error_message}")
+                    print(f"Full error info: {error_info}")
                 else:
-                    logging.debug(f"Unhandled event type: {event_type}")
+                    pass  # Handle other event types if necessary
     except asyncio.CancelledError:
-        logging.info("Message receiving task cancelled.")
+        print("Message receiving task cancelled.")
     except Exception as e:
-        logging.exception(f"Error in receive_messages: {e}")
+        print(f"Error in receive_messages: {e}")
 
 async def realtime_api():
     stream = None
     try:
         async with websockets.connect(url, extra_headers=headers) as websocket:
-            logging.info("Connected to OpenAI Realtime Assistant API.")
+            print("Connected to OpenAI Realtime Assistant API.")
 
             # Send session update
             session_update = {
@@ -198,13 +173,11 @@ async def realtime_api():
                 },
             }
             await websocket.send(json.dumps(session_update))
-            logging.debug("Sent session update.")
 
             # Start audio stream
             stream = sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16',
                                     callback=audio_callback, blocksize=blocksize)
             stream.start()
-            logging.debug("Started audio input stream.")
 
             loop = asyncio.get_running_loop()  # Get the current event loop
 
@@ -213,27 +186,25 @@ async def realtime_api():
 
             await asyncio.gather(send_task, receive_task)
     except KeyboardInterrupt:
-        logging.info("Program terminated by user.")
-    except Exception as e:
-        logging.exception(f"Unexpected error in realtime_api: {e}")
+        print("Program terminated by user.")
     finally:
-        logging.info("Cleaning up...")
+        print("Cleaning up...")
         if stream and not stream.stopped:
             stream.stop()
             stream.close()
 
 def main():
-    logging.info("Press Ctrl+C to exit the program.")
+    print("Press Ctrl+C to exit the program.")
 
     # Play the welcome audio at the start
     play_audio(welcome_file_path)
 
-    logging.info("Starting the assistant. Speak into your microphone.")
+    print("Starting the assistant. Speak into your microphone.")
 
     try:
         asyncio.run(realtime_api())
     except Exception as e:
-        logging.exception(f"An unexpected error occurred: {e}")
+        print(f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
     main()
