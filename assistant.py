@@ -15,6 +15,9 @@ import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
 import queue  # Thread-safe queue for audio data
+import datetime
+import csv
+import notify2
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
@@ -26,6 +29,9 @@ audio_queue = queue.Queue()  # Thread-safe queue for audio data
 
 # Unix domain socket path for IPC
 socket_path = '/tmp/assistant.sock'
+
+# Log file path
+log_csv_path = Path.home() / 'assistant_interactions.csv'
 
 # Function to load the API key using keyring
 def load_api_key():
@@ -53,6 +59,20 @@ def play_audio(file_path):
         sd.wait()
     except Exception as e:
         print(f"Error playing audio file {file_path}: {e}")
+
+# Function to log interactions
+def log_interaction(question, response):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_csv_path, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([now, "Question", question])
+        writer.writerow([now, "Response", response])
+
+# Function to send desktop notifications
+def send_notification(title, message):
+    n = notify2.Notification(title, message)
+    n.set_timeout(30000)
+    n.show()
 
 # Use the function to load the API key
 api_key = load_api_key()
@@ -86,22 +106,9 @@ def audio_callback(indata, frames, time_info, status):
     audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
 async def send_audio(websocket, shutdown_event):
-    silence_threshold = 0.01  # Normalized threshold
-    silence_duration = 0
-    silence_duration_limit = 1.0  # seconds
-    chunk_duration = blocksize / samplerate  # seconds per chunk
-
     try:
         while not shutdown_event.is_set():
             indata = await asyncio.get_event_loop().run_in_executor(None, audio_queue.get)
-            rms_value = np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2))
-            print(f"RMS value: {rms_value}")
-
-            if rms_value < silence_threshold:
-                silence_duration += chunk_duration
-            else:
-                silence_duration = 0
-
             audio_bytes = indata.tobytes()
             print(f"Sending {len(audio_bytes)} bytes of audio data.")
             base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
@@ -110,12 +117,6 @@ async def send_audio(websocket, shutdown_event):
                 "audio": base64_audio,
             }
             await websocket.send(json.dumps(audio_event))
-
-            if silence_duration >= silence_duration_limit:
-                commit_event = {"type": "input_audio_buffer.commit"}
-                await websocket.send(json.dumps(commit_event))
-                silence_duration = 0
-                print("Silence detected. Sent input_audio_buffer.commit")
     except asyncio.CancelledError:
         print("Audio sending task cancelled.")
     except Exception as e:
@@ -124,6 +125,9 @@ async def send_audio(websocket, shutdown_event):
 async def receive_messages(websocket, shutdown_event):
     assistant_response_started = False
     output_stream = None
+    user_question = ''
+    assistant_response = ''
+    assistant_audio_transcript = ''
     try:
         # Initialize the OutputStream for continuous playback
         output_stream = sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16')
@@ -137,20 +141,38 @@ async def receive_messages(websocket, shutdown_event):
                 continue  # Check shutdown_event again
             event = json.loads(message)
 
-            if event["type"] == "response.audio.delta":
+            if event["type"] == "conversation.item.input_audio_transcription.completed":
+                transcript = event.get("transcript", "")
+                user_question = transcript
+                print(f"\nYou: {transcript}")
+                send_notification("You said:", transcript)
+            elif event["type"] == "response.audio.delta":
                 delta = event["delta"]
                 audio_data = base64.b64decode(delta)
                 audio_array = np.frombuffer(audio_data, dtype=np.int16)
                 output_stream.write(audio_array)
             elif event["type"] == "response.text.delta":
                 delta = event.get("delta", "")
+                assistant_response += delta
                 if not assistant_response_started:
                     print("\nAssistant:", end=' ', flush=True)
                     assistant_response_started = True
                 print(delta, end='', flush=True)
+            elif event["type"] == "response.audio_transcript.delta":
+                delta = event.get("delta", "")
+                assistant_audio_transcript += delta
+            elif event["type"] == "response.audio_transcript.done":
+                transcript = event.get("transcript", "")
+                assistant_audio_transcript = transcript
             elif event["type"] == "response.done":
                 assistant_response_started = False
                 print("\nAssistant response complete.")
+                log_interaction(user_question, assistant_response)
+                send_notification("Assistant", assistant_response)
+                # Reset variables for next interaction
+                user_question = ''
+                assistant_response = ''
+                assistant_audio_transcript = ''
             elif event["type"] == "error":
                 error_info = event.get("error", {})
                 error_message = error_info.get("message", "")
@@ -209,7 +231,7 @@ async def realtime_api():
 
             # Play the welcome audio at the start
             play_audio(welcome_file_path)
-            
+
             # Send session update
             session_update = {
                 "type": "session.update",
@@ -218,6 +240,10 @@ async def realtime_api():
                     "voice": "shimmer",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
+                    "input_audio_transcription": {
+                        "enabled": True,
+                        "model": "whisper-1",
+                    },
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.75,
@@ -271,6 +297,8 @@ async def send_shutdown_command():
 
 def main():
     print("Starting the assistant.")
+
+    notify2.init('Assistant')
 
     if os.path.exists(socket_path):
         # Another instance is running, send shutdown command
