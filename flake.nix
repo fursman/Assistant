@@ -55,8 +55,8 @@
             chmod +x $out/bin/assistant
 
             # Install Python script
-            cp ${assistantSrc}/assistant-legacy.py $out/bin/assistant-legacy
-            chmod +x $out/bin/assistant-legacy
+            cp ${assistantSrc}/realtime-assistant.py $out/bin/realtime
+            chmod +x $out/bin/realtime
 
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
