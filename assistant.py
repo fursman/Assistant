@@ -123,7 +123,7 @@ async def send_audio(websocket, loop):
 async def receive_messages(websocket):
     try:
         # Initialize the OutputStream for continuous playback
-        with sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16') as output_stream:
+        with sd.OutputStream(channels=1, dtype='int16') as output_stream:
             while True:
                 message = await websocket.recv()
                 event = json.loads(message)
