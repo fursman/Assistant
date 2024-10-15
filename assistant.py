@@ -6,6 +6,7 @@ import json
 import websockets
 import base64
 import sys
+import fcntl  # Import fcntl for file locking
 
 import keyring
 from pathlib import Path
@@ -54,14 +55,20 @@ def play_audio(file_path):
 # Use the function to load the API key
 api_key = load_api_key()
 
-# Define the welcome_file_path
+# Define the assets directory and audio file paths
 assets_directory = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
 assets_directory.mkdir(parents=True, exist_ok=True)
 welcome_file_path = assets_directory / "welcome.mp3"
+gotit_file_path = assets_directory / "gotit.mp3"  # Define gotit.mp3 path
 
 # Ensure the welcome audio file exists
 if not welcome_file_path.is_file():
     print(f"Welcome audio file not found at {welcome_file_path}")
+    sys.exit(1)
+
+# Ensure the gotit audio file exists
+if not gotit_file_path.is_file():
+    print(f"Gotit audio file not found at {gotit_file_path}")
     sys.exit(1)
 
 # Define the URL and headers
@@ -166,7 +173,7 @@ async def realtime_api():
                     "output_audio_format": "pcm16",
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
+                        "threshold": 0.9,
                         "prefix_padding_ms": 100,
                         "silence_duration_ms": 1000,
                     },
@@ -201,10 +208,28 @@ def main():
     print("Press Ctrl+C to exit the program.")
     print("Starting the assistant.")
 
+    # Implement file locking mechanism
+    lock_file_path = '/tmp/assistant.lock'  # Path to the lock file
     try:
-        asyncio.run(realtime_api())
+        lock_file = open(lock_file_path, 'w')
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Successfully acquired the lock; proceed to run the assistant
+            try:
+                asyncio.run(realtime_api())
+            except Exception as e:
+                print(f"An unexpected error occurred: {e}")
+            finally:
+                # Release the lock
+                lock_file.close()
+                os.remove(lock_file_path)  # Clean up the lock file
+        except BlockingIOError:
+            # Could not acquire the lock; another instance is running
+            lock_file.close()
+            print("Another instance is already running.")
+            play_audio(gotit_file_path)
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"Error with lock file: {e}")
 
 if __name__ == "__main__":
     main()
