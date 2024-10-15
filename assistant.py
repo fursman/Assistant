@@ -164,9 +164,9 @@ async def receive_messages(websocket, shutdown_event):
     except Exception as e:
         print(f"Error in receive_messages: {e}")
     finally:
-        # Stop and close the output stream immediately
-        if output_stream and output_stream.active:
-            output_stream.stop()
+        # Abort and close the output stream immediately
+        if output_stream:
+            output_stream.abort()  # Immediately stop playback and discard buffers
             output_stream.close()
             print("Audio playback stopped.")
 
@@ -220,7 +220,7 @@ async def realtime_api():
                     "output_audio_format": "pcm16",
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
+                        "threshold": 0.75,
                         "prefix_padding_ms": 100,
                         "silence_duration_ms": 1000,
                     },
@@ -246,8 +246,8 @@ async def realtime_api():
             send_task.cancel()
         if receive_task and not receive_task.done():
             receive_task.cancel()
-        if stream and not stream.stopped:
-            stream.stop()
+        if stream and stream.active:
+            stream.abort()  # Immediately stop recording
             stream.close()
             print("Audio recording stopped.")
         if ipc_server_task:
