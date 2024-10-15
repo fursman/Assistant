@@ -19,7 +19,7 @@ import queue  # Import queue module for thread-safe queue
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
-assistant_samplerate = 24000  # Assistant's audio output sample rate
+assistant_samplerate = 28000  # Assistant's audio output sample rate
 channels = 1
 blocksize = 2400  # 0.1 seconds at 24 kHz
 
