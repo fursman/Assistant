@@ -157,7 +157,7 @@ def create_assistant(client):
         name="NixOS Assistant",
         instructions="You are a helpful assistant integrated with NixOS. Provide concise and accurate information. If asked about system configurations or clipboard content, refer to the additional context provided.",
         tools=[],
-        model="gpt-4o-mini"
+        model="o1-mini"
     )
     return assistant.id
 
