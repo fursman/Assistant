@@ -123,38 +123,52 @@ async def send_audio(websocket, shutdown_event):
 
 async def receive_messages(websocket, shutdown_event):
     assistant_response_started = False
+    output_stream = None
     try:
         # Initialize the OutputStream for continuous playback
-        with sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16') as output_stream:
-            while not shutdown_event.is_set():
-                message = await websocket.recv()
-                event = json.loads(message)
+        output_stream = sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16')
+        output_stream.start()
 
-                if event["type"] == "response.audio.delta":
-                    delta = event["delta"]
-                    audio_data = base64.b64decode(delta)
-                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                    output_stream.write(audio_array)
-                elif event["type"] == "response.text.delta":
-                    delta = event.get("delta", "")
-                    if not assistant_response_started:
-                        print("\nAssistant:", end=' ', flush=True)
-                        assistant_response_started = True
-                    print(delta, end='', flush=True)
-                elif event["type"] == "response.done":
-                    assistant_response_started = False
-                    print("\nAssistant response complete.")
-                elif event["type"] == "error":
-                    error_info = event.get("error", {})
-                    error_message = error_info.get("message", "")
-                    print(f"Error: {error_message}")
-                    print(f"Full error info: {error_info}")
-                else:
-                    pass  # Handle other event types if necessary
+        while not shutdown_event.is_set():
+            # Use asyncio.wait_for to add a timeout in case websocket.recv() hangs
+            try:
+                message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue  # Check shutdown_event again
+            event = json.loads(message)
+
+            if event["type"] == "response.audio.delta":
+                delta = event["delta"]
+                audio_data = base64.b64decode(delta)
+                audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                output_stream.write(audio_array)
+            elif event["type"] == "response.text.delta":
+                delta = event.get("delta", "")
+                if not assistant_response_started:
+                    print("\nAssistant:", end=' ', flush=True)
+                    assistant_response_started = True
+                print(delta, end='', flush=True)
+            elif event["type"] == "response.done":
+                assistant_response_started = False
+                print("\nAssistant response complete.")
+            elif event["type"] == "error":
+                error_info = event.get("error", {})
+                error_message = error_info.get("message", "")
+                print(f"Error: {error_message}")
+                print(f"Full error info: {error_info}")
+            else:
+                pass  # Handle other event types if necessary
+
     except asyncio.CancelledError:
         print("Message receiving task cancelled.")
     except Exception as e:
         print(f"Error in receive_messages: {e}")
+    finally:
+        # Stop and close the output stream immediately
+        if output_stream and output_stream.active:
+            output_stream.stop()
+            output_stream.close()
+            print("Audio playback stopped.")
 
 async def ipc_server(shutdown_event):
     # Remove existing socket file if it exists
@@ -225,6 +239,7 @@ async def realtime_api():
             await shutdown_event.wait()
             print("Shutdown event received.")
 
+        # After exiting the 'async with' block, the websocket connection is closed
     finally:
         print("Cleaning up...")
         if send_task and not send_task.done():
@@ -234,6 +249,7 @@ async def realtime_api():
         if stream and not stream.stopped:
             stream.stop()
             stream.close()
+            print("Audio recording stopped.")
         if ipc_server_task:
             ipc_server_task.close()
             await ipc_server_task.wait_closed()
@@ -262,10 +278,10 @@ def main():
         try:
             asyncio.run(send_shutdown_command())
             # Wait for the running process to shut down
-            for _ in range(10):
+            for _ in range(20):  # Increased range to allow more time
                 if not os.path.exists(socket_path):
                     break
-                asyncio.run(asyncio.sleep(0.1))
+                asyncio.run(asyncio.sleep(0.05))  # Check every 50ms
             # Play "got it" audio
             play_audio(gotit_file_path)
         except Exception as e:
