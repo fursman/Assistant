@@ -7,7 +7,6 @@ import websockets
 import base64
 import sys
 
-from dotenv import load_dotenv
 import keyring
 from pathlib import Path
 import getpass
@@ -21,15 +20,13 @@ import queue  # Import queue module for thread-safe queue
 samplerate = 16000  # Microphone input sample rate
 assistant_samplerate = 24000  # Assistant's audio output sample rate
 channels = 1
-blocksize = 2400  # 0.1 seconds at 24 kHz
+blocksize = 2400  # Block size for audio recording
 
-audio_queue = queue.Queue()  # Use thread-safe queue
+audio_queue = queue.Queue()  # Thread-safe queue for audio data
 
 # Function to load the API key using keyring
 def load_api_key():
     api_key = keyring.get_password("NixOSAssistant", "APIKey")
-    if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         api_key = getpass.getpass("Please enter your OpenAI API Key: ").strip()
         if api_key:
@@ -54,15 +51,8 @@ def play_audio(file_path):
     except Exception as e:
         print(f"Error playing audio file {file_path}: {e}")
 
-# Load environment variables
-load_dotenv()
-
 # Use the function to load the API key
 api_key = load_api_key()
-
-if not api_key:
-    print("Please set the OPENAI_API_KEY in your .env file or enter it when prompted.")
-    sys.exit(1)
 
 # Define the welcome_file_path
 assets_directory = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
@@ -95,7 +85,7 @@ async def send_audio(websocket, loop):
     try:
         while True:
             indata = await loop.run_in_executor(None, audio_queue.get)
-            rms_value = np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768
+            rms_value = np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2))
             print(f"RMS value: {rms_value}")
 
             if rms_value < silence_threshold:
@@ -121,6 +111,7 @@ async def send_audio(websocket, loop):
         print("Audio sending task cancelled.")
 
 async def receive_messages(websocket):
+    assistant_response_started = False
     try:
         # Initialize the OutputStream for continuous playback
         with sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16') as output_stream:
@@ -135,8 +126,12 @@ async def receive_messages(websocket):
                     output_stream.write(audio_array)
                 elif event["type"] == "response.text.delta":
                     delta = event.get("delta", "")
-                    print(f"Assistant: {delta}", end='', flush=True)
+                    if not assistant_response_started:
+                        print("\nAssistant:", end=' ', flush=True)
+                        assistant_response_started = True
+                    print(delta, end='', flush=True)
                 elif event["type"] == "response.done":
+                    assistant_response_started = False
                     print("\nAssistant response complete.")
                 elif event["type"] == "error":
                     error_info = event.get("error", {})
@@ -152,6 +147,8 @@ async def receive_messages(websocket):
 
 async def realtime_api():
     stream = None
+    send_task = None
+    receive_task = None
     try:
         async with websockets.connect(url, extra_headers=headers) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
@@ -192,13 +189,16 @@ async def realtime_api():
         print("Program terminated by user.")
     finally:
         print("Cleaning up...")
+        if send_task and not send_task.done():
+            send_task.cancel()
+        if receive_task and not receive_task.done():
+            receive_task.cancel()
         if stream and not stream.stopped:
             stream.stop()
             stream.close()
 
 def main():
     print("Press Ctrl+C to exit the program.")
-
     print("Starting the assistant.")
 
     try:
