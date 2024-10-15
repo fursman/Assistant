@@ -14,7 +14,7 @@ import keyring
 import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
-import queue  # Import queue module for thread-safe queue
+import queue  # Thread-safe queue for audio data
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
@@ -23,6 +23,9 @@ channels = 1
 blocksize = 2400  # Block size for audio recording
 
 audio_queue = queue.Queue()  # Thread-safe queue for audio data
+
+# Unix domain socket path for IPC
+socket_path = '/tmp/assistant.sock'
 
 # Function to load the API key using keyring
 def load_api_key():
@@ -82,14 +85,14 @@ def audio_callback(indata, frames, time_info, status):
         print(status, file=sys.stderr)
     audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
-async def send_audio(websocket):
+async def send_audio(websocket, shutdown_event):
     silence_threshold = 0.01  # Normalized threshold
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
     chunk_duration = blocksize / samplerate  # seconds per chunk
 
     try:
-        while True:
+        while not shutdown_event.is_set():
             indata = await asyncio.get_event_loop().run_in_executor(None, audio_queue.get)
             rms_value = np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2))
             print(f"RMS value: {rms_value}")
@@ -115,13 +118,15 @@ async def send_audio(websocket):
                 print("Silence detected. Sent input_audio_buffer.commit")
     except asyncio.CancelledError:
         print("Audio sending task cancelled.")
+    except Exception as e:
+        print(f"Error in send_audio: {e}")
 
-async def receive_messages(websocket):
+async def receive_messages(websocket, shutdown_event):
     assistant_response_started = False
     try:
         # Initialize the OutputStream for continuous playback
         with sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16') as output_stream:
-            while True:
+            while not shutdown_event.is_set():
                 message = await websocket.recv()
                 event = json.loads(message)
 
@@ -151,21 +156,40 @@ async def receive_messages(websocket):
     except Exception as e:
         print(f"Error in receive_messages: {e}")
 
+async def ipc_server(shutdown_event):
+    # Remove existing socket file if it exists
+    if os.path.exists(socket_path):
+        os.remove(socket_path)
+
+    async def handle_client(reader, writer):
+        try:
+            data = await reader.read(100)
+            message = data.decode()
+            print(f"Received IPC message: {message}")
+            if message.strip() == "shutdown":
+                shutdown_event.set()
+                writer.write(b"ack")
+                await writer.drain()
+        except Exception as e:
+            print(f"Error in IPC server: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(handle_client, path=socket_path)
+    return server
+
 async def realtime_api():
     stream = None
     send_task = None
     receive_task = None
-    loop = asyncio.get_running_loop()
+    ipc_server_task = None
     shutdown_event = asyncio.Event()
 
-    def shutdown():
-        shutdown_event.set()
-
-    # Register signal handlers
-    loop.add_signal_handler(signal.SIGTERM, shutdown)
-    loop.add_signal_handler(signal.SIGINT, shutdown)
-
     try:
+        # Start IPC server
+        ipc_server_task = await ipc_server(shutdown_event)
+
         async with websockets.connect(url, extra_headers=headers) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
 
@@ -182,7 +206,7 @@ async def realtime_api():
                     "output_audio_format": "pcm16",
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.9,
+                        "threshold": 0.5,
                         "prefix_padding_ms": 100,
                         "silence_duration_ms": 1000,
                     },
@@ -195,8 +219,8 @@ async def realtime_api():
                                     callback=audio_callback, blocksize=blocksize)
             stream.start()
 
-            send_task = asyncio.create_task(send_audio(websocket))
-            receive_task = asyncio.create_task(receive_messages(websocket))
+            send_task = asyncio.create_task(send_audio(websocket, shutdown_event))
+            receive_task = asyncio.create_task(receive_messages(websocket, shutdown_event))
 
             await shutdown_event.wait()
             print("Shutdown event received.")
@@ -210,45 +234,48 @@ async def realtime_api():
         if stream and not stream.stopped:
             stream.stop()
             stream.close()
+        if ipc_server_task:
+            ipc_server_task.close()
+            await ipc_server_task.wait_closed()
+        if os.path.exists(socket_path):
+            os.remove(socket_path)
+
+async def send_shutdown_command():
+    try:
+        reader, writer = await asyncio.open_unix_connection(socket_path)
+        writer.write(b"shutdown")
+        await writer.drain()
+        data = await reader.read(100)
+        if data.decode() == "ack":
+            print("Shutdown command acknowledged.")
+        writer.close()
+        await writer.wait_closed()
+    except Exception as e:
+        print(f"Error sending shutdown command: {e}")
 
 def main():
-    print("Press Ctrl+C to exit the program.")
     print("Starting the assistant.")
 
-    # PID file path
-    pid_file_path = '/tmp/assistant.pid'
-
-    pid = os.getpid()
-    if os.path.isfile(pid_file_path):
-        # Read the PID from the file
-        with open(pid_file_path, 'r') as f:
-            old_pid = int(f.read())
-        # Check if the process is running
+    if os.path.exists(socket_path):
+        # Another instance is running, send shutdown command
+        print("Another instance detected. Sending shutdown command.")
         try:
-            os.kill(old_pid, 0)
-        except OSError:
-            # Process is not running, remove the pid file and start new instance
-            os.remove(pid_file_path)
-        else:
-            # Process is running, send SIGTERM
-            os.kill(old_pid, signal.SIGTERM)
-            # Play "got it"
+            asyncio.run(send_shutdown_command())
+            # Wait for the running process to shut down
+            for _ in range(10):
+                if not os.path.exists(socket_path):
+                    break
+                asyncio.run(asyncio.sleep(0.1))
+            # Play "got it" audio
             play_audio(gotit_file_path)
-            # Remove the pid file
-            os.remove(pid_file_path)
-            sys.exit(0)
-    # Write current PID to the pid file
-    with open(pid_file_path, 'w') as f:
-        f.write(str(pid))
-
-    try:
-        asyncio.run(realtime_api())
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-    finally:
-        # Remove the pid file
-        if os.path.isfile(pid_file_path):
-            os.remove(pid_file_path)
+        except Exception as e:
+            print(f"Error communicating with the running instance: {e}")
+        sys.exit(0)
+    else:
+        try:
+            asyncio.run(realtime_api())
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
     main()
