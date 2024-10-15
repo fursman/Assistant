@@ -156,6 +156,9 @@ async def realtime_api():
         async with websockets.connect(url, extra_headers=headers) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
 
+            # Play the welcome audio at the start
+            play_audio(welcome_file_path)
+            
             # Send session update
             session_update = {
                 "type": "session.update",
@@ -196,10 +199,7 @@ async def realtime_api():
 def main():
     print("Press Ctrl+C to exit the program.")
 
-    # Play the welcome audio at the start
-    play_audio(welcome_file_path)
-
-    print("Starting the assistant. Speak into your microphone.")
+    print("Starting the assistant.")
 
     try:
         asyncio.run(realtime_api())
