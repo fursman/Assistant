@@ -55,8 +55,8 @@
             chmod +x $out/bin/assistant
 
             # Install Python script
-            cp ${assistantSrc}/realtime-assistant.py $out/bin/realtime
-            chmod +x $out/bin/realtime
+            cp ${assistantSrc}/legacy-assistant.py $out/bin/chatgpt
+            chmod +x $out/bin/chatgpt
 
             # Copy audio assets
             cp -r ${assistantSrc}/assets-audio/* $out/share/assistant/assets-audio/
