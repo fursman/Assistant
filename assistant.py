@@ -6,12 +6,11 @@ import json
 import websockets
 import base64
 import sys
-import fcntl  # Import fcntl for file locking
-
-import keyring
+import signal
 from pathlib import Path
 import getpass
 
+import keyring
 import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
@@ -83,7 +82,7 @@ def audio_callback(indata, frames, time_info, status):
         print(status, file=sys.stderr)
     audio_queue.put(indata.copy())  # Put data into thread-safe queue
 
-async def send_audio(websocket, loop):
+async def send_audio(websocket):
     silence_threshold = 0.01  # Normalized threshold
     silence_duration = 0
     silence_duration_limit = 1.0  # seconds
@@ -91,7 +90,7 @@ async def send_audio(websocket, loop):
 
     try:
         while True:
-            indata = await loop.run_in_executor(None, audio_queue.get)
+            indata = await asyncio.get_event_loop().run_in_executor(None, audio_queue.get)
             rms_value = np.sqrt(np.mean((indata.astype(np.float32) / 32768.0) ** 2))
             print(f"RMS value: {rms_value}")
 
@@ -156,6 +155,16 @@ async def realtime_api():
     stream = None
     send_task = None
     receive_task = None
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def shutdown():
+        shutdown_event.set()
+
+    # Register signal handlers
+    loop.add_signal_handler(signal.SIGTERM, shutdown)
+    loop.add_signal_handler(signal.SIGINT, shutdown)
+
     try:
         async with websockets.connect(url, extra_headers=headers) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
@@ -186,14 +195,12 @@ async def realtime_api():
                                     callback=audio_callback, blocksize=blocksize)
             stream.start()
 
-            loop = asyncio.get_running_loop()  # Get the current event loop
-
-            send_task = asyncio.create_task(send_audio(websocket, loop))
+            send_task = asyncio.create_task(send_audio(websocket))
             receive_task = asyncio.create_task(receive_messages(websocket))
 
-            await asyncio.gather(send_task, receive_task)
-    except KeyboardInterrupt:
-        print("Program terminated by user.")
+            await shutdown_event.wait()
+            print("Shutdown event received.")
+
     finally:
         print("Cleaning up...")
         if send_task and not send_task.done():
@@ -208,28 +215,40 @@ def main():
     print("Press Ctrl+C to exit the program.")
     print("Starting the assistant.")
 
-    # Implement file locking mechanism
-    lock_file_path = '/tmp/assistant.lock'  # Path to the lock file
-    try:
-        lock_file = open(lock_file_path, 'w')
+    # PID file path
+    pid_file_path = '/tmp/assistant.pid'
+
+    pid = os.getpid()
+    if os.path.isfile(pid_file_path):
+        # Read the PID from the file
+        with open(pid_file_path, 'r') as f:
+            old_pid = int(f.read())
+        # Check if the process is running
         try:
-            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Successfully acquired the lock; proceed to run the assistant
-            try:
-                asyncio.run(realtime_api())
-            except Exception as e:
-                print(f"An unexpected error occurred: {e}")
-            finally:
-                # Release the lock
-                lock_file.close()
-                os.remove(lock_file_path)  # Clean up the lock file
-        except BlockingIOError:
-            # Could not acquire the lock; another instance is running
-            lock_file.close()
-            print("Another instance is already running.")
+            os.kill(old_pid, 0)
+        except OSError:
+            # Process is not running, remove the pid file and start new instance
+            os.remove(pid_file_path)
+        else:
+            # Process is running, send SIGTERM
+            os.kill(old_pid, signal.SIGTERM)
+            # Play "got it"
             play_audio(gotit_file_path)
+            # Remove the pid file
+            os.remove(pid_file_path)
+            sys.exit(0)
+    # Write current PID to the pid file
+    with open(pid_file_path, 'w') as f:
+        f.write(str(pid))
+
+    try:
+        asyncio.run(realtime_api())
     except Exception as e:
-        print(f"Error with lock file: {e}")
+        print(f"An unexpected error occurred: {e}")
+    finally:
+        # Remove the pid file
+        if os.path.isfile(pid_file_path):
+            os.remove(pid_file_path)
 
 if __name__ == "__main__":
     main()
