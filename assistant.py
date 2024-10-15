@@ -21,7 +21,7 @@ import queue  # Import queue module for thread-safe queue
 samplerate = 16000  # Microphone input sample rate
 assistant_samplerate = 24000  # Assistant's audio output sample rate
 channels = 1
-blocksize = 1600  # 0.1 seconds at 16 kHz
+blocksize = 2400  # 0.1 seconds at 24 kHz
 
 audio_queue = queue.Queue()  # Use thread-safe queue
 
