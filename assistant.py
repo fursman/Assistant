@@ -161,7 +161,7 @@ async def realtime_api():
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio", "text"],
-                    "voice": "nova",
+                    "voice": "shimmer",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
                     "turn_detection": {
