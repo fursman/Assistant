@@ -19,9 +19,9 @@ import queue  # Import queue module for thread-safe queue
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
-assistant_samplerate = 26000  # Assistant's audio output sample rate
+assistant_samplerate = 24000  # Assistant's audio output sample rate
 channels = 1
-blocksize = 2600  # 0.1 seconds at 24 kHz
+blocksize = 2400  # 0.1 seconds at 24 kHz
 
 audio_queue = queue.Queue()  # Use thread-safe queue
 
@@ -161,14 +161,14 @@ async def realtime_api():
                 "type": "session.update",
                 "session": {
                     "modalities": ["audio", "text"],
-                    "voice": "alloy",
+                    "voice": "nova",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.5,
                         "prefix_padding_ms": 100,
-                        "silence_duration_ms": 500,
+                        "silence_duration_ms": 1000,
                     },
                 },
             }
