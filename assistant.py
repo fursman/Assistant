@@ -19,7 +19,7 @@ import queue  # Import queue module for thread-safe queue
 
 # Audio configuration
 samplerate = 16000  # Microphone input sample rate
-assistant_samplerate = 24000  # Assistant's audio output sample rate
+assistant_samplerate = 22050  # Assistant's audio output sample rate
 channels = 1
 blocksize = 2400  # 0.1 seconds at 24 kHz
 
@@ -123,7 +123,7 @@ async def send_audio(websocket, loop):
 async def receive_messages(websocket):
     try:
         # Initialize the OutputStream for continuous playback
-        with sd.OutputStream(channels=1, dtype='int16') as output_stream:
+        with sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16') as output_stream:
             while True:
                 message = await websocket.recv()
                 event = json.loads(message)
