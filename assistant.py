@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import asyncio
 import os
 import json
@@ -9,7 +8,6 @@ import sys
 import signal
 from pathlib import Path
 import getpass
-
 import keyring
 import sounddevice as sd
 import numpy as np
@@ -19,22 +17,22 @@ import datetime
 import csv
 import notify2
 
-# Audio configuration
-samplerate = 16000  # Microphone input sample rate
-assistant_samplerate = 24000  # Assistant's audio output sample rate
-channels = 1
-blocksize = 2400  # Block size for audio recording
+# Configuration Constants
+SAMPLERATE = 16000            # Microphone input sample rate
+ASSISTANT_SAMPLERATE = 24000  # Assistant's audio output sample rate
+CHANNELS = 1
+BLOCKSIZE = 2400             # Block size for audio recording
+AUDIO_QUEUE = queue.Queue()  # Thread-safe queue for audio data
+SOCKET_PATH = '/tmp/assistant.sock'
+LOG_CSV_PATH = Path.home() / 'assistant_interactions.csv'
 
-audio_queue = queue.Queue()  # Thread-safe queue for audio data
+# API endpoint and headers
+API_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
 
-# Unix domain socket path for IPC
-socket_path = '/tmp/assistant.sock'
-
-# Log file path
-log_csv_path = Path.home() / 'assistant_interactions.csv'
-
-# Function to load the API key using keyring
 def load_api_key():
+    """
+    Loads the API key from keyring. If not available, prompts the user.
+    """
     api_key = keyring.get_password("NixOSAssistant", "APIKey")
     if not api_key:
         api_key = getpass.getpass("Please enter your OpenAI API Key: ").strip()
@@ -45,12 +43,35 @@ def load_api_key():
             sys.exit(1)
     return api_key
 
-# Function to play audio file
+API_KEY = load_api_key()
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "OpenAI-Beta": "realtime=v1",
+}
+
+# Define assets directory and audio file paths.
+ASSETS_DIRECTORY = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
+ASSETS_DIRECTORY.mkdir(parents=True, exist_ok=True)
+WELCOME_FILE_PATH = ASSETS_DIRECTORY / "welcome.mp3"
+GOTIT_FILE_PATH = ASSETS_DIRECTORY / "gotit.mp3"
+
+# Ensure required audio files exist.
+if not WELCOME_FILE_PATH.is_file():
+    print(f"Welcome audio file not found at {WELCOME_FILE_PATH}")
+    sys.exit(1)
+if not GOTIT_FILE_PATH.is_file():
+    print(f"Gotit audio file not found at {GOTIT_FILE_PATH}")
+    sys.exit(1)
+
 def play_audio(file_path):
+    """
+    Plays an audio file using pydub and sounddevice.
+    """
     try:
         audio = AudioSegment.from_file(file_path)
         samples = np.array(audio.get_array_of_samples())
-        # If stereo, reshape
+        # Reshape samples if stereo.
         if audio.channels == 2:
             samples = samples.reshape((-1, 2))
         else:
@@ -60,55 +81,47 @@ def play_audio(file_path):
     except Exception as e:
         print(f"Error playing audio file {file_path}: {e}")
 
-# Function to log interactions
 def log_interaction(question, response):
+    """
+    Logs the interaction (question and response) to a CSV file.
+    """
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_csv_path, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([now, "Question", question])
-        writer.writerow([now, "Response", response])
+    try:
+        with open(LOG_CSV_PATH, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([now, "Question", question])
+            writer.writerow([now, "Response", response])
+    except Exception as e:
+        print(f"Error logging interaction: {e}")
 
-# Function to send desktop notifications
 def send_notification(title, message):
-    n = notify2.Notification(title, message)
-    n.set_timeout(30000)
-    n.show()
-
-# Use the function to load the API key
-api_key = load_api_key()
-
-# Define the assets directory and audio file paths
-assets_directory = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
-assets_directory.mkdir(parents=True, exist_ok=True)
-welcome_file_path = assets_directory / "welcome.mp3"
-gotit_file_path = assets_directory / "gotit.mp3"  # Define gotit.mp3 path
-
-# Ensure the welcome audio file exists
-if not welcome_file_path.is_file():
-    print(f"Welcome audio file not found at {welcome_file_path}")
-    sys.exit(1)
-
-# Ensure the gotit audio file exists
-if not gotit_file_path.is_file():
-    print(f"Gotit audio file not found at {gotit_file_path}")
-    sys.exit(1)
-
-# Define the URL and headers
-url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
-headers = {
-    "Authorization": f"Bearer {api_key}",
-    "OpenAI-Beta": "realtime=v1",
-}
+    """
+    Sends a desktop notification using notify2.
+    """
+    try:
+        n = notify2.Notification(title, message)
+        n.set_timeout(30000)
+        n.show()
+    except Exception as e:
+        print(f"Notification error: {e}")
 
 def audio_callback(indata, frames, time_info, status):
+    """
+    Sounddevice callback for recording audio. Puts recorded data into a thread-safe queue.
+    """
     if status:
-        print(status, file=sys.stderr)
-    audio_queue.put(indata.copy())  # Put data into thread-safe queue
+        print(f"Audio callback status: {status}", file=sys.stderr)
+    AUDIO_QUEUE.put(indata.copy())
 
 async def send_audio(websocket, shutdown_event):
+    """
+    Async task that sends recorded audio data to the websocket.
+    """
+    loop = asyncio.get_event_loop()
     try:
         while not shutdown_event.is_set():
-            indata = await asyncio.get_event_loop().run_in_executor(None, audio_queue.get)
+            # Retrieve audio data using run_in_executor to avoid blocking the event loop.
+            indata = await loop.run_in_executor(None, AUDIO_QUEUE.get)
             audio_bytes = indata.tobytes()
             print(f"Sending {len(audio_bytes)} bytes of audio data.")
             base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
@@ -123,86 +136,99 @@ async def send_audio(websocket, shutdown_event):
         print(f"Error in send_audio: {e}")
 
 async def receive_messages(websocket, shutdown_event):
+    """
+    Async task that receives and handles messages from the websocket.
+    """
     assistant_response_started = False
-    output_stream = None
-    user_question = ''
     assistant_response = ''
+    user_question = ''
     assistant_audio_transcript = ''
+    output_stream = None
     try:
-        # Initialize the OutputStream for continuous playback
-        output_stream = sd.OutputStream(samplerate=assistant_samplerate, channels=1, dtype='int16')
+        # Initialize an OutputStream for assistant audio playback.
+        output_stream = sd.OutputStream(samplerate=ASSISTANT_SAMPLERATE, channels=1, dtype='int16')
         output_stream.start()
-
         while not shutdown_event.is_set():
-            # Use asyncio.wait_for to add a timeout in case websocket.recv() hangs
             try:
                 message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
             except asyncio.TimeoutError:
-                continue  # Check shutdown_event again
-            event = json.loads(message)
+                continue  # Regularly check for shutdown.
+            except websockets.exceptions.ConnectionClosed:
+                print("WebSocket connection closed.")
+                shutdown_event.set()
+                break
 
-            if event["type"] == "conversation.item.input_audio_transcription.completed":
+            try:
+                event = json.loads(message)
+            except json.JSONDecodeError:
+                print("Received invalid JSON message.")
+                continue
+
+            event_type = event.get("type", "")
+            if event_type == "conversation.item.input_audio_transcription.completed":
                 transcript = event.get("transcript", "")
                 user_question = transcript
                 print(f"\nYou: {transcript}")
                 send_notification("You said:", transcript)
-            elif event["type"] == "response.audio.delta":
-                delta = event["delta"]
-                audio_data = base64.b64decode(delta)
-                audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                output_stream.write(audio_array)
-            elif event["type"] == "response.text.delta":
+            elif event_type == "response.audio.delta":
+                delta = event.get("delta", "")
+                try:
+                    audio_data = base64.b64decode(delta)
+                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    output_stream.write(audio_array)
+                except Exception as e:
+                    print(f"Error processing audio delta: {e}")
+            elif event_type == "response.text.delta":
                 delta = event.get("delta", "")
                 assistant_response += delta
                 if not assistant_response_started:
                     print("\nAssistant:", end=' ', flush=True)
                     assistant_response_started = True
                 print(delta, end='', flush=True)
-            elif event["type"] == "response.audio_transcript.delta":
-                delta = event.get("delta", "")
-                assistant_audio_transcript += delta
-            elif event["type"] == "response.audio_transcript.done":
-                transcript = event.get("transcript", "")
-                assistant_audio_transcript = transcript
-            elif event["type"] == "response.done":
+            elif event_type == "response.audio_transcript.delta":
+                assistant_audio_transcript += event.get("delta", "")
+            elif event_type == "response.audio_transcript.done":
+                assistant_audio_transcript = event.get("transcript", "")
+            elif event_type == "response.done":
                 assistant_response_started = False
                 print("\nAssistant response complete.")
                 log_interaction(user_question, assistant_response)
                 send_notification("Assistant", assistant_response)
-                # Reset variables for next interaction
+                # Reset for next interaction.
                 user_question = ''
                 assistant_response = ''
                 assistant_audio_transcript = ''
-            elif event["type"] == "error":
+            elif event_type == "error":
                 error_info = event.get("error", {})
                 error_message = error_info.get("message", "")
                 print(f"Error: {error_message}")
                 print(f"Full error info: {error_info}")
             else:
-                pass  # Handle other event types if necessary
-
+                # For debugging, print any unhandled event types.
+                print(f"Unhandled event type: {event_type}")
     except asyncio.CancelledError:
         print("Message receiving task cancelled.")
     except Exception as e:
         print(f"Error in receive_messages: {e}")
     finally:
-        # Abort and close the output stream immediately
         if output_stream:
-            output_stream.abort()  # Immediately stop playback and discard buffers
+            output_stream.abort()
             output_stream.close()
             print("Audio playback stopped.")
 
 async def ipc_server(shutdown_event):
-    # Remove existing socket file if it exists
-    if os.path.exists(socket_path):
-        os.remove(socket_path)
+    """
+    Starts a simple IPC server on a Unix domain socket to handle shutdown commands.
+    """
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
 
     async def handle_client(reader, writer):
         try:
             data = await reader.read(100)
-            message = data.decode()
+            message = data.decode().strip()
             print(f"Received IPC message: {message}")
-            if message.strip() == "shutdown":
+            if message == "shutdown":
                 shutdown_event.set()
                 writer.write(b"ack")
                 await writer.drain()
@@ -212,27 +238,25 @@ async def ipc_server(shutdown_event):
             writer.close()
             await writer.wait_closed()
 
-    server = await asyncio.start_unix_server(handle_client, path=socket_path)
+    server = await asyncio.start_unix_server(handle_client, path=SOCKET_PATH)
     return server
 
 async def realtime_api():
-    stream = None
+    """
+    Main asynchronous function to handle the realtime API connection, audio streams,
+    and IPC shutdown. Ensures that all tasks are cleaned up upon exit.
+    """
     send_task = None
     receive_task = None
-    ipc_server_task = None
+    ipc_srv = None
+    stream = None
     shutdown_event = asyncio.Event()
-
     try:
-        # Start IPC server
-        ipc_server_task = await ipc_server(shutdown_event)
-
-        async with websockets.connect(url, extra_headers=headers) as websocket:
+        ipc_srv = await ipc_server(shutdown_event)
+        async with websockets.connect(API_URL, extra_headers=HEADERS) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
-
-            # Play the welcome audio at the start
-            play_audio(welcome_file_path)
-
-            # Send session update
+            play_audio(WELCOME_FILE_PATH)
+            # Send a session update event with the desired configuration.
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -253,19 +277,16 @@ async def realtime_api():
                 },
             }
             await websocket.send(json.dumps(session_update))
-
-            # Start audio stream
-            stream = sd.InputStream(samplerate=samplerate, channels=channels, dtype='int16',
-                                    callback=audio_callback, blocksize=blocksize)
+            # Start the audio input stream.
+            stream = sd.InputStream(samplerate=SAMPLERATE, channels=CHANNELS, dtype='int16',
+                                    callback=audio_callback, blocksize=BLOCKSIZE)
             stream.start()
-
             send_task = asyncio.create_task(send_audio(websocket, shutdown_event))
             receive_task = asyncio.create_task(receive_messages(websocket, shutdown_event))
-
             await shutdown_event.wait()
             print("Shutdown event received.")
-
-        # After exiting the 'async with' block, the websocket connection is closed
+    except Exception as e:
+        print(f"Exception in realtime_api: {e}")
     finally:
         print("Cleaning up...")
         if send_task and not send_task.done():
@@ -273,22 +294,25 @@ async def realtime_api():
         if receive_task and not receive_task.done():
             receive_task.cancel()
         if stream and stream.active:
-            stream.abort()  # Immediately stop recording
+            stream.abort()
             stream.close()
             print("Audio recording stopped.")
-        if ipc_server_task:
-            ipc_server_task.close()
-            await ipc_server_task.wait_closed()
-        if os.path.exists(socket_path):
-            os.remove(socket_path)
+        if ipc_srv:
+            ipc_srv.close()
+            await ipc_srv.wait_closed()
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)
 
 async def send_shutdown_command():
+    """
+    Sends a shutdown command via IPC to the running instance.
+    """
     try:
-        reader, writer = await asyncio.open_unix_connection(socket_path)
+        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
         writer.write(b"shutdown")
         await writer.drain()
         data = await reader.read(100)
-        if data.decode() == "ack":
+        if data.decode().strip() == "ack":
             print("Shutdown command acknowledged.")
         writer.close()
         await writer.wait_closed()
@@ -296,22 +320,24 @@ async def send_shutdown_command():
         print(f"Error sending shutdown command: {e}")
 
 def main():
+    """
+    Main entry point for the assistant.
+    If an instance is already running (detected via the IPC socket),
+    sends a shutdown command and exits. Otherwise, it starts the realtime API.
+    """
     print("Starting the assistant.")
-
     notify2.init('Assistant')
 
-    if os.path.exists(socket_path):
-        # Another instance is running, send shutdown command
+    if os.path.exists(SOCKET_PATH):
         print("Another instance detected. Sending shutdown command.")
         try:
             asyncio.run(send_shutdown_command())
-            # Wait for the running process to shut down
-            for _ in range(20):  # Increased range to allow more time
-                if not os.path.exists(socket_path):
+            # Wait until the other instance shuts down.
+            for _ in range(20):
+                if not os.path.exists(SOCKET_PATH):
                     break
-                asyncio.run(asyncio.sleep(0.05))  # Check every 50ms
-            # Play "got it" audio
-            play_audio(gotit_file_path)
+                asyncio.run(asyncio.sleep(0.05))
+            play_audio(GOTIT_FILE_PATH)
         except Exception as e:
             print(f"Error communicating with the running instance: {e}")
         sys.exit(0)
