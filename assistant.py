@@ -21,7 +21,7 @@ import notify2
 
 # Global configuration and state
 is_speaking = False  # When True, incoming audio from the microphone is ignored.
-PLAYBACK_SPEED = 1.1  # Increase playback speed by 25%; set to 1.0 for normal speed.
+PLAYBACK_SPEED = 1.04  # Increase playback speed by 25%; set to 1.0 for normal speed.
 
 # Audio configuration
 SAMPLERATE = 16000            # Microphone input sample rate (Hz)
