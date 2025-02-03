@@ -237,7 +237,7 @@ async def realtime_api():
     shutdown_event = asyncio.Event()
     try:
         ipc_srv = await ipc_server(shutdown_event)
-        async with websockets.connect(URL, extra_headers=HEADERS) as websocket:
+        async with websockets.connect(URL, extra_headers=HEADERS, ping_interval=20, ping_timeout=60) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
             play_audio(WELCOME_FILE_PATH)
             # Send a session update without the unsupported "enabled" key.
