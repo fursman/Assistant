@@ -9,6 +9,7 @@ import signal
 from pathlib import Path
 import getpass
 import io
+import threading
 
 import keyring
 import sounddevice as sd
@@ -21,7 +22,7 @@ import notify2
 
 # Global configuration and state
 is_speaking = False  # When True, incoming audio from the microphone is ignored.
-PLAYBACK_SPEED = 1.04  # Increase playback speed by 25%; set to 1.0 for normal speed.
+PLAYBACK_SPEED = 1.04  # Increase playback speed by 4%; set to 1.0 for normal speed.
 
 # Audio configuration
 SAMPLERATE = 16000            # Microphone input sample rate (Hz)
@@ -202,7 +203,6 @@ async def receive_messages(websocket, shutdown_event):
                 # Audio streaming is complete; we wait for the content_part.done to trigger playback.
                 pass
             elif event_type == "response.content_part.done":
-                # When an audio content part is done, play back the entire assistant audio reply.
                 part = event.get("part", {})
                 if part.get("type") == "audio":
                     # Begin playback: set flag to ignore further microphone input.
@@ -226,15 +226,29 @@ async def receive_messages(websocket, shutdown_event):
                                 samples = samples.reshape((-1, 2))
                             else:
                                 samples = samples.reshape((-1, 1))
-                            sd.play(samples, samplerate=audio_segment.frame_rate)
-                            sd.wait()
+                            
+                            # Define the callback to run when playback finishes.
+                            def playback_finished_callback():
+                                assistant_audio_chunks.clear()
+                                global is_speaking
+                                is_speaking = False
+                                print("Playback finished, microphone re-enabled.")
+
+                            # Define a thread to handle playback asynchronously.
+                            def playback_thread():
+                                try:
+                                    sd.play(samples, samplerate=audio_segment.frame_rate)
+                                    sd.wait()
+                                except Exception as e:
+                                    print(f"Error during assistant audio playback: {e}")
+                                playback_finished_callback()
+
+                            # Start the playback in a separate thread.
+                            threading.Thread(target=playback_thread, daemon=True).start()
                         except Exception as e:
-                            print(f"Error during assistant audio playback: {e}")
+                            print(f"Error processing assistant audio data: {e}")
                     else:
                         print("No assistant audio data received.")
-                    # Clear buffer and allow audio input again.
-                    assistant_audio_chunks.clear()
-                    is_speaking = False
             elif event_type == "response.done":
                 print("\nAssistant response complete.")
                 log_interaction(user_question, assistant_response)
