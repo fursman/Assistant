@@ -194,11 +194,13 @@ async def receive_messages(websocket, shutdown_event):
                 assistant_response += delta
                 print(f"\nAssistant (text): {delta}", end='', flush=True)
             elif event_type == "response.audio_transcript.delta":
-                # (Optional) accumulate audio transcript deltas if desired.
-                pass
+                # Accumulate transcript deltas from audio transcript events.
+                transcript_delta = event.get("delta", "")
+                assistant_response += transcript_delta
+                print(f"\nAssistant (audio transcript): {transcript_delta}", end='', flush=True)
             elif event_type == "response.audio_transcript.done":
-                # (Optional) final transcript for audio if needed.
-                pass
+                # Optionally, you can finalize transcript processing here.
+                print("\nAssistant audio transcript complete.")
             elif event_type == "response.audio.done":
                 # Audio streaming is complete; we wait for the content_part.done to trigger playback.
                 pass
@@ -252,7 +254,8 @@ async def receive_messages(websocket, shutdown_event):
             elif event_type == "response.done":
                 print("\nAssistant response complete.")
                 log_interaction(user_question, assistant_response)
-                send_notification("Assistant", assistant_response)
+                # Send a notification with the assistant's transcript if available.
+                send_notification("Assistant", assistant_response if assistant_response else "No transcript available.")
                 # Reset conversation variables.
                 assistant_response = ''
                 user_question = ''
