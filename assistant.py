@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""
+Optimized assistant script for realtime streaming and improved microphone input.
+Modifications:
+  • Streams assistant audio as soon as audio deltas arrive using a RawOutputStream.
+  • Removes aggressive muting in the microphone callback to avoid cutting off user input.
+  
+References:
+  OpenAI Realtime API docs: :contentReference[oaicite:2]{index=2}
+  Streaming completions guidelines: :contentReference[oaicite:3]{index=3}
+"""
+
 import asyncio
 import os
 import json
@@ -10,7 +21,6 @@ from pathlib import Path
 import getpass
 import io
 import threading
-
 import keyring
 import sounddevice as sd
 import numpy as np
@@ -21,15 +31,17 @@ import csv
 import notify2
 
 # Global configuration and state
-is_speaking = False  # When True, incoming audio from the microphone is ignored.
+# Removed the flag that completely stops microphone input during playback.
+# (We want to capture user speech even during assistant playback.)
+# is_speaking = False   <-- no longer used for mic muting
 PLAYBACK_SPEED = 1.04  # Increase playback speed by 4%; set to 1.0 for normal speed.
 
 # Audio configuration
-SAMPLERATE = 16000            # Microphone input sample rate (Hz)
-ASSISTANT_SAMPLERATE = 24000  # Expected sample rate for assistant's audio output (Hz)
+SAMPLERATE = 16000           # Microphone input sample rate (Hz)
+ASSISTANT_SAMPLERATE = 24000  # Assistant's audio output sample rate (Hz)
 CHANNELS = 1
-BLOCKSIZE = 2400             # Block size for audio recording
-AUDIO_QUEUE = queue.Queue()  # Thread-safe queue for audio data
+BLOCKSIZE = 2400  # Block size for audio recording
+AUDIO_QUEUE = queue.Queue()  # Queue for mic audio data
 
 # Unix domain socket path for IPC
 SOCKET_PATH = '/tmp/assistant.sock'
@@ -107,23 +119,30 @@ HEADERS = {
 def change_speed(sound, speed=1.0):
     """
     Change the playback speed of an AudioSegment.
-    This method adjusts the frame_rate to speed up (or slow down) playback.
+    This adjusts the frame_rate to speed up (or slow down) playback.
     Note: This method will also alter the pitch.
     """
     sound_altered = sound._spawn(sound.raw_data, overrides={
-         "frame_rate": int(sound.frame_rate * speed)
+        "frame_rate": int(sound.frame_rate * speed)
     })
     return sound_altered.set_frame_rate(sound.frame_rate)
 
+# --- Updated microphone input ---
 def audio_callback(indata, frames, time_info, status):
-    """Audio callback for recording; ignores audio if the system is speaking."""
-    global is_speaking
-    if is_speaking:
-        return
+    """
+    Audio callback for recording.
+    *Always* enqueue microphone data, even if assistant is playing,
+    so that the user's speech (even the first words) are not lost.
+    (Echo cancellation is left to the server-side VAD.)
+    """
     if status:
         print(f"Audio callback status: {status}", file=sys.stderr)
     AUDIO_QUEUE.put(indata.copy())
 
+# Global variable for streaming assistant output.
+assistant_output_stream = None  # Will hold our output stream for assistant audio
+
+# --- Updated send_audio: unchanged, mic audio is always sent ---
 async def send_audio(websocket, shutdown_event):
     """Continuously send recorded audio chunks to the WebSocket."""
     loop = asyncio.get_event_loop()
@@ -143,17 +162,16 @@ async def send_audio(websocket, shutdown_event):
     except Exception as e:
         print(f"Error in send_audio: {e}")
 
+# --- Updated receive_messages to stream assistant audio immediately ---
 async def receive_messages(websocket, shutdown_event):
     """
     Receive events from the WebSocket.
-    This function buffers the assistant's audio output (instead of playing it immediately)
-    and then plays it (with an optional speed increase) once the response is complete.
-    It also logs and displays text responses.
+    Streams assistant audio immediately as chunks arrive.
+    Accumulates transcript text concurrently.
     """
-    global is_speaking
+    global assistant_output_stream
     assistant_response = ''
     user_question = ''
-    assistant_audio_chunks = []  # Buffer to accumulate assistant audio bytes
     try:
         while not shutdown_event.is_set():
             try:
@@ -164,13 +182,11 @@ async def receive_messages(websocket, shutdown_event):
                 print("WebSocket connection closed.")
                 shutdown_event.set()
                 break
-
             try:
                 event = json.loads(message)
             except json.JSONDecodeError:
                 print("Received invalid JSON message.")
                 continue
-
             event_type = event.get("type", "")
             if event_type == "session.created":
                 print("Session created event received.")
@@ -179,96 +195,60 @@ async def receive_messages(websocket, shutdown_event):
             elif event_type == "conversation.item.input_audio_transcription.completed":
                 transcript = event.get("transcript", "")
                 user_question = transcript
-                print(f"\nYou: {transcript}")
+                print(f"\n You: {transcript}")
                 send_notification("You said:", transcript)
             elif event_type == "response.audio.delta":
                 delta = event.get("delta", "")
                 if delta:
                     try:
                         chunk = base64.b64decode(delta)
-                        assistant_audio_chunks.append(chunk)
+                        # Create output stream on first delta if not already created.
+                        if assistant_output_stream is None:
+                            assistant_output_stream = sd.RawOutputStream(
+                                samplerate=ASSISTANT_SAMPLERATE,
+                                channels=1,
+                                dtype='int16'
+                            )
+                            assistant_output_stream.start()
+                        # Write chunk immediately to output stream.
+                        assistant_output_stream.write(chunk)
                     except Exception as e:
                         print(f"Error processing audio delta: {e}")
             elif event_type == "response.text.delta":
                 delta = event.get("delta", "")
                 assistant_response += delta
-                print(f"\nAssistant (text): {delta}", end='', flush=True)
+                print(f"\n Assistant (text): {delta}", end='', flush=True)
             elif event_type == "response.audio_transcript.delta":
-                # Accumulate transcript deltas from audio transcript events.
                 transcript_delta = event.get("delta", "")
                 assistant_response += transcript_delta
-                print(f"\nAssistant (audio transcript): {transcript_delta}", end='', flush=True)
+                print(f"\n Assistant (audio transcript): {transcript_delta}", end='', flush=True)
             elif event_type == "response.audio_transcript.done":
-                # Optionally, you can finalize transcript processing here.
-                print("\nAssistant audio transcript complete.")
-            elif event_type == "response.audio.done":
-                # Audio streaming is complete; we wait for the content_part.done to trigger playback.
-                pass
-            elif event_type == "response.content_part.done":
-                part = event.get("part", {})
-                if part.get("type") == "audio":
-                    # Begin playback: set flag to ignore further microphone input.
-                    is_speaking = True
-                    full_audio_bytes = b"".join(assistant_audio_chunks)
-                    if full_audio_bytes:
-                        try:
-                            # Create an AudioSegment from the raw PCM audio data.
-                            audio_segment = AudioSegment.from_raw(
-                                io.BytesIO(full_audio_bytes),
-                                sample_width=2,  # 16-bit PCM
-                                frame_rate=ASSISTANT_SAMPLERATE,
-                                channels=1
-                            )
-                            # Adjust speed if desired.
-                            if PLAYBACK_SPEED != 1.0:
-                                audio_segment = change_speed(audio_segment, PLAYBACK_SPEED)
-                            # Convert AudioSegment to numpy array for playback.
-                            samples = np.array(audio_segment.get_array_of_samples())
-                            if audio_segment.channels == 2:
-                                samples = samples.reshape((-1, 2))
-                            else:
-                                samples = samples.reshape((-1, 1))
-                            
-                            # Define the callback to run when playback finishes.
-                            def playback_finished_callback():
-                                assistant_audio_chunks.clear()
-                                global is_speaking
-                                is_speaking = False
-                                print("Playback finished, microphone re-enabled.")
-
-                            # Define a thread to handle playback asynchronously.
-                            def playback_thread():
-                                try:
-                                    sd.play(samples, samplerate=audio_segment.frame_rate)
-                                    sd.wait()
-                                except Exception as e:
-                                    print(f"Error during assistant audio playback: {e}")
-                                playback_finished_callback()
-
-                            # Start the playback in a separate thread.
-                            threading.Thread(target=playback_thread, daemon=True).start()
-                        except Exception as e:
-                            print(f"Error processing assistant audio data: {e}")
-                    else:
-                        print("No assistant audio data received.")
+                print("\n Assistant audio transcript complete.")
+            elif event_type in ["response.audio.done", "response.content_part.done"]:
+                # End of assistant audio response: stop and close the stream if open.
+                if assistant_output_stream is not None:
+                    try:
+                        assistant_output_stream.stop()
+                        assistant_output_stream.close()
+                        assistant_output_stream = None
+                        print("Assistant audio playback complete.")
+                    except Exception as e:
+                        print(f"Error finishing assistant audio playback: {e}")
             elif event_type == "response.done":
-                print("\nAssistant response complete.")
+                print("\n Assistant response complete.")
                 log_interaction(user_question, assistant_response)
-                # Send a notification with the assistant's transcript if available.
                 send_notification("Assistant", assistant_response if assistant_response else "No transcript available.")
                 # Reset conversation variables.
                 assistant_response = ''
                 user_question = ''
-            elif event_type in ["input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped",
-                                "input_audio_buffer.committed", "conversation.item.created",
-                                "response.created", "rate_limits.updated", "response.output_item.added",
-                                "response.output_item.done"]:
-                # Log these events for debugging purposes.
+            elif event_type in [
+                "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped",
+                "input_audio_buffer.committed", "conversation.item.created",
+                "response.created", "rate_limits.updated", "response.output_item.added",
+                "response.output_item.done"
+            ]:
                 print(f"Unhandled event type: {event_type}")
                 print(event)
-            elif event_type == "response.content_part.added":
-                # Optionally log if needed.
-                print("Received response content part added event.")
             else:
                 print(f"Unhandled event type: {event_type}")
                 print(event)
@@ -309,7 +289,7 @@ async def realtime_api():
         async with websockets.connect(URL, extra_headers=HEADERS) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
             play_audio_file(WELCOME_FILE_PATH)
-            # Send a session update with enhanced instructions.
+            # Send session update with instructions.
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -317,7 +297,7 @@ async def realtime_api():
                     "voice": "shimmer",
                     "input_audio_format": "pcm16",
                     "output_audio_format": "pcm16",
-                    "input_audio_transcription": { "model": "whisper-1" },
+                    "input_audio_transcription": {"model": "whisper-1"},
                     "turn_detection": {
                         "type": "server_vad",
                         "threshold": 0.75,
@@ -330,12 +310,17 @@ async def realtime_api():
                         "Act like a human, but remember that you aren't a human. "
                         "Speak quickly in your responses."
                     )
-                },
+                }
             }
             await websocket.send(json.dumps(session_update))
-            # Start the audio input stream.
-            stream = sd.InputStream(samplerate=SAMPLERATE, channels=CHANNELS, dtype='int16',
-                                    callback=audio_callback, blocksize=BLOCKSIZE)
+            # Start audio input stream; microphone always records.
+            stream = sd.InputStream(
+                samplerate=SAMPLERATE,
+                channels=CHANNELS,
+                dtype='int16',
+                callback=audio_callback,
+                blocksize=BLOCKSIZE
+            )
             stream.start()
             send_task = asyncio.create_task(send_audio(websocket, shutdown_event))
             receive_task = asyncio.create_task(receive_messages(websocket, shutdown_event))
