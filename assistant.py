@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Final optimized assistant script for realtime streaming with complete assistant audio playback.
+Optimized assistant script for realtime streaming and improved microphone input.
 Modifications:
-  • Streams assistant audio immediately as deltas arrive.
-  • Waits briefly (0.1 sec) after receiving the final audio done event to flush remaining audio before closing.
-  • Always enqueues microphone input, so the user's reply isn’t cut off.
+  • Streams assistant audio as soon as audio deltas arrive using a RawOutputStream.
+  • Removes aggressive muting in the microphone callback to avoid cutting off user input.
   
 References:
-  OpenAI Realtime API docs: :contentReference[oaicite:0]{index=0}
-  Streaming completions guidelines: :contentReference[oaicite:1]{index=1}
+  OpenAI Realtime API docs: :contentReference[oaicite:2]{index=2}
+  Streaming completions guidelines: :contentReference[oaicite:3]{index=3}
 """
 
 import asyncio
@@ -32,15 +31,22 @@ import csv
 import notify2
 
 # Global configuration and state
-PLAYBACK_SPEED = 1.04  # Increase playback speed by 4%
-SAMPLERATE = 16000           # Microphone input sample rate (Hz)
-ASSISTANT_SAMPLERATE = 24000  # Expected sample rate for assistant audio output (Hz)
-CHANNELS = 1
-BLOCKSIZE = 2400           # Block size for audio recording
-AUDIO_QUEUE = queue.Queue()  # Queue for microphone audio data
+# Removed the flag that completely stops microphone input during playback.
+# (We want to capture user speech even during assistant playback.)
+# is_speaking = False   <-- no longer used for mic muting
+PLAYBACK_SPEED = 1.04  # Increase playback speed by 4%; set to 1.0 for normal speed.
 
-# Unix domain socket for IPC
+# Audio configuration
+SAMPLERATE = 16000           # Microphone input sample rate (Hz)
+ASSISTANT_SAMPLERATE = 24000  # Assistant's audio output sample rate (Hz)
+CHANNELS = 1
+BLOCKSIZE = 2400  # Block size for audio recording
+AUDIO_QUEUE = queue.Queue()  # Queue for mic audio data
+
+# Unix domain socket path for IPC
 SOCKET_PATH = '/tmp/assistant.sock'
+
+# Log file path (CSV)
 LOG_CSV_PATH = Path.home() / 'assistant_interactions.csv'
 
 def load_api_key():
@@ -89,7 +95,7 @@ def send_notification(title, message):
     except Exception as e:
         print(f"Notification error: {e}")
 
-# Load API key and assets
+# Load API key and set up assets
 API_KEY = load_api_key()
 ASSETS_DIRECTORY = Path(os.getenv('AUDIO_ASSETS', Path(__file__).parent / "assets-audio"))
 ASSETS_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -111,21 +117,34 @@ HEADERS = {
 }
 
 def change_speed(sound, speed=1.0):
-    """Adjust playback speed (and pitch) of an AudioSegment."""
-    sound_altered = sound._spawn(sound.raw_data, overrides={"frame_rate": int(sound.frame_rate * speed)})
+    """
+    Change the playback speed of an AudioSegment.
+    This adjusts the frame_rate to speed up (or slow down) playback.
+    Note: This method will also alter the pitch.
+    """
+    sound_altered = sound._spawn(sound.raw_data, overrides={
+        "frame_rate": int(sound.frame_rate * speed)
+    })
     return sound_altered.set_frame_rate(sound.frame_rate)
 
-# Microphone audio callback: always enqueue audio.
+# --- Updated microphone input ---
 def audio_callback(indata, frames, time_info, status):
+    """
+    Audio callback for recording.
+    *Always* enqueue microphone data, even if assistant is playing,
+    so that the user's speech (even the first words) are not lost.
+    (Echo cancellation is left to the server-side VAD.)
+    """
     if status:
         print(f"Audio callback status: {status}", file=sys.stderr)
     AUDIO_QUEUE.put(indata.copy())
 
-# Global variable to hold our assistant audio output stream.
-assistant_output_stream = None
+# Global variable for streaming assistant output.
+assistant_output_stream = None  # Will hold our output stream for assistant audio
 
+# --- Updated send_audio: unchanged, mic audio is always sent ---
 async def send_audio(websocket, shutdown_event):
-    """Continuously send recorded microphone audio to the WebSocket."""
+    """Continuously send recorded audio chunks to the WebSocket."""
     loop = asyncio.get_event_loop()
     try:
         while not shutdown_event.is_set():
@@ -143,11 +162,12 @@ async def send_audio(websocket, shutdown_event):
     except Exception as e:
         print(f"Error in send_audio: {e}")
 
+# --- Updated receive_messages to stream assistant audio immediately ---
 async def receive_messages(websocket, shutdown_event):
     """
     Receive events from the WebSocket.
-    Immediately writes assistant audio deltas to an output stream.
-    Also accumulates transcript text.
+    Streams assistant audio immediately as chunks arrive.
+    Accumulates transcript text concurrently.
     """
     global assistant_output_stream
     assistant_response = ''
@@ -182,6 +202,7 @@ async def receive_messages(websocket, shutdown_event):
                 if delta:
                     try:
                         chunk = base64.b64decode(delta)
+                        # Create output stream on first delta if not already created.
                         if assistant_output_stream is None:
                             assistant_output_stream = sd.RawOutputStream(
                                 samplerate=ASSISTANT_SAMPLERATE,
@@ -189,6 +210,7 @@ async def receive_messages(websocket, shutdown_event):
                                 dtype='int16'
                             )
                             assistant_output_stream.start()
+                        # Write chunk immediately to output stream.
                         assistant_output_stream.write(chunk)
                     except Exception as e:
                         print(f"Error processing audio delta: {e}")
@@ -203,9 +225,11 @@ async def receive_messages(websocket, shutdown_event):
             elif event_type == "response.audio_transcript.done":
                 print("\n Assistant audio transcript complete.")
             elif event_type in ["response.audio.done", "response.content_part.done"]:
-                # Wait briefly to allow any remaining audio to play
-                await asyncio.sleep(0.1)
+                # End of assistant audio response: wait briefly to flush the output buffer,
+                # then stop and close the stream if open.
                 if assistant_output_stream is not None:
+                    # Wait 300ms to allow any remaining audio to be played
+                    sd.sleep(300)
                     try:
                         assistant_output_stream.stop()
                         assistant_output_stream.close()
@@ -217,6 +241,7 @@ async def receive_messages(websocket, shutdown_event):
                 print("\n Assistant response complete.")
                 log_interaction(user_question, assistant_response)
                 send_notification("Assistant", assistant_response if assistant_response else "No transcript available.")
+                # Reset conversation variables.
                 assistant_response = ''
                 user_question = ''
             elif event_type in [
@@ -236,7 +261,7 @@ async def receive_messages(websocket, shutdown_event):
         print(f"Error in receive_messages: {e}")
 
 async def ipc_server(shutdown_event):
-    """Set up an IPC server for external shutdown commands."""
+    """Set up an IPC server to allow external shutdown commands."""
     if os.path.exists(SOCKET_PATH):
         os.remove(SOCKET_PATH)
     async def handle_client(reader, writer):
@@ -267,6 +292,7 @@ async def realtime_api():
         async with websockets.connect(URL, extra_headers=HEADERS) as websocket:
             print("Connected to OpenAI Realtime Assistant API.")
             play_audio_file(WELCOME_FILE_PATH)
+            # Send session update with instructions.
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -290,6 +316,7 @@ async def realtime_api():
                 }
             }
             await websocket.send(json.dumps(session_update))
+            # Start audio input stream; microphone always records.
             stream = sd.InputStream(
                 samplerate=SAMPLERATE,
                 channels=CHANNELS,
@@ -321,7 +348,7 @@ async def realtime_api():
             os.remove(SOCKET_PATH)
 
 async def send_shutdown_command():
-    """Send a shutdown command via the IPC socket."""
+    """Send a shutdown command via the IPC socket to stop any running instance."""
     try:
         reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
         writer.write(b"shutdown")
@@ -341,6 +368,7 @@ def main():
         print("Another instance detected. Sending shutdown command.")
         try:
             asyncio.run(send_shutdown_command())
+            # Wait briefly for the other instance to shut down.
             for _ in range(20):
                 if not os.path.exists(SOCKET_PATH):
                     break
