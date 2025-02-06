@@ -4,6 +4,7 @@ Optimized assistant script for realtime streaming and improved microphone input.
 Modifications:
   • Streams assistant audio as soon as audio deltas arrive using a RawOutputStream.
   • Removes aggressive muting in the microphone callback to avoid cutting off user input.
+  • After assistant playback completes, flushes the mic audio queue and temporarily ignores further mic data.
   
 References:
   OpenAI Realtime API docs: :contentReference[oaicite:2]{index=2}
@@ -29,19 +30,18 @@ import queue  # Thread-safe queue for audio data
 import datetime
 import csv
 import notify2
+import time  # used for time.time() in our ignore-mic timer
 
 # Global configuration and state
-# Removed the flag that completely stops microphone input during playback.
-# (We want to capture user speech even during assistant playback.)
-# is_speaking = False   <-- no longer used for mic muting
 PLAYBACK_SPEED = 1.04  # Increase playback speed by 4%; set to 1.0 for normal speed.
-
-# Audio configuration
 SAMPLERATE = 16000           # Microphone input sample rate (Hz)
 ASSISTANT_SAMPLERATE = 24000  # Assistant's audio output sample rate (Hz)
 CHANNELS = 1
 BLOCKSIZE = 2400  # Block size for audio recording
 AUDIO_QUEUE = queue.Queue()  # Queue for mic audio data
+
+# Global flag to temporarily ignore mic input
+IGNORE_MIC = False
 
 # Unix domain socket path for IPC
 SOCKET_PATH = '/tmp/assistant.sock'
@@ -127,22 +127,40 @@ def change_speed(sound, speed=1.0):
     })
     return sound_altered.set_frame_rate(sound.frame_rate)
 
+def flush_audio_queue():
+    """Empty the microphone audio queue."""
+    while not AUDIO_QUEUE.empty():
+        try:
+            AUDIO_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+
+def disable_mic_temporarily(duration_sec):
+    """Temporarily ignore microphone input for duration_sec seconds."""
+    global IGNORE_MIC
+    IGNORE_MIC = True
+    def enable_mic():
+        global IGNORE_MIC
+        IGNORE_MIC = False
+    timer = threading.Timer(duration_sec, enable_mic)
+    timer.start()
+
 # --- Updated microphone input ---
 def audio_callback(indata, frames, time_info, status):
     """
     Audio callback for recording.
-    *Always* enqueue microphone data, even if assistant is playing,
-    so that the user's speech (even the first words) are not lost.
-    (Echo cancellation is left to the server-side VAD.)
+    Always enqueues microphone data UNLESS we are temporarily ignoring mic input.
     """
     if status:
         print(f"Audio callback status: {status}", file=sys.stderr)
+    if IGNORE_MIC:
+        return  # Skip enqueuing data if we're ignoring mic input
     AUDIO_QUEUE.put(indata.copy())
 
 # Global variable for streaming assistant output.
 assistant_output_stream = None  # Will hold our output stream for assistant audio
 
-# --- Updated send_audio: unchanged, mic audio is always sent ---
+# --- Updated send_audio: mic audio is always sent ---
 async def send_audio(websocket, shutdown_event):
     """Continuously send recorded audio chunks to the WebSocket."""
     loop = asyncio.get_event_loop()
@@ -225,10 +243,10 @@ async def receive_messages(websocket, shutdown_event):
             elif event_type == "response.audio_transcript.done":
                 print("\n Assistant audio transcript complete.")
             elif event_type in ["response.audio.done", "response.content_part.done"]:
-                # End of assistant audio response: wait briefly to flush the output buffer,
-                # then stop and close the stream if open.
+                # End of assistant audio response: wait briefly to allow any buffered audio to play,
+                # then stop and close the stream.
                 if assistant_output_stream is not None:
-                    # Wait 300ms to allow any remaining audio to be played
+                    # Wait 300ms to allow remaining audio to be played
                     sd.sleep(300)
                     try:
                         assistant_output_stream.stop()
@@ -237,6 +255,10 @@ async def receive_messages(websocket, shutdown_event):
                         print("Assistant audio playback complete.")
                     except Exception as e:
                         print(f"Error finishing assistant audio playback: {e}")
+                    # Flush mic input that might have captured assistant output
+                    flush_audio_queue()
+                    # Temporarily ignore mic input for 0.5 seconds to let the environment settle
+                    disable_mic_temporarily(0.5)
             elif event_type == "response.done":
                 print("\n Assistant response complete.")
                 log_interaction(user_question, assistant_response)
