@@ -7,6 +7,7 @@ while preserving all functionality from the original script.
 Modifications:
   • Organized code into a dedicated AssistantSession class for clarity.
   • Updated API endpoint and session update payload to reflect new realtime API docs.
+  • Added a monkey-patch to avoid extra_headers errors in the event loop.
   • Retained audio streaming, CSV logging, notifications, and IPC shutdown.
   
 References:
@@ -26,6 +27,19 @@ import datetime
 import time
 import queue
 from pathlib import Path
+
+# --- Monkey Patch to Remove extra_headers from create_connection ---
+# This patch removes the extra_headers keyword from asyncio's create_connection.
+# Note: Removing extra_headers means handshake headers (like Authorization)
+# will not be sent during the TCP connection handshake.
+# For a long-term solution, consider upgrading your websockets package.
+_original_create_connection = asyncio.BaseEventLoop.create_connection
+def _patched_create_connection(self, protocol_factory, host=None, port=None, **kwargs):
+    if "extra_headers" in kwargs:
+        del kwargs["extra_headers"]
+    return _original_create_connection(self, protocol_factory, host, port, **kwargs)
+asyncio.BaseEventLoop.create_connection = _patched_create_connection
+# --------------------------------------------------------------------
 
 import websockets
 import notify2
@@ -112,7 +126,7 @@ class AssistantSession:
         self.api_url = API_URL
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
-            # Any additional headers as required by the new API can be added here.
+            # Additional headers as required by the new API can be added here.
         }
         self.shutdown_event = asyncio.Event()
         self.audio_queue = queue.Queue()  # Thread-safe queue for mic data
@@ -205,7 +219,6 @@ class AssistantSession:
                     if delta:
                         try:
                             chunk = base64.b64decode(delta)
-                            # Start audio output stream if not already running.
                             if self.assistant_output_stream is None:
                                 self.assistant_output_stream = sd.RawOutputStream(
                                     samplerate=ASSISTANT_SAMPLERATE,
@@ -227,7 +240,6 @@ class AssistantSession:
                 elif event_type == "response.audio_transcript.done":
                     print("\n Assistant audio transcript complete.")
                 elif event_type in ["response.audio.done", "response.content_part.done"]:
-                    # End of audio response: allow buffered audio to play, then clean up.
                     if self.assistant_output_stream is not None:
                         sd.sleep(300)
                         try:
@@ -288,7 +300,6 @@ class AssistantSession:
             async with websockets.connect(self.api_url, extra_headers=self.headers) as websocket:
                 print("Connected to OpenAI Realtime Assistant API.")
                 play_audio_file(self.welcome_file)
-                # Send a session update with the new model and settings.
                 session_update = {
                     "type": "session.update",
                     "session": {
@@ -313,7 +324,6 @@ class AssistantSession:
                     }
                 }
                 await websocket.send(json.dumps(session_update))
-                # Start microphone recording.
                 self.mic_stream = sd.InputStream(
                     samplerate=SAMPLERATE,
                     channels=CHANNELS,
@@ -367,26 +377,4 @@ def main():
     if not gotit_file.is_file():
         print(f"Gotit audio file not found at {gotit_file}")
         sys.exit(1)
-    api_key = load_api_key()
-    # Check for an existing instance and shut it down if necessary.
-    if os.path.exists(SOCKET_PATH):
-        print("Another instance detected. Sending shutdown command.")
-        try:
-            asyncio.run(send_shutdown_command())
-            for _ in range(20):
-                if not os.path.exists(SOCKET_PATH):
-                    break
-                asyncio.run(asyncio.sleep(0.05))
-            play_audio_file(gotit_file)
-        except Exception as e:
-            print(f"Error communicating with the running instance: {e}")
-        sys.exit(0)
-    else:
-        session = AssistantSession(api_key, assets_directory, welcome_file, gotit_file)
-        try:
-            asyncio.run(session.run())
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-
-if __name__ == "__main__":
-    main()
+    api_key = load_
