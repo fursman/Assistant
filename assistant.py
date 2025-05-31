@@ -48,7 +48,7 @@ SOCKET_PATH = '/tmp/assistant.sock'
 LOG_CSV_PATH = Path.home() / 'assistant_interactions.csv'
 
 # OpenAI Realtime API configuration (updated for 2025)
-API_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+API_URL = "wss://api.openai.com/v1/realtime"
 DEFAULT_MODEL = "gpt-4o-realtime-preview-2024-10-01"
 
 class AssistantState(Enum):
@@ -124,10 +124,6 @@ class AssistantSession:
         self.welcome_file = welcome_file
         self.gotit_file = gotit_file
         self.api_url = API_URL
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1"
-        }
         
         # State management
         self.state = AssistantState.IDLE
@@ -429,14 +425,23 @@ class AssistantSession:
             # Start IPC server
             ipc_server = await self.ipc_server()
             
-            # Connect to OpenAI
+            # Connect to OpenAI with proper header handling
             print("🔗 Connecting to OpenAI Realtime API...")
+            
+            # Use the correct WebSocket URL format with model parameter
+            ws_url = f"{self.api_url}?model={DEFAULT_MODEL}"
+            
+            # Create the websocket connection with authorization headers
             websocket = await websockets.connect(
-                self.api_url, 
-                extra_headers=self.headers,
+                ws_url,
+                additional_headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "OpenAI-Beta": "realtime=v1"
+                },
                 ping_interval=20,
                 ping_timeout=10
             )
+            
             print("✅ Connected to OpenAI Realtime API")
             
             # Play welcome sound
