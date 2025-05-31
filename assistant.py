@@ -12,6 +12,8 @@ Key improvements:
   • More reliable IPC communication for instant shutdown
   • Enhanced error handling and recovery
   • Better notification system integration
+  • Updated API version and model configuration
+  • Fixed threading cleanup issues
 """
 
 import asyncio
@@ -26,6 +28,7 @@ import datetime
 import time
 import queue
 import signal
+import atexit
 from pathlib import Path
 from enum import Enum
 from typing import Optional
@@ -49,7 +52,11 @@ LOG_CSV_PATH = Path.home() / 'assistant_interactions.csv'
 
 # OpenAI Realtime API configuration (updated for 2025)
 API_URL = "wss://api.openai.com/v1/realtime"
-DEFAULT_MODEL = "gpt-4o-realtime-preview-2024-10-01"
+DEFAULT_MODEL = "gpt-4o-realtime-preview"
+API_VERSION = "2025-04-01-preview"
+
+# Global shutdown flag for clean exit
+_shutdown_requested = False
 
 class AssistantState(Enum):
     """Enum to track the current state of the assistant"""
@@ -143,6 +150,9 @@ class AssistantSession:
         
         # Tasks tracking
         self.tasks = []
+        
+        # Session start time to prevent immediate shutdown
+        self.session_start_time = time.time()
 
     def set_state(self, new_state: AssistantState):
         """Thread-safe state management"""
@@ -157,6 +167,11 @@ class AssistantSession:
         
         # Only process audio when in listening state
         if self.state in [AssistantState.LISTENING, AssistantState.IDLE]:
+            # Check audio levels for debugging
+            audio_level = np.abs(indata).mean()
+            if audio_level > 0.01:  # Only log if there's significant audio
+                print(f"🎵 Audio level: {audio_level:.4f}", end='\r')
+            
             try:
                 self.audio_queue.put(indata.copy(), block=False)
             except queue.Full:
@@ -178,6 +193,7 @@ class AssistantSession:
     async def send_audio(self, websocket):
         """Continuously send recorded audio chunks to the websocket."""
         loop = asyncio.get_event_loop()
+        audio_chunks_sent = 0
         try:
             while not self.shutdown_event.is_set():
                 try:
@@ -188,13 +204,20 @@ class AssistantSession:
                     )
                     
                     if self.state in [AssistantState.LISTENING, AssistantState.IDLE]:
-                        audio_bytes = indata.tobytes()
+                        # Convert to bytes with explicit little-endian format
+                        audio_bytes = indata.astype(np.int16).tobytes()
                         b64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+                        
                         event = {
                             "type": "input_audio_buffer.append",
                             "audio": b64_audio,
                         }
                         await websocket.send(json.dumps(event))
+                        
+                        audio_chunks_sent += 1
+                        if audio_chunks_sent % 100 == 0:  # Log every 100 chunks
+                            print(f"📤 Sent {audio_chunks_sent} audio chunks")
+                            
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
@@ -203,6 +226,7 @@ class AssistantSession:
                     break
         except asyncio.CancelledError:
             print("Audio sending task cancelled.")
+            print(f"📊 Total audio chunks sent: {audio_chunks_sent}")
 
     async def receive_messages(self, websocket):
         """Receive and process events from the websocket."""
@@ -360,10 +384,16 @@ class AssistantSession:
                 print(f"📨 Received IPC message: {message}")
                 
                 if message == "shutdown":
-                    print("🛑 Shutdown command received")
-                    self.set_state(AssistantState.SHUTTING_DOWN)
-                    self.shutdown_event.set()
-                    writer.write(b"ack")
+                    # Prevent immediate shutdown - require minimum session time
+                    session_duration = time.time() - self.session_start_time
+                    if session_duration < 2.0:  # Minimum 2 seconds
+                        print(f"⏰ Ignoring shutdown - session too young ({session_duration:.1f}s)")
+                        writer.write(b"ignored")
+                    else:
+                        print("🛑 Shutdown command received")
+                        self.set_state(AssistantState.SHUTTING_DOWN)
+                        self.shutdown_event.set()
+                        writer.write(b"ack")
                     await writer.drain()
             except Exception as e:
                 print(f"Error in IPC server: {e}")
@@ -390,8 +420,8 @@ class AssistantSession:
             if not task.done():
                 task.cancel()
                 try:
-                    await task
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
         
         # Stop audio streams
@@ -428,7 +458,7 @@ class AssistantSession:
             # Connect to OpenAI with proper header handling
             print("🔗 Connecting to OpenAI Realtime API...")
             
-            # Use the correct WebSocket URL format with model parameter
+            # Use the updated WebSocket URL format with correct model and API version
             ws_url = f"{self.api_url}?model={DEFAULT_MODEL}"
             
             # Create the websocket connection with authorization headers
@@ -436,7 +466,7 @@ class AssistantSession:
                 ws_url,
                 additional_headers={
                     "Authorization": f"Bearer {self.api_key}",
-                    "OpenAI-Beta": "realtime=v1"
+                    "OpenAI-Beta": f"realtime={API_VERSION}"
                 },
                 ping_interval=20,
                 ping_timeout=10
@@ -447,7 +477,7 @@ class AssistantSession:
             # Play welcome sound
             play_audio_file(self.welcome_file, volume=0.7)
             
-            # Configure session
+            # Configure session with more sensitive VAD settings
             session_config = {
                 "type": "session.update",
                 "session": {
@@ -460,9 +490,9 @@ class AssistantSession:
                     },
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 800
+                        "threshold": 0.3,  # Lower threshold for more sensitivity
+                        "prefix_padding_ms": 200,  # Reduced padding
+                        "silence_duration_ms": 600  # Shorter silence duration
                     },
                     "instructions": (
                         "You are a helpful, efficient desktop assistant integrated with NixOS and Hyprland. "
@@ -476,16 +506,34 @@ class AssistantSession:
             
             await websocket.send(json.dumps(session_config))
             
-            # Start microphone
-            self.mic_stream = sd.InputStream(
-                samplerate=SAMPLERATE,
-                channels=CHANNELS,
-                dtype='int16',
-                callback=self.audio_callback,
-                blocksize=BLOCKSIZE
-            )
-            self.mic_stream.start()
-            print("🎤 Microphone started")
+            # Start microphone with explicit device selection
+            try:
+                # List available devices for debugging
+                devices = sd.query_devices()
+                default_input = sd.default.device[0] if sd.default.device[0] is not None else 0
+                print(f"🎤 Using input device {default_input}: {devices[default_input]['name']}")
+                
+                self.mic_stream = sd.InputStream(
+                    device=default_input,
+                    samplerate=SAMPLERATE,
+                    channels=CHANNELS,
+                    dtype='int16',
+                    callback=self.audio_callback,
+                    blocksize=BLOCKSIZE
+                )
+                self.mic_stream.start()
+                print("🎤 Microphone started - speak now to test!")
+                
+                # Test microphone levels for a few seconds
+                print("🔊 Testing microphone levels for 3 seconds...")
+                await asyncio.sleep(3)
+                
+            except Exception as e:
+                print(f"❌ Failed to start microphone: {e}")
+                print("Available audio devices:")
+                for i, device in enumerate(sd.query_devices()):
+                    print(f"  {i}: {device['name']} ({'input' if device['max_input_channels'] > 0 else 'output only'})")
+                raise
             
             # Start main processing tasks
             send_task = asyncio.create_task(self.send_audio(websocket))
@@ -517,9 +565,13 @@ async def send_shutdown_command():
         
         # Wait for acknowledgment
         data = await asyncio.wait_for(reader.read(100), timeout=2.0)
-        if data.decode().strip() == "ack":
+        response = data.decode().strip()
+        if response == "ack":
             print("✅ Assistant stopped successfully")
             return True
+        elif response == "ignored":
+            print("ℹ️  Shutdown ignored - assistant session too young")
+            return False
         else:
             print("⚠️  Unexpected response from assistant")
             return False
@@ -541,16 +593,34 @@ async def send_shutdown_command():
 
 def setup_signal_handlers():
     """Set up signal handlers for graceful shutdown."""
+    global _shutdown_requested
+    
     def signal_handler(signum, frame):
-        print(f"\n🛑 Received signal {signum}, shutting down...")
-        sys.exit(0)
+        global _shutdown_requested
+        if not _shutdown_requested:
+            print(f"\n🛑 Received signal {signum}, shutting down...")
+            _shutdown_requested = True
+        else:
+            print(f"\n⚠️  Force exit on second signal {signum}")
+            os._exit(1)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+def cleanup_on_exit():
+    """Clean up resources on exit."""
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.remove(SOCKET_PATH)
+        except:
+            pass
+
 async def main():
     """Main function that handles assistant lifecycle."""
+    global _shutdown_requested
+    
     setup_signal_handlers()
+    atexit.register(cleanup_on_exit)
     
     print("🚀 Starting Voice Assistant for Hyprland/NixOS")
     
