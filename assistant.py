@@ -1,165 +1,269 @@
 #!/usr/bin/env python3
 """
-assistant.py — Hyprland / NixOS real‑time voice client for OpenAI GPT‑4o
------------------------------------------------------------------------
-A lean reference implementation that:
-  • streams microphone audio → OpenAI Realtime API
-  • receives text + audio responses in <300 ms round‑trip
-  • plays assistant audio reply via the system default sink
+Enhanced realtime voice assistant for Hyprland/NixOS integration.
+----------------------------------------------------------------
+Full‑feature edition (IPC, notify2, VAD tuning, CSV logging, key‑ring,
+welcome sounds, etc.) **plus the Realtime‑beta handshake fixes**:
 
-Key points:
-  • Adds **OpenAI‑Beta: realtime=v1** header (mandatory)
-  • Uses current preview **gpt‑4o‑realtime‑preview‑2024‑12‑17**
-  • Sends configuration frame first
-  • Works on `websockets` ≥14 by using **additional_headers**
-  • Minimal dependencies (`websockets`, `sounddevice`, `simpleaudio`)
+* Uses `OpenAI‑Beta: realtime=v1` (mandatory header)
+* Pins model to `gpt‑4o‑realtime‑preview‑2024‑12‑17`
+* Sends the required **configuration** frame first, before `session.update`
+* Switches to `additional_headers=` so it works on `websockets` ≥14
 
-You can layer notifications, VAD tuning, IPC, etc. back on once the
-WebSocket handshake is proven stable.
+Everything else from your original long script is preserved.
 """
 
 import asyncio
-import base64
-import json
 import os
-import signal
-import ssl
+import json
+import base64
 import sys
+import threading
+import getpass
+import csv
+import datetime
+import time
+import queue
+import signal
+import atexit
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Event, Thread
+from enum import Enum
+from typing import Optional
 
-import sounddevice as sd  # microphone + playback
-import websockets  # type: ignore
+# Third‑party libs
+import websockets  # >=14
+import notify2
+import sounddevice as sd
+import numpy as np
+from pydub import AudioSegment
+import keyring
 
-# ------------------- User‑tweakable constants -------------------- #
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-realtime-preview-2024-12-17")
-SAMPLE_RATE = int(os.getenv("ASSISTANT_SAMPLE_RATE", "16000"))
-CHUNK_MS = int(os.getenv("ASSISTANT_CHUNK_MS", "40"))  # 40 ms frames
-ENCODING = "linear_pcm"  # 16‑bit PCM little‑endian
+# ---------- Global configuration ----------------------------------------- #
+PLAYBACK_SPEED = 1.04  # 4 % faster playback to feel snappier
+SAMPLERATE = 16000      # Match OpenAI spec (16 kHz)
+ASSISTANT_SAMPLERATE = 16000
+CHANNELS = 1
+BLOCKSIZE = 1600        # 100 ms @16 kHz mono int16
+SOCKET_PATH = "/tmp/assistant.sock"
+LOG_CSV_PATH = Path.home() / "assistant_interactions.csv"
 
-if not OPENAI_API_KEY:
-    print("❌  OPENAI_API_KEY env‑var not set — aborting", file=sys.stderr)
-    sys.exit(1)
+API_URL = "wss://api.openai.com/v1/realtime"
+DEFAULT_MODEL = "gpt-4o-realtime-preview-2024-12-17"
+API_BETA_VERSION = "v1"          # << key fix
 
-# -------------------------- Audio I/O ---------------------------- #
-audio_q: "Queue[bytes]" = Queue(maxsize=256)
-stop_flag = Event()
+_shutdown_requested = False
 
-def _record() -> None:
-    """Capture microphone audio and push int16 LE frames onto a Queue."""
-    def callback(indata, _frames, _time, status):  # type: ignore[override]
+class AssistantState(Enum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    SPEAKING = "speaking"
+    SHUTTING_DOWN = "shutting_down"
+
+# ----------------------- Helper utilities -------------------------------- #
+
+def load_api_key():
+    api_key = keyring.get_password("NixOSAssistant", "APIKey")
+    if not api_key:
+        api_key = getpass.getpass("Please enter your OpenAI API Key: ").strip()
+        if api_key:
+            keyring.set_password("NixOSAssistant", "APIKey", api_key)
+        else:
+            print("No API Key provided. Exiting.")
+            sys.exit(1)
+    return api_key
+
+def play_audio_file(file_path: Path, volume: float = 1.0):
+    try:
+        audio = AudioSegment.from_file(file_path)
+        if volume != 1.0:
+            audio += 20 * np.log10(volume)
+        samples = np.array(audio.get_array_of_samples()).reshape((-1, audio.channels))
+        sd.play(samples, samplerate=audio.frame_rate)
+        sd.wait()
+    except Exception as e:
+        print(f"Error playing audio file {file_path}: {e}")
+
+def log_interaction(question: str, response: str):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        new_file = not LOG_CSV_PATH.exists()
+        with open(LOG_CSV_PATH, "a", newline="") as f:
+            writer = csv.writer(f)
+            if new_file:
+                writer.writerow(["Timestamp", "Type", "Content"])
+            writer.writerow([now, "Question", question])
+            writer.writerow([now, "Response", response])
+    except Exception as e:
+        print(f"CSV log error: {e}")
+
+def send_notification(title: str, message: str, timeout: int = 5000):
+    try:
+        if not notify2.is_initted():
+            notify2.init("Assistant")
+        n = notify2.Notification(title, message)
+        n.set_timeout(timeout)
+        n.show()
+    except Exception as e:
+        print(f"Notification error: {e}")
+
+# ----------------------- Assistant session -------------------------------- #
+class AssistantSession:
+    def __init__(self, api_key: str, assets_dir: Path, welcome_file: Path, gotit_file: Path):
+        self.api_key = api_key
+        self.assets_dir = assets_dir
+        self.welcome_file = welcome_file
+        self.gotit_file = gotit_file
+        self.api_url = API_URL
+
+        self.state = AssistantState.IDLE
+        self.shutdown_event = asyncio.Event()
+        self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+        self.assistant_output_stream = None
+        self.mic_stream = None
+
+        self.current_response = ""
+        self.current_question = ""
+        self.response_id: Optional[str] = None
+
+        self.tasks = []
+        self.session_start_time = time.time()
+
+    # ------------------- State helpers ----------------------------------- #
+    def set_state(self, new_state: AssistantState):
+        if self.state != new_state:
+            print(f"State transition: {self.state.value} -> {new_state.value}")
+            self.state = new_state
+
+    # ------------------- Audio callback ---------------------------------- #
+    def audio_callback(self, indata, frames, time_info, status):
         if status:
-            print("⚠️  Audio status:", status, file=sys.stderr)
-        if stop_flag.is_set():
-            raise sd.CallbackStop()
-        pcm = (indata * 32767).astype("<i2").tobytes()
+            print(f"Audio status: {status}", file=sys.stderr)
+        if self.state in (AssistantState.LISTENING, AssistantState.IDLE):
+            try:
+                self.audio_queue.put_nowait(indata.copy())
+            except queue.Full:
+                try:
+                    self.audio_queue.get_nowait()
+                    self.audio_queue.put_nowait(indata.copy())
+                except queue.Empty:
+                    pass
+
+    def flush_audio_queue(self):
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    # ------------------- WebSocket helpers ------------------------------- #
+    async def send_audio(self, websocket):
+        loop = asyncio.get_event_loop()
         try:
-            audio_q.put_nowait(pcm)
-        except:
+            while not self.shutdown_event.is_set():
+                try:
+                    indata = await asyncio.wait_for(loop.run_in_executor(None, self.audio_queue.get), 0.1)
+                except asyncio.TimeoutError:
+                    continue
+                if self.state in (AssistantState.LISTENING, AssistantState.IDLE):
+                    b64_audio = base64.b64encode(indata.astype(np.int16).tobytes()).decode()
+                    await websocket.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64_audio}))
+        except asyncio.CancelledError:
             pass
 
-    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE,
-                        blocksize=int(SAMPLE_RATE * CHUNK_MS / 1000),
-                        dtype="float32", callback=callback):
-        stop_flag.wait()
-
-def start_recording() -> Thread:
-    t = Thread(target=_record, daemon=True)
-    t.start()
-    return t
-
-# Playback helper (optional, skip if simpleaudio missing)
-try:
-    import simpleaudio as sa
-except ImportError:
-    sa = None
-
-def play_pcm(pcm: bytes, sample_rate: int = SAMPLE_RATE):
-    if not sa:
-        return
-    wave = sa.WaveObject(pcm, 1, 2, sample_rate)
-    wave.play()
-
-# ----------------------- OpenAI session -------------------------- #
-async def openai_session():
-    url = f"wss://api.openai.com/v1/realtime?model={MODEL}"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
-    }
-    print("🔗 Connecting to", url)
-    ssl_ctx = ssl.create_default_context()
-
-    async with websockets.connect(
-        url,
-        additional_headers=headers,  # NOTE: works on websockets ≥14
-        ssl=ssl_ctx,
-        max_size=None,
-        ping_interval=10,
-        ping_timeout=20,
-    ) as ws:
-        # 1) config frame first
-        await ws.send(json.dumps({
-            "type": "configuration",
-            "audio": {"encoding": ENCODING, "sample_rate": SAMPLE_RATE},
-            "user_id": os.getenv("USER", "nixos"),
-        }))
-        print("✅ Sent configuration header")
-
-        sender = asyncio.create_task(_pump_audio(ws))
-        receiver = asyncio.create_task(_consume(ws))
-        done, pending = await asyncio.wait(
-            [sender, receiver], return_when=asyncio.FIRST_EXCEPTION)
-        for task in pending:
-            task.cancel()
-
-async def _pump_audio(ws):
-    while not stop_flag.is_set():
+    async def receive_messages(self, websocket):
         try:
-            pcm = audio_q.get(timeout=0.2)
-        except Empty:
-            continue
-        await ws.send(json.dumps({
-            "type": "audio",
-            "audio": {
-                "content": base64.b64encode(pcm).decode(),
-                "encoding": ENCODING,
-                "sample_rate": SAMPLE_RATE,
-            },
-        }))
-    await ws.send(json.dumps({"type": "audio", "event": "end_of_stream"}))
+            while not self.shutdown_event.is_set():
+                try:
+                    msg = await asyncio.wait_for(websocket.recv(), 0.1)
+                except asyncio.TimeoutError:
+                    continue
+                except websockets.exceptions.ConnectionClosed:
+                    print("WebSocket closed")
+                    self.shutdown_event.set()
+                    break
+                await self.handle_event(json.loads(msg))
+        except asyncio.CancelledError:
+            pass
 
-async def _consume(ws):
-    async for msg in ws:
-        data = json.loads(msg)
-        if data.get("type") == "audio":
-            pcm = base64.b64decode(data["audio"]["content"])
-            play_pcm(pcm, data["audio"].get("sample_rate", SAMPLE_RATE))
-        elif data.get("type") == "transcript":
-            print("👤", data.get("text", ""))
-        elif data.get("type") == "assistant_response":
-            print("🤖", data.get("text", ""))
-        elif data.get("type") == "error":
-            print("❌", data)
+    # ------------------- Event dispatcher -------------------------------- #
+    async def handle_event(self, event):
+        etype = event.get("type", "")
+        if etype == "session.created":
+            self.set_state(AssistantState.LISTENING)
+        elif etype == "input_audio_buffer.speech_started":
+            self.set_state(AssistantState.PROCESSING)
+        elif etype == "conversation.item.input_audio_transcription.completed":
+            t = event.get("transcript", "").strip()
+            if t:
+                self.current_question = t
+                print(f"\n👤 You: {t}")
+                send_notification("You said", t)
+        elif etype == "response.created":
+            self.response_id = event.get("response", {}).get("id")
+            self.current_response = ""
+            print("🤖 Thinking …")
+        elif etype == "response.audio_transcript.delta":
+            delta = event.get("delta", "")
+            self.current_response += delta
+            print(delta, end="", flush=True)
+        elif etype == "response.audio.delta":
+            await self.handle_audio_delta(event)
+        elif etype == "response.audio.done":
+            await self.finish_audio_playback()
+        elif etype == "response.done":
+            await self.handle_response_complete()
+        elif etype == "error":
+            print("❌ API error:", event.get("error"))
 
-# -------------------------- Main -------------------------------- #
-async def main():
-    print("🚀 Starting Voice Assistant for Hyprland/NixOS")
-    start_recording()
+    async def handle_audio_delta(self, event):
+        delta = event.get("delta", "")
+        if not delta:
+            return
+        chunk = base64.b64decode(delta)
+        if self.assistant_output_stream is None:
+            self.set_state(AssistantState.SPEAKING)
+            self.assistant_output_stream = sd.RawOutputStream(
+                samplerate=ASSISTANT_SAMPLERATE, channels=1, dtype="int16", blocksize=BLOCKSIZE)
+            self.assistant_output_stream.start()
+            self.flush_audio_queue()
+        self.assistant_output_stream.write(chunk)
 
-    task = asyncio.create_task(openai_session())
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_flag.set)
+    async def finish_audio_playback(self):
+        if self.assistant_output_stream:
+            await asyncio.sleep(0.2)
+            self.assistant_output_stream.stop()
+            self.assistant_output_stream.close()
+            self.assistant_output_stream = None
+            self.set_state(AssistantState.LISTENING)
+            self.flush_audio_queue()
 
-    await task
-    print("🏁 Assistant session ended")
+    async def handle_response_complete(self):
+        print("\n✓ Response complete")
+        if self.current_question and self.current_response:
+            log_interaction(self.current_question, self.current_response)
+            send_notification("Assistant", self.current_response[:120])
+        self.current_question = self.current_response = ""
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        stop_flag.set()
-        print("👋 Bye!")
+    # ------------------- IPC server -------------------------------------- #
+    async def ipc_server(self):
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)
+        async def handle(reader, writer):
+            data = (await reader.read(100)).decode().strip()
+            if data == "shutdown":
+                self.shutdown_event.set()
+                writer.write(b"ack")
+                await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        return await asyncio.start_unix_server(handle, path=SOCKET_PATH)
+
+    # ------------------- Cleanup ----------------------------------------- #
+    async def cleanup(self):
+        print("🧹 Cleaning up …")
+        for t in self.tasks:
+            t.cancel()
+        if self.assistant_output_stream:
+            try:
+                self.assistant_output_stream.abort(); self.assistant_output
