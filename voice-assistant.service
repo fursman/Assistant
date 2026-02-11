@@ -1,0 +1,32 @@
+[Unit]
+Description=Hyprland Voice Assistant
+Documentation=https://github.com/user/voice-assistant
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voice-assistant
+Restart=on-failure
+RestartSec=5
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=%h/voice-assistant/.venv/lib/python3.13/site-packages"
+Environment="WAYLAND_DISPLAY=wayland-1"
+WorkingDirectory=%h/voice-assistant
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice-assistant
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/voice-assistant
+ReadWritePaths=%h/.cache
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=default.target

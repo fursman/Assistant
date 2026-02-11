@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-assistant"
+version = "1.0.0"
+description = "Hyprland Voice Assistant with VAD, STT, LLM, and TTS"
+authors = [{name = "User", email = "user@localhost"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Desktop Environment",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "pyaudio>=0.2.11",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0", 
+    "faster-whisper>=0.9.0",
+    "anthropic>=0.8.0",
+    "onnxruntime-gpu>=1.16.0",
+    "silero-vad>=4.0.1",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/user/voice-assistant"
+"Bug Reports" = "https://github.com/user/voice-assistant/issues"
+"Source" = "https://github.com/user/voice-assistant"
+
+[project.scripts]
+voice-assistant = "voice_assistant:main"
+
+[tool.setuptools]
+py-modules = ["voice_assistant"]
