@@ -67,15 +67,11 @@ systemctl --user start voice-assistant.service
 ## Architecture
 
 ```
-┌──────────┐    ┌───────────┐    ┌──────────┐    ┌─────────┐    ┌───────────┐
-│ Silero   │───▶│  Faster   │───▶│ OpenClaw │───▶│ Kokoro  │───▶│ PipeWire  │
-│ VAD      │    │  Whisper  │    │ Gateway  │    │ TTS     │    │ Speaker   │
-│ (detect) │    │ (transcr) │    │ (LLM)   │    │ (speak) │    │ (output)  │
-└──────────┘    └───────────┘    └──────────┘    └─────────┘    └───────────┘
-     ▲                                                               │
-     │              PipeWire Microphone Input                        │
-     └──────────────────────────────────────────────────────────────┘
+Mic ──▶ Silero VAD ──▶ Faster Whisper ──▶ OpenClaw Gateway ──▶ Kokoro TTS ──▶ Speaker
+         (detect)        (transcribe)        (LLM agent)        (speak)
 ```
+
+**Pipeline:** PipeWire captures audio → VAD detects speech → Whisper transcribes on GPU → OpenClaw routes to your AI agent → Kokoro speaks the response → PipeWire plays it back.
 
 ## Models
 
