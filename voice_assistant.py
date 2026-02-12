@@ -421,7 +421,7 @@ class VoiceAssistant:
         subprocess.run(['espeak', '-s', '150', '-v', 'en+f3', text], 
                       capture_output=True, check=False)
     
-    def record_until_silence(self, max_duration=15, silence_timeout=1.5, pre_audio=None):
+    def record_until_silence(self, max_duration=15, silence_timeout=2.0, pre_audio=None):
         """Record audio until silence is detected after speech, or max duration."""
         frames = []
         stream = None
