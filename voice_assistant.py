@@ -31,6 +31,7 @@ class VoiceAssistant:
         self.is_listening = False
         self.is_processing = False
         self._abort_event = threading.Event()
+        self._tts_process: Optional[subprocess.Popen] = None
         
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
@@ -232,20 +233,33 @@ class VoiceAssistant:
         status_file.write_text(json.dumps({"text": symbol, "class": state}))
     
     def abort_inflight(self):
-        """Abort any in-flight OpenClaw request — both client-side and server-side."""
+        """Abort any in-flight OpenClaw request and kill TTS playback immediately."""
         self._abort_event.set()
-        # Send /stop to the session to kill server-side tool execution
-        try:
-            self.openai.chat.completions.create(
-                model="openclaw:main",
-                max_tokens=32,
-                messages=[{"role": "user", "content": "/stop"}],
-                extra_headers={"x-openclaw-agent-id": "main"},
-                user="voice-assistant",
-            )
-            self.logger.info("Sent /stop to abort server-side processing")
-        except Exception as e:
-            self.logger.warning(f"Failed to send /stop: {e}")
+
+        # Kill TTS playback immediately
+        if self._tts_process and self._tts_process.poll() is None:
+            self._tts_process.kill()
+            self.logger.info("Killed TTS playback")
+
+        # Also kill any lingering pw-play processes we spawned
+        subprocess.run(['pkill', '-f', 'pw-play.*tts_output'], capture_output=True, check=False)
+
+        # Send /stop to the session to kill server-side processing
+        def send_stop():
+            try:
+                self.openai.chat.completions.create(
+                    model="openclaw:main",
+                    max_tokens=32,
+                    messages=[{"role": "user", "content": "/stop"}],
+                    extra_headers={"x-openclaw-agent-id": "main"},
+                    user="voice-assistant",
+                )
+                self.logger.info("Sent /stop to abort server-side processing")
+            except Exception as e:
+                self.logger.warning(f"Failed to send /stop: {e}")
+
+        # Send /stop in background so toggle feels instant
+        threading.Thread(target=send_stop, daemon=True).start()
         self.logger.info("Signalled abort for in-flight request")
 
     def toggle_handler(self, signum, frame):
@@ -379,15 +393,23 @@ class VoiceAssistant:
             return "Sorry, I couldn't process that request."
     
     def speak_text(self, text):
-        """Convert text to speech and play it."""
+        """Convert text to speech and play it. Respects abort signal."""
+        if self._abort_event.is_set():
+            return
         if self.tts_available and self.kokoro:
             try:
                 self.logger.info(f"Speaking with Kokoro: {text[:50]}...")
                 import soundfile as sf
                 samples, sample_rate = self.kokoro.create(text, voice="af_heart", speed=1.0)
+                if self._abort_event.is_set():
+                    return
                 tmp_path = self.chimes_dir / "tts_output.wav"
                 sf.write(str(tmp_path), samples, sample_rate)
-                subprocess.run(['pw-play', str(tmp_path)], capture_output=True, check=False)
+                self._tts_process = subprocess.Popen(['pw-play', str(tmp_path)],
+                                                      stdout=subprocess.DEVNULL,
+                                                      stderr=subprocess.DEVNULL)
+                self._tts_process.wait()
+                self._tts_process = None
             except Exception as e:
                 self.logger.error(f"Kokoro TTS failed: {e}, falling back to espeak")
                 self.speak_with_espeak(text)

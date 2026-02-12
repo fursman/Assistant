@@ -53,4 +53,5 @@ local.conf
 # Sensitive
 .env
 *.key
-api_keys.txt
+api_keys.txtkokoro-v1.0.onnx
+voices-v1.0.bin
