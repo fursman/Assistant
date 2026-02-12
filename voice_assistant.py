@@ -219,9 +219,9 @@ class VoiceAssistant:
             subprocess.run(['pw-play', str(chime_path)], 
                          capture_output=True, check=False)
     
-    def notify(self, message):
+    def notify(self, message, title='Voice Assistant'):
         """Send desktop notification."""
-        subprocess.run(['notify-send', 'Voice Assistant', message], 
+        subprocess.run(['notify-send', title, message], 
                       capture_output=True, check=False)
     
     def set_waybar_status(self, state):
@@ -628,7 +628,7 @@ class VoiceAssistant:
             self.play_chime("processing")
             
             self.logger.info(f"Transcription: {transcription}")
-            self.notify(f"💭 {transcription}")
+            self.notify(f"💭 {transcription}", title="You Said")
             
             # Query Claude
             response = self.query_claude(transcription)
@@ -638,7 +638,7 @@ class VoiceAssistant:
                 return
             
             self.logger.info(f"Response: {response}")
-            self.notify(f"🧙 {response}")
+            self.notify(f"🧙 {response}", title="Assistant")
             
             # Speak response (only if still active)
             if self.is_active:
