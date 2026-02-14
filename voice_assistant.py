@@ -101,8 +101,7 @@ class VoiceAssistant:
         # Start WebSocket thinking listener
         self._start_thinking_listener()
 
-        # Enable reasoning stream for voice session so thinking events are emitted
-        self._set_reasoning_mode()
+        # Note: reasoning mode is set via WS in _thinking_ws_connect()
 
         # Initialize waybar status
         self._set_waybar_status("off")
@@ -274,26 +273,6 @@ class VoiceAssistant:
         )
 
     # ------------------------------------------------------------------
-    # Reasoning mode
-    # ------------------------------------------------------------------
-
-    def _set_reasoning_mode(self):
-        """Send /reasoning stream to enable thinking event emission for voice queries."""
-        def do_set():
-            try:
-                self.openai.chat.completions.create(
-                    model=LLM_MODEL,
-                    max_tokens=64,
-                    messages=[{"role": "user", "content": "/reasoning stream"}],
-                    extra_headers={"x-openclaw-agent-id": "main"},
-                    user="voice-assistant",
-                )
-                self.logger.info("Reasoning mode set to 'stream' for voice session")
-            except Exception as e:
-                self.logger.warning(f"Failed to set reasoning mode: {e}")
-        threading.Thread(target=do_set, daemon=True).start()
-
-    # ------------------------------------------------------------------
     # WebSocket thinking listener
     # ------------------------------------------------------------------
 
@@ -346,7 +325,7 @@ class VoiceAssistant:
                 },
                 "caps": [],
                 "auth": {"token": token},
-                "scopes": ["agent"],
+                "scopes": ["agent", "operator.admin"],
             },
         }
         ws.send(json.dumps(handshake))
@@ -367,6 +346,26 @@ class VoiceAssistant:
             self.logger.warning(f"Thinking WS handshake failed: {resp}")
             ws.close()
             return
+
+        # Set reasoning level to "stream" on the voice assistant session
+        ws.send(json.dumps({
+            "type": "req",
+            "id": "set-reasoning",
+            "method": "sessions.patch",
+            "params": {
+                "key": "agent:main:openai-user:voice-assistant",
+                "reasoningLevel": "stream",
+            },
+        }))
+        # Read messages until we get our response (skip interleaved events)
+        for _ in range(20):
+            msg = json.loads(ws.recv())
+            if msg.get("type") == "res" and msg.get("id") == "set-reasoning":
+                if msg.get("ok"):
+                    self.logger.info("Reasoning level set to 'stream' via WS")
+                else:
+                    self.logger.warning(f"Failed to set reasoning: {msg.get('error')}")
+                break
 
         # Listen for events
         self._thinking_ws = ws
@@ -677,6 +676,7 @@ class VoiceAssistant:
                 if prev_path and prev_path.exists():
                     prev_path.unlink(missing_ok=True)
 
+                self.logger.info(f"Playing TTS chunk: {path.name}")
                 self._tts_process = subprocess.Popen(
                     ["pw-play", str(path)],
                     stdout=subprocess.DEVNULL,
@@ -714,22 +714,26 @@ class VoiceAssistant:
                 if delta and delta.content:
                     pending += delta.content
 
-                    # Check if we have a complete sentence
-                    if re.search(r"[.!?]\s*$", pending):
-                        sentence = pending.strip()
-                        pending = ""
-                        full_response_parts.append(sentence)
-
-                        self.logger.info(f"Sentence complete: {sentence[:60]}...")
-
-                        # Queue for TTS
-                        if self.tts_available and self.kokoro:
-                            sentence_queue.put(sentence)
+                    # Split completed sentences from pending text
+                    while True:
+                        match = re.search(r"[.!?](?:\s|$)", pending)
+                        if not match:
+                            break
+                        # Split at end of sentence
+                        split_pos = match.end()
+                        sentence = pending[:split_pos].strip()
+                        pending = pending[split_pos:]
+                        if sentence:
+                            full_response_parts.append(sentence)
+                            self.logger.info(f"Sentence complete: {sentence[:60]}...")
+                            if self.tts_available and self.kokoro:
+                                sentence_queue.put(sentence)
 
             # Flush remaining text
             if pending.strip():
                 sentence = pending.strip()
                 full_response_parts.append(sentence)
+                self.logger.info(f"Final fragment: {sentence[:60]}...")
                 if self.tts_available and self.kokoro:
                     sentence_queue.put(sentence)
 
