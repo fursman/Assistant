@@ -47,11 +47,11 @@ show_status() {
         echo -e "Process: ${RED}NOT RUNNING${NC}"
     fi
     
-    # API key status
-    if [[ -n "$ANTHROPIC_API_KEY" ]]; then
-        echo -e "API Key: ${GREEN}SET${NC}"
+    # Gateway token status
+    if [[ -n "$OPENCLAW_GATEWAY_TOKEN" ]]; then
+        echo -e "Gateway Token: ${GREEN}SET${NC}"
     else
-        echo -e "API Key: ${RED}NOT SET${NC}"
+        echo -e "Gateway Token: ${YELLOW}NOT SET (loaded from service env)${NC}"
     fi
     
     # Log file
