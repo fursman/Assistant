@@ -363,12 +363,14 @@ class VoiceAssistant:
             return ""
     
     def query_claude(self, text):
-        """Send query to Clawbook via OpenClaw gateway. Abortable on deactivation."""
+        """Send query to Clawbook via OpenClaw gateway with streaming.
+        Shows intermediate chunks as desktop notifications; returns final text for TTS."""
         self._abort_event.clear()
         try:
-            response = self.openai.chat.completions.create(
+            stream = self.openai.chat.completions.create(
                 model="openclaw:main",
                 max_tokens=1024,
+                stream=True,
                 messages=[
                     {
                         "role": "user",
@@ -380,10 +382,37 @@ class VoiceAssistant:
                 },
                 user="voice-assistant",
             )
+            
+            full_response = ""
+            last_notified = ""
+            notify_interval = 0.8  # seconds between notification updates
+            last_notify_time = 0
+            
+            for chunk in stream:
+                if self._abort_event.is_set():
+                    self.logger.info("Streaming aborted due to deactivation")
+                    return None
+                
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    full_response += delta.content
+                    
+                    # Throttled notifications so you can watch the response build
+                    now = time.time()
+                    if now - last_notify_time >= notify_interval and full_response != last_notified:
+                        # Show current accumulated text (truncated for readability)
+                        preview = full_response[-200:] if len(full_response) > 200 else full_response
+                        if len(full_response) > 200:
+                            preview = "..." + preview
+                        self.notify(f"💭 {preview}", title="Thinking...")
+                        last_notified = full_response
+                        last_notify_time = now
+            
             if self._abort_event.is_set():
                 self.logger.info("Request completed but assistant was deactivated — discarding response")
                 return None
-            return response.choices[0].message.content
+            
+            return full_response.strip() if full_response else "Sorry, I got an empty response."
         
         except Exception as e:
             if self._abort_event.is_set():
@@ -392,24 +421,94 @@ class VoiceAssistant:
             self.logger.error(f"OpenClaw API error: {e}")
             return "Sorry, I couldn't process that request."
     
+    def _split_into_sentences(self, text):
+        """Split text into speakable chunks (sentences)."""
+        import re
+        # Split on sentence-ending punctuation, keeping the punctuation
+        parts = re.split(r'(?<=[.!?])\s+', text)
+        # Merge very short fragments with the next chunk
+        chunks = []
+        buf = ""
+        for part in parts:
+            buf = (buf + " " + part).strip() if buf else part
+            if len(buf) >= 40:  # minimum chunk size to avoid tiny fragments
+                chunks.append(buf)
+                buf = ""
+        if buf:
+            if chunks:
+                chunks[-1] = chunks[-1] + " " + buf
+            else:
+                chunks.append(buf)
+        return chunks
+
     def speak_text(self, text):
-        """Convert text to speech and play it. Respects abort signal."""
+        """Convert text to speech and play it with streaming — synthesize and play sentence by sentence,
+        pipelining so the next sentence generates while the current one plays. Respects abort signal."""
         if self._abort_event.is_set():
             return
         if self.tts_available and self.kokoro:
             try:
-                self.logger.info(f"Speaking with Kokoro: {text[:50]}...")
                 import soundfile as sf
-                samples, sample_rate = self.kokoro.create(text, voice="af_heart", speed=1.0)
-                if self._abort_event.is_set():
-                    return
-                tmp_path = self.chimes_dir / "tts_output.wav"
-                sf.write(str(tmp_path), samples, sample_rate)
-                self._tts_process = subprocess.Popen(['pw-play', str(tmp_path)],
-                                                      stdout=subprocess.DEVNULL,
-                                                      stderr=subprocess.DEVNULL)
-                self._tts_process.wait()
+                sentences = self._split_into_sentences(text)
+                self.logger.info(f"Speaking {len(sentences)} chunks with Kokoro (pipelined)")
+
+                # Pipeline: generate chunk N+1 while chunk N plays
+                from concurrent.futures import ThreadPoolExecutor, Future
+
+                def generate_chunk(sentence, idx):
+                    """Generate a single TTS chunk, return (path, sample_rate)."""
+                    samples, sr = self.kokoro.create(sentence, voice="af_heart", speed=1.0)
+                    path = self.chimes_dir / f"tts_chunk_{idx}.wav"
+                    sf.write(str(path), samples, sr)
+                    return path
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    # Kick off first chunk generation
+                    next_future = pool.submit(generate_chunk, sentences[0], 0)
+                    prev_path = None
+
+                    for i in range(len(sentences)):
+                        if self._abort_event.is_set():
+                            next_future.cancel()
+                            return
+
+                        # Wait for current chunk to be ready
+                        chunk_path = next_future.result()
+
+                        if self._abort_event.is_set():
+                            return
+
+                        # Start generating NEXT chunk before we play this one
+                        if i + 1 < len(sentences):
+                            next_future = pool.submit(generate_chunk, sentences[i + 1], i + 1)
+
+                        # Wait for previous playback to finish
+                        if self._tts_process and self._tts_process.poll() is None:
+                            self._tts_process.wait()
+
+                        if self._abort_event.is_set():
+                            return
+
+                        # Clean up previous file
+                        if prev_path and prev_path.exists():
+                            prev_path.unlink(missing_ok=True)
+
+                        # Play current chunk
+                        self.logger.info(f"Playing chunk {i+1}/{len(sentences)}")
+                        self._tts_process = subprocess.Popen(
+                            ['pw-play', str(chunk_path)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        prev_path = chunk_path
+
+                # Wait for last chunk
+                if self._tts_process and self._tts_process.poll() is None:
+                    self._tts_process.wait()
                 self._tts_process = None
+                if prev_path and prev_path.exists():
+                    prev_path.unlink(missing_ok=True)
+
             except Exception as e:
                 self.logger.error(f"Kokoro TTS failed: {e}, falling back to espeak")
                 self.speak_with_espeak(text)
@@ -638,7 +737,7 @@ class VoiceAssistant:
                 return
             
             self.logger.info(f"Response: {response}")
-            self.notify(f"🧙 {response}", title="Assistant")
+            self.notify(f"🧙 {response[:300]}", title="Speaking")
             
             # Speak response (only if still active)
             if self.is_active:
