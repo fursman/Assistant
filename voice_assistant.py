@@ -53,9 +53,6 @@ class VoiceAssistant:
         self.setup_models()
         self.generate_chimes()
         
-        # Start persistent thinking listener (WebSocket to gateway)
-        self._thinking_proc, self._thinking_file = self._start_thinking_listener()
-        
         # Signal handler
         signal.signal(signal.SIGUSR1, self.toggle_handler)
         
@@ -365,180 +362,10 @@ class VoiceAssistant:
             self.logger.error(f"Transcription error: {e}")
             return ""
     
-    def _start_thinking_listener(self):
-        """Start a background process that connects to the gateway WebSocket
-        and writes thinking events to a named pipe. Returns (process, pipe_path) or (None, None)."""
-        import json as _json
-        
-        pipe_path = self.state_dir / "thinking_pipe"
-        
-        # Create a small Node.js script that connects using OpenClaw's protocol
-        # and streams thinking events as JSON lines
-        script = self.state_dir / "thinking_listener.mjs"
-        script.write_text('''
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const { WebSocket } = require("/home/user/.npm-global/lib/node_modules/openclaw/node_modules/ws/index.js");
-import { randomUUID } from "crypto";
-import { appendFileSync, writeFileSync } from "fs";
-
-const token = process.env.OPENCLAW_GATEWAY_TOKEN || "";
-const port = 18789;
-const outPath = process.argv[2];
-
-// Clear file
-writeFileSync(outPath, "");
-
-const ws = new WebSocket(`ws://127.0.0.1:${port}/`);
-
-ws.on("open", () => {
-    // Send connect handshake
-    ws.send(JSON.stringify({
-        type: "req",
-        id: randomUUID(),
-        method: "connect",
-        params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-                id: "gateway-client",
-                displayName: "Voice Thinking Listener",
-                version: "1.0.0",
-                platform: "linux",
-                mode: "backend"
-            },
-            scopes: ["chat"],
-            auth: { token }
-        }
-    }));
-});
-
-let lastThinking = "";
-
-ws.on("message", (data) => {
-    try {
-        const msg = JSON.parse(data.toString());
-        // Chat delta events contain message.content with thinking blocks
-        if (msg.type === "event" && msg.event === "chat") {
-            const payload = msg.payload || {};
-            if (payload.state !== "delta") return;
-            const content = payload.message?.content;
-            if (!Array.isArray(content)) return;
-            // Extract thinking blocks from message content
-            const thinkingParts = [];
-            for (const block of content) {
-                if (block && block.type === "thinking" && typeof block.thinking === "string") {
-                    thinkingParts.push(block.thinking);
-                }
-            }
-            const thinkingText = thinkingParts.join("\\n").trim();
-            if (thinkingText && thinkingText !== lastThinking) {
-                const delta = thinkingText.startsWith(lastThinking) 
-                    ? thinkingText.slice(lastThinking.length) 
-                    : thinkingText;
-                lastThinking = thinkingText;
-                appendFileSync(outPath, JSON.stringify({ text: thinkingText, delta }) + "\\n");
-            }
-        }
-        // Reset on final/error so next turn starts fresh
-        if (msg.type === "event" && msg.event === "chat") {
-            const state = msg.payload?.state;
-            if (state === "final" || state === "error" || state === "aborted") {
-                lastThinking = "";
-            }
-        }
-    } catch {}
-});
-
-ws.on("error", () => {});
-ws.on("close", () => process.exit(0));
-
-// Stay alive
-setInterval(() => {}, 60000);
-
-// Clean exit
-process.on("SIGTERM", () => { ws.close(); process.exit(0); });
-''')
-        
-        thinking_file = self.state_dir / "thinking_events.jsonl"
-        thinking_file.write_text("")
-        
-        try:
-            proc = subprocess.Popen(
-                ['node', str(script), str(thinking_file)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env={**os.environ}
-            )
-            # Give it a moment to connect
-            time.sleep(0.5)
-            if proc.poll() is not None:
-                self.logger.warning("Thinking listener process exited immediately")
-                return None, None
-            self.logger.info("Thinking listener connected to gateway WebSocket")
-            return proc, thinking_file
-        except Exception as e:
-            self.logger.warning(f"Failed to start thinking listener: {e}")
-            return None, None
-    
-    def _poll_thinking_notifications(self, thinking_file, stop_event):
-        """Poll the thinking events file and send notifications. Runs in a thread."""
-        import json as _json
-        
-        last_notify_time = 0
-        file_pos = 0
-        
-        while not stop_event.is_set():
-            try:
-                with open(thinking_file, 'r') as f:
-                    f.seek(file_pos)
-                    new_lines = f.readlines()
-                    file_pos = f.tell()
-                
-                for line in new_lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = _json.loads(line)
-                        text = evt.get("text", "")
-                        if text:
-                            now = time.time()
-                            if now - last_notify_time >= 1.0:
-                                last_notify_time = now
-                                preview = text[-300:] if len(text) > 300 else text
-                                if len(text) > 300:
-                                    preview = "..." + preview
-                                self.notify(f"🧠 {preview}", title="Thinking...")
-                    except _json.JSONDecodeError:
-                        pass
-            except FileNotFoundError:
-                pass
-            
-            stop_event.wait(0.2)
-    
     def query_claude(self, text):
         """Send query to Clawbook via OpenClaw gateway with streaming.
-        Thinking tokens → desktop notifications. Final reply text → returned for TTS."""
+        Shows streamed text as notifications while generating; returns final text for TTS."""
         self._abort_event.clear()
-        
-        # Start thinking notification poller
-        stop_thinking = threading.Event()
-        thinking_file = self.state_dir / "thinking_events.jsonl"
-        
-        # Clear any stale thinking events
-        try:
-            thinking_file.write_text("")
-        except Exception:
-            pass
-        
-        thinking_thread = threading.Thread(
-            target=self._poll_thinking_notifications,
-            args=(thinking_file, stop_thinking),
-            daemon=True
-        )
-        thinking_thread.start()
-        
         try:
             stream = self.openai.chat.completions.create(
                 model="openclaw:main",
@@ -557,6 +384,7 @@ process.on("SIGTERM", () => { ws.close(); process.exit(0); });
             )
             
             full_response = ""
+            last_notify_time = 0
             
             for chunk in stream:
                 if self._abort_event.is_set():
@@ -566,6 +394,15 @@ process.on("SIGTERM", () => { ws.close(); process.exit(0); });
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta and delta.content:
                     full_response += delta.content
+                    
+                    # Show streaming text as notification (throttled)
+                    now = time.time()
+                    if now - last_notify_time >= 1.0:
+                        last_notify_time = now
+                        preview = full_response[-300:] if len(full_response) > 300 else full_response
+                        if len(full_response) > 300:
+                            preview = "..." + preview
+                        self.notify(f"💭 {preview}", title="Thinking...")
             
             if self._abort_event.is_set():
                 self.logger.info("Request completed but assistant was deactivated — discarding response")
@@ -579,8 +416,6 @@ process.on("SIGTERM", () => { ws.close(); process.exit(0); });
                 return None
             self.logger.error(f"OpenClaw API error: {e}")
             return "Sorry, I couldn't process that request."
-        finally:
-            stop_thinking.set()
     
     def _split_into_sentences(self, text):
         """Split text into speakable chunks (sentences)."""
@@ -914,11 +749,6 @@ process.on("SIGTERM", () => { ws.close(); process.exit(0); });
     
     def cleanup(self):
         """Cleanup resources."""
-        # Kill thinking listener
-        if hasattr(self, '_thinking_proc') and self._thinking_proc and self._thinking_proc.poll() is None:
-            self._thinking_proc.terminate()
-            self._thinking_proc.wait(timeout=3)
-        
         if hasattr(self, 'audio'):
             self.audio.terminate()
         
