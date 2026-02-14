@@ -63,25 +63,8 @@ class VoiceAssistant:
         with open(self.pid_file, 'w') as f:
             f.write(str(os.getpid()))
         
-        # Enable reasoning stream mode for the voice session
-        self._configure_voice_session()
-        
         # Initialize waybar status
         self.set_waybar_status("off")
-    
-    def _configure_voice_session(self):
-        """Send /reasoning stream to the voice session so thinking events are emitted live."""
-        try:
-            self.openai.chat.completions.create(
-                model="openclaw:main",
-                max_tokens=64,
-                messages=[{"role": "user", "content": "/reasoning stream"}],
-                extra_headers={"x-openclaw-agent-id": "main"},
-                user="voice-assistant",
-            )
-            self.logger.info("Voice session configured: reasoning=stream")
-        except Exception as e:
-            self.logger.warning(f"Failed to configure voice session reasoning mode: {e}")
     
     def setup_logging(self):
         """Setup logging configuration."""
@@ -424,23 +407,44 @@ ws.on("open", () => {
                 platform: "linux",
                 mode: "backend"
             },
-            scopes: ["agent"],
+            scopes: ["chat"],
             auth: { token }
         }
     }));
 });
 
+let lastThinking = "";
+
 ws.on("message", (data) => {
     try {
         const msg = JSON.parse(data.toString());
-        if (msg.type === "event" && msg.event === "agent") {
+        // Chat delta events contain message.content with thinking blocks
+        if (msg.type === "event" && msg.event === "chat") {
             const payload = msg.payload || {};
-            if (payload.stream === "thinking") {
-                const text = payload.data?.text || "";
-                const delta = payload.data?.delta || "";
-                if (delta) {
-                    appendFileSync(outPath, JSON.stringify({ text, delta }) + "\\n");
+            if (payload.state !== "delta") return;
+            const content = payload.message?.content;
+            if (!Array.isArray(content)) return;
+            // Extract thinking blocks from message content
+            const thinkingParts = [];
+            for (const block of content) {
+                if (block && block.type === "thinking" && typeof block.thinking === "string") {
+                    thinkingParts.push(block.thinking);
                 }
+            }
+            const thinkingText = thinkingParts.join("\\n").trim();
+            if (thinkingText && thinkingText !== lastThinking) {
+                const delta = thinkingText.startsWith(lastThinking) 
+                    ? thinkingText.slice(lastThinking.length) 
+                    : thinkingText;
+                lastThinking = thinkingText;
+                appendFileSync(outPath, JSON.stringify({ text: thinkingText, delta }) + "\\n");
+            }
+        }
+        // Reset on final/error so next turn starts fresh
+        if (msg.type === "event" && msg.event === "chat") {
+            const state = msg.payload?.state;
+            if (state === "final" || state === "error" || state === "aborted") {
+                lastThinking = "";
             }
         }
     } catch {}
