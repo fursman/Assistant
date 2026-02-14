@@ -27,6 +27,7 @@ import numpy as np
 import pyaudio
 import soundfile as sf
 import torch
+import websocket
 from faster_whisper import WhisperModel
 from openai import OpenAI
 from silero_vad import load_silero_vad, get_speech_timestamps
@@ -96,6 +97,12 @@ class VoiceAssistant:
 
         # Write PID file
         self.pid_file.write_text(str(os.getpid()))
+
+        # Start WebSocket thinking listener
+        self._start_thinking_listener()
+
+        # Enable reasoning stream for voice session so thinking events are emitted
+        self._set_reasoning_mode()
 
         # Initialize waybar status
         self._set_waybar_status("off")
@@ -265,6 +272,169 @@ class VoiceAssistant:
             ["notify-send", "", "", "-r", str(replace_id), "-t", "1"],
             capture_output=True, check=False,
         )
+
+    # ------------------------------------------------------------------
+    # Reasoning mode
+    # ------------------------------------------------------------------
+
+    def _set_reasoning_mode(self):
+        """Send /reasoning stream to enable thinking event emission for voice queries."""
+        def do_set():
+            try:
+                self.openai.chat.completions.create(
+                    model=LLM_MODEL,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": "/reasoning stream"}],
+                    extra_headers={"x-openclaw-agent-id": "main"},
+                    user="voice-assistant",
+                )
+                self.logger.info("Reasoning mode set to 'stream' for voice session")
+            except Exception as e:
+                self.logger.warning(f"Failed to set reasoning mode: {e}")
+        threading.Thread(target=do_set, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # WebSocket thinking listener
+    # ------------------------------------------------------------------
+
+    def _start_thinking_listener(self):
+        """Connect to OpenClaw gateway WebSocket to receive thinking events in real-time."""
+        self._thinking_ws = None
+        self._thinking_text = ""  # accumulated thinking for current run
+        self._thinking_run_id = None
+        thread = threading.Thread(target=self._thinking_listener_loop, daemon=True)
+        thread.start()
+        self.logger.info("Thinking listener thread started")
+
+    def _thinking_listener_loop(self):
+        """Persistent WebSocket connection with auto-reconnect."""
+        token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+        while True:
+            try:
+                self._thinking_ws_connect(token)
+            except Exception as e:
+                self.logger.warning(f"Thinking WS error: {e}")
+            time.sleep(3)  # reconnect backoff
+
+    def _thinking_ws_connect(self, token):
+        """Connect and listen for thinking events."""
+        ws = websocket.WebSocket()
+        ws.connect("ws://127.0.0.1:18789")
+        self.logger.info("Thinking WS connected")
+
+        # Wait for connect.challenge
+        raw = ws.recv()
+        challenge = json.loads(raw)
+        if challenge.get("event") != "connect.challenge":
+            self.logger.warning(f"Expected connect.challenge, got: {challenge}")
+            ws.close()
+            return
+
+        # Send handshake (after challenge)
+        handshake = {
+            "type": "req",
+            "id": "1",
+            "method": "connect",
+            "params": {
+                "minProtocol": 3,
+                "maxProtocol": 3,
+                "client": {
+                    "id": "gateway-client",
+                    "version": "voice-assistant",
+                    "platform": "linux",
+                    "mode": "backend",
+                },
+                "caps": [],
+                "auth": {"token": token},
+                "scopes": ["agent"],
+            },
+        }
+        ws.send(json.dumps(handshake))
+
+        # Read handshake response
+        try:
+            raw_resp = ws.recv()
+        except websocket.WebSocketConnectionClosedException as e:
+            self.logger.warning(f"Thinking WS closed during handshake: {e}")
+            return
+        if not raw_resp:
+            self.logger.warning("Thinking WS: empty handshake response")
+            return
+        resp = json.loads(raw_resp)
+        if resp.get("type") == "res" and resp.get("ok"):
+            self.logger.info("Thinking WS handshake OK")
+        else:
+            self.logger.warning(f"Thinking WS handshake failed: {resp}")
+            ws.close()
+            return
+
+        # Listen for events
+        self._thinking_ws = ws
+        ws.settimeout(60)  # heartbeat interval
+        while True:
+            try:
+                raw = ws.recv()
+                if not raw:
+                    break
+                msg = json.loads(raw)
+                self._handle_ws_message(msg)
+            except websocket.WebSocketTimeoutException:
+                # Send keepalive ping
+                try:
+                    ws.ping()
+                except Exception:
+                    break
+            except Exception as e:
+                self.logger.warning(f"Thinking WS recv error: {e}")
+                break
+
+        ws.close()
+        self._thinking_ws = None
+        self.logger.info("Thinking WS disconnected")
+
+    def _handle_ws_message(self, msg):
+        """Process incoming WebSocket messages, looking for thinking events."""
+        if msg.get("type") != "event" or msg.get("event") != "agent":
+            return
+
+        payload = msg.get("payload", {})
+        stream_type = payload.get("stream")
+        data = payload.get("data", {})
+        run_id = payload.get("runId")
+
+        if stream_type == "thinking":
+            # New run resets accumulated thinking
+            if run_id != self._thinking_run_id:
+                self._thinking_run_id = run_id
+                self._thinking_text = ""
+
+            delta = data.get("delta", "")
+            if delta:
+                self._thinking_text += delta
+
+                # Fire notification when a sentence completes
+                if re.search(r"[.!?]\s*$", self._thinking_text):
+                    sentence = self._thinking_text.strip()
+                    self._thinking_text = ""
+                    self._notify(
+                        f"🧠 {sentence}\n",
+                        title="Thinking...",
+                        timeout_ms=8000,
+                    )
+                    self.logger.info(f"Thinking sentence: {sentence[:60]}...")
+
+        elif stream_type == "lifecycle":
+            phase = data.get("phase")
+            if phase in ("end", "error"):
+                # Flush any remaining thinking text
+                if self._thinking_text.strip():
+                    self._notify(
+                        f"🧠 {self._thinking_text.strip()}\n",
+                        title="Thinking...",
+                        timeout_ms=8000,
+                    )
+                self._thinking_text = ""
+                self._thinking_run_id = None
 
     # ------------------------------------------------------------------
     # Waybar
@@ -447,7 +617,8 @@ class VoiceAssistant:
           2. TTS generation ← sentence_queue → audio_queue  (worker thread)
           3. Audio playback ← audio_queue  (worker thread)
 
-        Returns the full response text, or None if aborted.
+        Returns (full_response_text, tts_thread, play_thread) or (None, None, None) if aborted.
+        The caller should post notifications and then join the threads.
         """
         sentence_queue: queue.Queue[Optional[str]] = queue.Queue()
         audio_queue: queue.Queue[Optional[Path]] = queue.Queue()
@@ -537,7 +708,7 @@ class VoiceAssistant:
                 if self._abort_event.is_set():
                     self.logger.info("Streaming aborted")
                     sentence_queue.put(None)
-                    return None
+                    return None, None, None
 
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta and delta.content:
@@ -549,13 +720,7 @@ class VoiceAssistant:
                         pending = ""
                         full_response_parts.append(sentence)
 
-                        # Thinking notification
-                        self._notify(
-                            f"💭 {sentence}\n",
-                            title="Thinking...",
-                            replace_id=NOTIFY_ID_THINKING,
-                            timeout_ms=8000,
-                        )
+                        self.logger.info(f"Sentence complete: {sentence[:60]}...")
 
                         # Queue for TTS
                         if self.tts_available and self.kokoro:
@@ -565,12 +730,6 @@ class VoiceAssistant:
             if pending.strip():
                 sentence = pending.strip()
                 full_response_parts.append(sentence)
-                self._notify(
-                    f"💭 {sentence}\n",
-                    title="Thinking...",
-                    replace_id=NOTIFY_ID_THINKING,
-                    timeout_ms=8000,
-                )
                 if self.tts_available and self.kokoro:
                     sentence_queue.put(sentence)
 
@@ -578,27 +737,22 @@ class VoiceAssistant:
             if self._abort_event.is_set():
                 self.logger.info("Request aborted")
                 sentence_queue.put(None)
-                return None
+                return None, None, None
             self.logger.error(f"OpenClaw API error: {e}")
             sentence_queue.put(None)
-            return "Sorry, I couldn't process that request."
+            return "Sorry, I couldn't process that request.", tts_thread, play_thread
 
         # Signal end of sentences
         sentence_queue.put(None)
 
         if self._abort_event.is_set():
-            return None
+            return None, None, None
 
         full_response = " ".join(full_response_parts).strip()
         if not full_response:
-            return "Sorry, I got an empty response."
+            return "Sorry, I got an empty response.", tts_thread, play_thread
 
-        # Wait for TTS to finish
-        if self.tts_available and self.kokoro:
-            tts_thread.join()
-            play_thread.join()
-
-        return full_response
+        return full_response, tts_thread, play_thread
 
     def _speak_espeak(self, text):
         subprocess.run(
@@ -708,7 +862,7 @@ class VoiceAssistant:
             )
 
             # Stream LLM response and speak concurrently
-            response = await loop.run_in_executor(
+            response, tts_thread, play_thread = await loop.run_in_executor(
                 None, self._stream_and_speak, transcription
             )
 
@@ -716,19 +870,20 @@ class VoiceAssistant:
                 return
 
             self.logger.info(f"Response: {response}")
-            # Final "Speaking" notification replaces thinking
+            # Show full reply notification immediately (TTS may still be playing)
             self._notify(
                 f"🧙 {response}\n",
                 title="Clawbook",
-                replace_id=NOTIFY_ID_THINKING,
                 timeout_ms=10000,
             )
 
-            # espeak fallback if Kokoro unavailable
-            if not self.tts_available:
-                if self.is_active:
-                    self._set_waybar_status("speaking")
-                    await loop.run_in_executor(None, self._speak_espeak, response)
+            # Wait for TTS playback to finish
+            if tts_thread and play_thread:
+                await loop.run_in_executor(None, tts_thread.join)
+                await loop.run_in_executor(None, play_thread.join)
+            elif not self.tts_available and self.is_active:
+                self._set_waybar_status("speaking")
+                await loop.run_in_executor(None, self._speak_espeak, response)
 
         except Exception as e:
             self.logger.error(f"Processing error: {e}")
