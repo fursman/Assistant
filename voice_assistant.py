@@ -63,8 +63,25 @@ class VoiceAssistant:
         with open(self.pid_file, 'w') as f:
             f.write(str(os.getpid()))
         
+        # Enable reasoning stream mode for the voice session
+        self._configure_voice_session()
+        
         # Initialize waybar status
         self.set_waybar_status("off")
+    
+    def _configure_voice_session(self):
+        """Send /reasoning stream to the voice session so thinking events are emitted live."""
+        try:
+            self.openai.chat.completions.create(
+                model="openclaw:main",
+                max_tokens=64,
+                messages=[{"role": "user", "content": "/reasoning stream"}],
+                extra_headers={"x-openclaw-agent-id": "main"},
+                user="voice-assistant",
+            )
+            self.logger.info("Voice session configured: reasoning=stream")
+        except Exception as e:
+            self.logger.warning(f"Failed to configure voice session reasoning mode: {e}")
     
     def setup_logging(self):
         """Setup logging configuration."""
