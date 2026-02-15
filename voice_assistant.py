@@ -107,6 +107,7 @@ class VoiceAssistant:
         self._assistant_text = ""        # cumulative text from data.text
         self._assistant_spoken_pos = 0   # cursor: how much we've already queued for TTS
         self._run_done_event = threading.Event()
+        self._last_notify: dict[int, str] = {}  # replace_id → last content sent
 
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
@@ -258,6 +259,12 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _notify(self, message, title="Voice Assistant", replace_id=None, timeout_ms=None):
+        # Skip if content hasn't changed (prevents swaync re-animation pulse)
+        if replace_id is not None:
+            key = f"{title}\0{message}"
+            if self._last_notify.get(replace_id) == key:
+                return
+            self._last_notify[replace_id] = key
         cmd = ["notify-send", title, message]
         if replace_id is not None:
             cmd.extend(["-r", str(replace_id)])
@@ -486,6 +493,7 @@ class VoiceAssistant:
         self._assistant_text = ""
         self._assistant_spoken_pos = 0
         self._run_done_event.clear()
+        self._last_notify.clear()
 
         # Clean up any leftover TTS files from a previous run
         for f in self.tts_dir.glob("tts_*.wav"):
