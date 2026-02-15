@@ -435,7 +435,7 @@ class VoiceAssistant:
                         replace_id=NOTIFY_ID_STREAMING,
                         timeout_ms=15000,
                     )
-                self._flush_sentences(final=False)
+                # Don't flush to TTS during streaming — wait for final
 
         elif stream == "lifecycle":
             phase = data.get("phase")
@@ -455,6 +455,7 @@ class VoiceAssistant:
                     )
                     self._thinking_text = ""
 
+                # Now flush ALL text to TTS at once
                 self._flush_sentences(final=True)
 
                 if self._sentence_queue:
