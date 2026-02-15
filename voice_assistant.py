@@ -292,7 +292,7 @@ class VoiceAssistant:
                 "minProtocol": 3,
                 "maxProtocol": 3,
                 "client": {
-                    "id": "voice-assistant",
+                    "id": "gateway-client",
                     "version": "2.0",
                     "platform": "linux",
                     "mode": "backend",
@@ -384,10 +384,11 @@ class VoiceAssistant:
             return
 
         if stream == "thinking":
+            # Thinking events from gateway (future-proofing — currently not
+            # emitted for chat.send runs, but may be enabled in future versions)
             delta = data.get("delta", "")
             if delta:
                 self._thinking_text += delta
-                # Show thinking as a rolling notification (replace same ID)
                 while True:
                     match = re.search(r"[.!?\n](?:\s|$)", self._thinking_text)
                     if not match:
@@ -402,7 +403,7 @@ class VoiceAssistant:
                             replace_id=NOTIFY_ID_THINKING,
                             timeout_ms=8000,
                         )
-                        self.logger.info(f"Thinking: {sentence[:80]}...")
+                        self.logger.info(f"Thinking (stream): {sentence[:80]}...")
 
         elif stream == "assistant":
             # data.text is the cumulative full text so far
@@ -421,24 +422,69 @@ class VoiceAssistant:
                 if phase == "error":
                     self.logger.warning(f"Agent run error: {data.get('error', 'unknown')}")
 
-                # Flush remaining thinking
-                if self._thinking_text.strip():
-                    self._notify(
-                        f"🧠 {self._thinking_text.strip()}",
-                        title="Thinking...",
-                        replace_id=NOTIFY_ID_THINKING,
-                        timeout_ms=8000,
-                    )
-                    self._thinking_text = ""
-
                 # Flush any remaining assistant text as a final sentence
                 self._flush_sentences(final=True)
+
+                # Fetch thinking from the session transcript
+                self._fetch_and_show_thinking()
 
                 # Signal end of TTS sentences
                 if self._sentence_queue:
                     self._sentence_queue.put(None)
 
                 self._run_done_event.set()
+
+    def _fetch_and_show_thinking(self):
+        """Read thinking from the session transcript file after a run completes."""
+        try:
+            # Read session file path from sessions.json
+            import pathlib
+            sessions_path = pathlib.Path.home() / ".openclaw/agents/main/sessions/sessions.json"
+            if not sessions_path.exists():
+                return
+            with open(sessions_path) as f:
+                sessions = json.load(f)
+            entry = sessions.get(GATEWAY_SESSION_KEY, {})
+            session_file = entry.get("sessionFile")
+            if not session_file or not pathlib.Path(session_file).exists():
+                return
+
+            # Read last few lines looking for the most recent assistant message with thinking
+            with open(session_file) as f:
+                lines = f.readlines()
+
+            # Search backwards for the last assistant message
+            for line in reversed(lines[-10:]):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    m = msg.get("message", msg)
+                    if m.get("role") != "assistant":
+                        continue
+                    content = m.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    thinking_parts = []
+                    for block in content:
+                        if block.get("type") == "thinking" and block.get("thinking"):
+                            thinking_parts.append(block["thinking"])
+                    if thinking_parts:
+                        thinking = " ".join(thinking_parts).strip()
+                        self.logger.info(f"Thinking ({len(thinking)} chars): {thinking[:100]}...")
+                        # Show as notification
+                        self._notify(
+                            f"🧠 {thinking}",
+                            title="Thinking",
+                            replace_id=NOTIFY_ID_THINKING,
+                            timeout_ms=12000,
+                        )
+                    break
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch thinking: {e}")
 
     def _flush_sentences(self, final=False):
         """Extract complete sentences from _assistant_text beyond _assistant_spoken_pos."""
