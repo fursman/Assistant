@@ -277,7 +277,7 @@ class VoiceAssistant:
     def _notify(self, message, title="Voice Assistant", timeout_ms=None, silent=False):
         cmd = ["notify-send", title, message]
         if silent:
-            cmd.extend(["-h", "string:suppress-popup:true"])
+            cmd.extend(["-h", "string:suppress-popup:true", "-u", "low"])
         if timeout_ms is not None:
             cmd.extend(["-t", str(timeout_ms)])
         subprocess.run(cmd, capture_output=True, check=False)
@@ -449,7 +449,6 @@ class VoiceAssistant:
                                     f"🧠 {to_send}",
                                     title="Thinking...",
                                     silent=True,
-                                    timeout_ms=0,
                                 )
 
         elif stream == "tool":
@@ -476,7 +475,7 @@ class VoiceAssistant:
                         f"🔧 {label}",
                         title="Working...",
                         silent=True,
-                        timeout_ms=0,
+                        
                     )
 
         elif stream == "assistant":
@@ -507,7 +506,7 @@ class VoiceAssistant:
                             f"🧠 {remaining}",
                             title="Thinking...",
                             silent=True,
-                            timeout_ms=0,
+                            
                         )
 
                 # Skip silent/empty replies (NO_REPLY token or fragments)
@@ -524,7 +523,6 @@ class VoiceAssistant:
                         self._notify(
                             f"🧙 {preview}",
                             title="Clawbook",
-                            timeout_ms=15000,
                         )
 
                 # Now flush ALL text to TTS at once
