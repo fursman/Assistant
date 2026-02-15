@@ -467,15 +467,34 @@ class VoiceAssistant:
                     "memory_search": "Searching memory",
                 }
                 label = labels.get(tool_name, f"Using {tool_name}")
+                args = data.get("args", {})
+                detail = ""
+                if tool_name == "exec":
+                    cmd = args.get("command", "")
+                    if cmd:
+                        # Show first line, truncated
+                        first_line = cmd.split("\n")[0].strip()
+                        detail = f"\n{first_line[:120]}"
+                elif tool_name in ("Read", "Edit", "Write"):
+                    path = args.get("file_path", "") or args.get("path", "")
+                    if path:
+                        detail = f"\n{path}"
+                elif tool_name == "web_search":
+                    query = args.get("query", "")
+                    if query:
+                        detail = f"\n{query}"
+                elif tool_name == "web_fetch":
+                    url = args.get("url", "")
+                    if url:
+                        detail = f"\n{url[:120]}"
                 now = time.time()
                 last_tool = self._last_tool_notify
                 if now - last_tool >= 2.0:
                     self._last_tool_notify = now
                     self._notify(
-                        f"🔧 {label}",
+                        f"🔧 {label}{detail}",
                         title="Working...",
                         silent=True,
-                        
                     )
 
         elif stream == "assistant":
