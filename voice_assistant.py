@@ -320,7 +320,7 @@ class VoiceAssistant:
             "method": "sessions.patch",
             "params": {
                 "key": GATEWAY_SESSION_KEY,
-                "thinkingLevel": "low",
+                "thinkingLevel": "high",
                 "reasoningLevel": "stream",
             },
         }))
