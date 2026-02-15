@@ -53,13 +53,11 @@ WHISPER_COMPUTE = "float16"
 
 TTS_VOICE = "af_heart"
 TTS_SPEED = 1.0
-TTS_MIN_CHUNK_LEN = 40
 
 GATEWAY_URL = "ws://127.0.0.1:18789"
 GATEWAY_SESSION_KEY = "agent:main:openai-user:voice-assistant"
 
 NOTIFY_ID_LISTENING = 59001
-NOTIFY_ID_THINKING = 59002
 
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
@@ -77,8 +75,7 @@ class VoiceAssistant:
         self._ws_lock = threading.Lock()
         self._ws_connected = threading.Event()
         self._ws_req_id = 0
-        self._pending_responses: dict[str, threading.Event] = {}
-        self._response_data: dict[str, dict] = {}
+        self._ws_req_lock = threading.Lock()
 
         # Per-run state for streaming
         self._active_run_id: Optional[str] = None
@@ -277,25 +274,9 @@ class VoiceAssistant:
             time.sleep(3)
 
     def _next_req_id(self):
-        self._ws_req_id += 1
-        return str(self._ws_req_id)
-
-    def _ws_send_request(self, method, params, req_id=None):
-        """Send a WS request and return the response (blocking)."""
-        if req_id is None:
-            req_id = self._next_req_id()
-        event = threading.Event()
-        self._pending_responses[req_id] = event
-        with self._ws_lock:
-            self._ws.send(json.dumps({
-                "type": "req",
-                "id": req_id,
-                "method": method,
-                "params": params,
-            }))
-        # Wait for response (up to 10s)
-        event.wait(timeout=10)
-        return self._response_data.pop(req_id, None)
+        with self._ws_req_lock:
+            self._ws_req_id += 1
+            return str(self._ws_req_id)
 
     def _ws_connect(self, token):
         ws = websocket.WebSocket()
@@ -370,6 +351,11 @@ class VoiceAssistant:
 
         ws.close()
         self._ws = None
+        # Signal any waiting run so it doesn't hang
+        if self._active_run_id:
+            if self._sentence_queue:
+                self._sentence_queue.put(None)
+            self._run_done_event.set()
         self.logger.info("WS disconnected")
 
     def _handle_ws_message(self, msg):
@@ -383,11 +369,10 @@ class VoiceAssistant:
                     self.logger.info("Reasoning level set to 'stream' via WS")
                 else:
                     self.logger.warning(f"Failed to set reasoning: {msg.get('error')}")
-                return
-            if req_id in self._pending_responses:
-                self._response_data[req_id] = msg
-                self._pending_responses.pop(req_id).set()
-                return
+            elif req_id and req_id.startswith("voice-"):
+                status = msg.get("payload", {}).get("status", "")
+                self.logger.info(f"Query {req_id}: {status}")
+            return
 
         # Handle agent events
         if msg_type == "event" and msg.get("event") == "agent":
@@ -543,6 +528,12 @@ class VoiceAssistant:
             play_thread.start()
 
         # Send query via WS
+        if not self._ws_connected.is_set() or not self._ws:
+            self.logger.error("WS not connected, cannot send query")
+            self._sentence_queue = None
+            sentence_q.put(None)
+            return "Sorry, I'm not connected to the gateway."
+
         try:
             with self._ws_lock:
                 self._ws.send(json.dumps({
@@ -577,6 +568,12 @@ class VoiceAssistant:
             return None
 
         full_response = " ".join(self._run_response_parts).strip()
+        if not full_response:
+            full_response = "Sorry, I got an empty response."
+
+        # Show reply notification now (TTS may still be playing)
+        self.logger.info(f"Response: {full_response}")
+        self._notify(f"🧙 {full_response}\n", title="Clawbook", timeout_ms=10000)
 
         # Wait for TTS to finish
         if tts_thread:
@@ -584,7 +581,7 @@ class VoiceAssistant:
         if play_thread:
             play_thread.join()
 
-        return full_response if full_response else "Sorry, I got an empty response."
+        return full_response
 
     # ------------------------------------------------------------------
     # Abort / Toggle
@@ -791,9 +788,6 @@ class VoiceAssistant:
 
             if response is None:
                 return
-
-            self.logger.info(f"Response: {response}")
-            self._notify(f"🧙 {response}\n", title="Clawbook", timeout_ms=10000)
 
             # espeak fallback
             if not self.tts_available and self.is_active:
