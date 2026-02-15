@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
 Hyprland Voice Assistant
-A voice-activated assistant for Hyprland with VAD, STT, LLM, and TTS.
 
 Pipeline: VAD → Whisper STT → OpenClaw LLM (streaming via WS) → Kokoro TTS (streaming) → PipeWire playback
 
-All communication with the OpenClaw gateway uses the native WebSocket protocol.
-Thinking events stream as 🧠 notifications; response sentences stream to TTS.
+Thinking events stream as 🧠 notifications; response sentences stream to TTS as they arrive.
 """
 
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import re
@@ -63,6 +62,31 @@ NOTIFY_ID_THINKING = 59002
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
 
+# Regex to strip markdown formatting before TTS
+_MD_STRIP = re.compile(
+    r"\*\*(.+?)\*\*"   # **bold**
+    r"|\*(.+?)\*"      # *italic*
+    r"|__(.+?)__"      # __bold__
+    r"|_(.+?)_"        # _italic_
+    r"|`([^`]+)`"      # `code`
+    r"|```[\s\S]*?```" # code blocks
+    r"|\[([^\]]+)\]\([^)]+\)"  # [text](url)
+    r"|^#{1,6}\s+"     # headings
+    r"|^[-*]\s+"       # list bullets
+    r"|^>\s+"          # blockquotes
+    , re.MULTILINE
+)
+
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown so TTS reads cleanly."""
+    def _pick(m):
+        # Return first non-None captured group (the inner text)
+        for g in m.groups():
+            if g is not None:
+                return g
+        return ""
+    return _MD_STRIP.sub(_pick, text).strip()
+
 
 class VoiceAssistant:
     def __init__(self):
@@ -80,8 +104,8 @@ class VoiceAssistant:
         self._active_req_id: Optional[str] = None
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
-        self._assistant_text = ""  # cumulative full text from data.text
-        self._assistant_spoken_pos = 0  # how much of _assistant_text we've already queued
+        self._assistant_text = ""        # cumulative text from data.text
+        self._assistant_spoken_pos = 0   # cursor: how much we've already queued for TTS
         self._run_done_event = threading.Event()
 
         # Paths
@@ -91,6 +115,8 @@ class VoiceAssistant:
         self.pid_file = self.state_dir / "voice-assistant.pid"
         self.chimes_dir = self.state_dir / "chimes"
         self.chimes_dir.mkdir(exist_ok=True)
+        self.tts_dir = self.state_dir / "tts"
+        self.tts_dir.mkdir(exist_ok=True)
 
         # Initialize components
         self._setup_logging()
@@ -103,7 +129,6 @@ class VoiceAssistant:
 
         # Start WebSocket connection
         self._start_ws()
-
         self._set_waybar_status("off")
 
     # ------------------------------------------------------------------
@@ -111,13 +136,13 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _setup_logging(self):
+        handler = logging.handlers.RotatingFileHandler(
+            self.log_file, maxBytes=2 * 1024 * 1024, backupCount=2,
+        )
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[
-                logging.FileHandler(self.log_file),
-                logging.StreamHandler(),
-            ],
+            handlers=[handler, logging.StreamHandler()],
         )
         self.logger = logging.getLogger(__name__)
         self.logger.info("Voice Assistant starting...")
@@ -143,7 +168,6 @@ class VoiceAssistant:
 
             self._setup_tts()
             self._warmup()
-
         except Exception as e:
             self.logger.error(f"Error loading models: {e}")
             sys.exit(1)
@@ -198,7 +222,6 @@ class VoiceAssistant:
             "deactivate": ([659.25, 523.25, 440], False),
         }
         if all((self.chimes_dir / f"{n}.wav").exists() for n in chimes):
-            self.logger.info("Chimes already cached")
             return
         for name, (freqs, fade) in chimes.items():
             data = self._create_chime(freqs, fade)
@@ -231,7 +254,7 @@ class VoiceAssistant:
         threading.Thread(target=self._play_chime, args=(name,), daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Notifications (swaync)
+    # Notifications
     # ------------------------------------------------------------------
 
     def _notify(self, message, title="Voice Assistant", replace_id=None, timeout_ms=None):
@@ -256,8 +279,7 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _start_ws(self):
-        thread = threading.Thread(target=self._ws_loop, daemon=True)
-        thread.start()
+        threading.Thread(target=self._ws_loop, daemon=True).start()
         self._ws_connected.wait(timeout=10)
 
     def _ws_loop(self):
@@ -276,14 +298,12 @@ class VoiceAssistant:
         ws.connect(GATEWAY_URL)
         self.logger.info("WS connected")
 
-        # Wait for challenge
         challenge = json.loads(ws.recv())
         if challenge.get("event") != "connect.challenge":
             self.logger.warning(f"Expected connect.challenge, got: {challenge.get('event')}")
             ws.close()
             return
 
-        # Handshake
         ws.send(json.dumps({
             "type": "req",
             "id": "connect",
@@ -313,7 +333,7 @@ class VoiceAssistant:
         self._ws = ws
         self._ws_connected.set()
 
-        # Configure the voice-assistant session: enable thinking + stream reasoning
+        # Configure voice-assistant session: thinking + reasoning stream
         ws.send(json.dumps({
             "type": "req",
             "id": "patch-session",
@@ -332,8 +352,7 @@ class VoiceAssistant:
                 raw = ws.recv()
                 if not raw:
                     break
-                msg = json.loads(raw)
-                self._handle_ws_message(msg)
+                self._handle_ws_message(json.loads(raw))
             except websocket.WebSocketTimeoutException:
                 try:
                     ws.ping()
@@ -354,41 +373,33 @@ class VoiceAssistant:
     def _handle_ws_message(self, msg):
         msg_type = msg.get("type")
 
-        # Handle RPC responses
         if msg_type == "res":
             req_id = msg.get("id")
             if req_id == "patch-session":
                 if msg.get("ok"):
-                    self.logger.info("Session patch OK (thinking + reasoning configured)")
+                    self.logger.info("Session configured (thinking=high, reasoning=stream)")
                 else:
                     self.logger.warning(f"Session patch failed: {msg.get('error')}")
-            elif req_id and req_id.startswith("voice-"):
-                payload = msg.get("payload", {})
-                self.logger.info(f"chat.send response for {req_id}: status={payload.get('status')}")
             return
 
-        # Handle agent events — filter by sessionKey
         if msg_type == "event" and msg.get("event") == "agent":
             payload = msg.get("payload", {})
-            session_key = payload.get("sessionKey", "")
-            if session_key != GATEWAY_SESSION_KEY:
-                return  # Ignore events from other sessions
+            if payload.get("sessionKey") != GATEWAY_SESSION_KEY:
+                return
             self._handle_agent_event(payload)
 
     def _handle_agent_event(self, payload):
         stream = payload.get("stream")
         data = payload.get("data", {})
 
-        # Only process events while we have an active query
         if not self._active_req_id:
             return
 
         if stream == "thinking":
-            # Thinking events from gateway (future-proofing — currently not
-            # emitted for chat.send runs, but may be enabled in future versions)
             delta = data.get("delta", "")
             if delta:
                 self._thinking_text += delta
+                # Show each complete sentence as a notification (replaces previous)
                 while True:
                     match = re.search(r"[.!?\n](?:\s|$)", self._thinking_text)
                     if not match:
@@ -403,15 +414,12 @@ class VoiceAssistant:
                             replace_id=NOTIFY_ID_THINKING,
                             timeout_ms=8000,
                         )
-                        self.logger.info(f"Thinking (stream): {sentence[:80]}...")
+                        self.logger.info(f"Thinking: {sentence[:80]}...")
 
         elif stream == "assistant":
-            # data.text is the cumulative full text so far
-            # data.delta is just the new piece
             text = data.get("text", "")
             if text:
                 self._assistant_text = text
-                # Extract new complete sentences beyond what we've already queued
                 self._flush_sentences(final=False)
 
         elif stream == "lifecycle":
@@ -422,80 +430,29 @@ class VoiceAssistant:
                 if phase == "error":
                     self.logger.warning(f"Agent run error: {data.get('error', 'unknown')}")
 
-                # Flush any remaining assistant text as a final sentence
+                # Flush remaining thinking as final notification
+                if self._thinking_text.strip():
+                    self._notify(
+                        f"🧠 {self._thinking_text.strip()}",
+                        title="Thinking...",
+                        replace_id=NOTIFY_ID_THINKING,
+                        timeout_ms=8000,
+                    )
+                    self._thinking_text = ""
+
+                # Flush remaining assistant text
                 self._flush_sentences(final=True)
 
-                # Fetch thinking from the session transcript
-                self._fetch_and_show_thinking()
-
-                # Signal end of TTS sentences
                 if self._sentence_queue:
                     self._sentence_queue.put(None)
-
                 self._run_done_event.set()
-
-    def _fetch_and_show_thinking(self):
-        """Read thinking from the session transcript file after a run completes."""
-        try:
-            # Read session file path from sessions.json
-            import pathlib
-            sessions_path = pathlib.Path.home() / ".openclaw/agents/main/sessions/sessions.json"
-            if not sessions_path.exists():
-                return
-            with open(sessions_path) as f:
-                sessions = json.load(f)
-            entry = sessions.get(GATEWAY_SESSION_KEY, {})
-            session_file = entry.get("sessionFile")
-            if not session_file or not pathlib.Path(session_file).exists():
-                return
-
-            # Read last few lines looking for the most recent assistant message with thinking
-            with open(session_file) as f:
-                lines = f.readlines()
-
-            # Search backwards for the last assistant message
-            for line in reversed(lines[-10:]):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                    m = msg.get("message", msg)
-                    if m.get("role") != "assistant":
-                        continue
-                    content = m.get("content", [])
-                    if not isinstance(content, list):
-                        continue
-                    thinking_parts = []
-                    for block in content:
-                        if block.get("type") == "thinking" and block.get("thinking"):
-                            thinking_parts.append(block["thinking"])
-                    if thinking_parts:
-                        thinking = " ".join(thinking_parts).strip()
-                        self.logger.info(f"Thinking ({len(thinking)} chars): {thinking[:100]}...")
-                        # Show as notification
-                        self._notify(
-                            f"🧠 {thinking}",
-                            title="Thinking",
-                            replace_id=NOTIFY_ID_THINKING,
-                            timeout_ms=12000,
-                        )
-                    break
-                except json.JSONDecodeError:
-                    continue
-        except Exception as e:
-            self.logger.warning(f"Failed to fetch thinking: {e}")
 
     def _flush_sentences(self, final=False):
         """Extract complete sentences from _assistant_text beyond _assistant_spoken_pos."""
-        text = self._assistant_text
-        pos = self._assistant_spoken_pos
-
-        remaining = text[pos:]
+        remaining = self._assistant_text[self._assistant_spoken_pos:]
         if not remaining:
             return
 
-        # Find complete sentences (end with . ! ? followed by space or end)
         while True:
             match = re.search(r"[.!?](?:\s|$)", remaining)
             if not match:
@@ -503,28 +460,24 @@ class VoiceAssistant:
             end = match.end()
             sentence = remaining[:end].strip()
             remaining = remaining[end:]
-            pos += end
+            self._assistant_spoken_pos += end
             if sentence and self._sentence_queue:
-                self._sentence_queue.put(sentence)
+                self._sentence_queue.put(_strip_markdown(sentence))
                 self.logger.info(f"→ TTS: {sentence[:80]}...")
 
         if final and remaining.strip():
-            # Queue whatever's left
             sentence = remaining.strip()
-            pos += len(remaining)
+            self._assistant_spoken_pos += len(remaining)
             if sentence and self._sentence_queue:
-                self._sentence_queue.put(sentence)
+                self._sentence_queue.put(_strip_markdown(sentence))
                 self.logger.info(f"→ TTS (final): {sentence[:80]}...")
-
-        self._assistant_spoken_pos = pos
 
     # ------------------------------------------------------------------
     # Query via WebSocket
     # ------------------------------------------------------------------
 
     def _query_and_speak(self, text):
-        """Send query via WS, stream thinking as notifications, stream response to TTS.
-        Returns full response text or None if aborted."""
+        """Send query via WS, stream thinking as notifications, stream response to TTS."""
         req_id = f"voice-{uuid.uuid4().hex[:12]}"
 
         # Reset per-run state
@@ -534,7 +487,11 @@ class VoiceAssistant:
         self._assistant_spoken_pos = 0
         self._run_done_event.clear()
 
-        # Set up TTS pipeline
+        # Clean up any leftover TTS files from a previous run
+        for f in self.tts_dir.glob("tts_*.wav"):
+            f.unlink(missing_ok=True)
+
+        # Set up streaming TTS pipeline: sentences → synthesis → playback
         sentence_q: queue.Queue[Optional[str]] = queue.Queue()
         audio_q: queue.Queue[Optional[Path]] = queue.Queue()
         self._sentence_queue = sentence_q
@@ -548,14 +505,14 @@ class VoiceAssistant:
                     return
                 try:
                     samples, sr = self.kokoro.create(sentence, voice=TTS_VOICE, speed=TTS_SPEED)
-                    path = self.chimes_dir / f"tts_chunk_{idx}.wav"
+                    path = self.tts_dir / f"tts_{idx}.wav"
                     sf.write(str(path), samples, sr)
                     audio_q.put(path)
                     idx += 1
                 except Exception as e:
-                    self.logger.error(f"TTS error: {e}")
-                    audio_q.put(None)
-                    return
+                    self.logger.error(f"TTS error on sentence: {e}")
+                    # Skip this sentence, keep going
+                    continue
 
         def playback_worker():
             first = True
@@ -565,7 +522,6 @@ class VoiceAssistant:
                     return
                 path = audio_q.get()
                 if path is None:
-                    # Wait for last playback to finish
                     if self._tts_process and self._tts_process.poll() is None:
                         self._tts_process.wait()
                     self._tts_process = None
@@ -575,15 +531,12 @@ class VoiceAssistant:
                 if first:
                     self._set_waybar_status("speaking")
                     first = False
-                # Wait for previous playback to finish
                 if self._tts_process and self._tts_process.poll() is None:
                     self._tts_process.wait()
                 if self._abort_event.is_set():
                     return
-                # Clean up previous temp file
                 if prev_path and prev_path.exists():
                     prev_path.unlink(missing_ok=True)
-                self.logger.info(f"Playing: {path.name}")
                 self._tts_process = subprocess.Popen(
                     ["pw-play", str(path)],
                     stdout=subprocess.DEVNULL,
@@ -598,9 +551,9 @@ class VoiceAssistant:
             tts_thread.start()
             play_thread.start()
 
-        # Send query via WS
+        # Send query
         if not self._ws_connected.is_set() or not self._ws:
-            self.logger.error("WS not connected, cannot send query")
+            self.logger.error("WS not connected")
             self._sentence_queue = None
             sentence_q.put(None)
             return "Sorry, I'm not connected to the gateway."
@@ -618,12 +571,15 @@ class VoiceAssistant:
                         "idempotencyKey": req_id,
                     },
                 }))
-            self.logger.info(f"Sent query: {text[:80]}...")
+            self.logger.info(f"Query: {text[:80]}...")
         except Exception as e:
             self.logger.error(f"Failed to send query: {e}")
             self._sentence_queue = None
             sentence_q.put(None)
             return "Sorry, I couldn't send that query."
+
+        # Play processing chime while waiting (non-blocking)
+        self._play_chime_async("processing")
 
         # Wait for run to complete (or abort)
         while not self._run_done_event.wait(timeout=0.5):
@@ -643,9 +599,8 @@ class VoiceAssistant:
         if not full_response:
             full_response = "Sorry, I got an empty response."
 
-        # Show reply notification
-        self.logger.info(f"Full response: {full_response[:200]}...")
-        self._notify(f"🧙 {full_response}", title="Clawbook", timeout_ms=10000)
+        self.logger.info(f"Response: {full_response[:200]}...")
+        self._notify(f"🧙 {_strip_markdown(full_response)}", title="Clawbook", timeout_ms=10000)
 
         # Wait for TTS pipeline to drain
         if tts_thread:
@@ -666,9 +621,8 @@ class VoiceAssistant:
             self._tts_process.kill()
             self.logger.info("Killed TTS playback")
 
-        subprocess.run(["pkill", "-f", "pw-play.*tts_chunk"], capture_output=True, check=False)
+        subprocess.run(["pkill", "-f", "pw-play.*tts_"], capture_output=True, check=False)
 
-        # Send /stop via WS
         def send_stop():
             try:
                 if self._ws and self._ws_connected.is_set():
@@ -685,23 +639,22 @@ class VoiceAssistant:
                                 "idempotencyKey": stop_id,
                             },
                         }))
-                    self.logger.info("Sent /stop via WS")
+                    self.logger.info("Sent /stop")
             except Exception as e:
                 self.logger.warning(f"Failed to send /stop: {e}")
 
         threading.Thread(target=send_stop, daemon=True).start()
-        self.logger.info("Signalled abort")
 
     def _toggle_handler(self, signum, frame):
         self.is_active = not self.is_active
         if self.is_active:
-            self.logger.info("Voice Assistant activated")
+            self.logger.info("Activated")
             self._abort_event.clear()
             self._notify("🎤 Voice Mode ON")
             self._set_waybar_status("ready")
             self._play_chime_async("listening")
         else:
-            self.logger.info("Voice Assistant deactivated")
+            self.logger.info("Deactivated")
             self._notify("🎤 Voice Mode OFF")
             self._set_waybar_status("off")
             self._abort_inflight()
@@ -745,7 +698,7 @@ class VoiceAssistant:
             elif had_speech:
                 silence_chunks += 1
                 if silence_chunks >= silence_limit:
-                    self.logger.info("Silence detected, stopping recording")
+                    self.logger.info("Silence detected")
                     break
         if not frames:
             return np.zeros(SAMPLE_RATE, dtype=np.float32)
@@ -805,6 +758,7 @@ class VoiceAssistant:
                     await asyncio.sleep(1)
                     continue
 
+            # Drain mic buffer while processing to prevent overflow
             if self.is_processing:
                 try:
                     await loop.run_in_executor(None, self._read_chunk, stream, 0.1)
@@ -851,18 +805,15 @@ class VoiceAssistant:
                 self.is_processing = False
                 return
 
-            await loop.run_in_executor(None, self._play_chime, "processing")
-
             self.logger.info(f"Transcription: {transcription}")
             self._notify(f"🎤 {transcription}", title="You Said", replace_id=NOTIFY_ID_LISTENING)
 
-            # Query and speak via WS (blocking — runs TTS pipeline internally)
             response = await loop.run_in_executor(None, self._query_and_speak, transcription)
 
             if response is None:
                 return
 
-            # espeak fallback
+            # espeak fallback when Kokoro isn't available
             if not self.tts_available and self.is_active:
                 self._set_waybar_status("speaking")
                 await loop.run_in_executor(
@@ -872,7 +823,6 @@ class VoiceAssistant:
                         capture_output=True, check=False,
                     ),
                 )
-
         except Exception as e:
             self.logger.error(f"Processing error: {e}")
         finally:
@@ -885,6 +835,9 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _cleanup(self):
+        # Clean up TTS temp files
+        for f in self.tts_dir.glob("tts_*.wav"):
+            f.unlink(missing_ok=True)
         if hasattr(self, "audio"):
             self.audio.terminate()
         self.pid_file.unlink(missing_ok=True)
