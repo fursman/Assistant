@@ -79,6 +79,7 @@ class VoiceAssistant:
 
         # Per-run state for streaming
         self._active_run_id: Optional[str] = None
+        self._active_req_id: Optional[str] = None
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
         self._assistant_pending = ""
@@ -367,9 +368,9 @@ class VoiceAssistant:
             req_id = msg.get("id")
             if req_id == "set-reasoning":
                 if msg.get("ok"):
-                    self.logger.info("Reasoning level set to 'stream' via WS")
+                    self.logger.info(f"Thinking+reasoning patch OK: {msg.get('payload', {})}")
                 else:
-                    self.logger.warning(f"Failed to set reasoning: {msg.get('error')}")
+                    self.logger.warning(f"Failed to set thinking: {msg.get('error')}")
             elif req_id and req_id.startswith("voice-"):
                 payload = msg.get("payload", {})
                 status = payload.get("status", "")
