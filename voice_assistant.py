@@ -58,6 +58,7 @@ GATEWAY_SESSION_KEY = "agent:main:openai-user:voice-assistant"
 
 NOTIFY_ID_LISTENING = 59001
 NOTIFY_ID_THINKING = 59002
+NOTIFY_ID_STREAMING = 59003
 
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
@@ -425,6 +426,15 @@ class VoiceAssistant:
             text = data.get("text", "")
             if text:
                 self._assistant_text = text
+                # Show streaming text as a live-updating notification
+                preview = _strip_markdown(text)
+                if preview:
+                    self._notify(
+                        f"🧙 {preview}",
+                        title="Clawbook",
+                        replace_id=NOTIFY_ID_STREAMING,
+                        timeout_ms=15000,
+                    )
                 self._flush_sentences(final=False)
 
         elif stream == "lifecycle":
@@ -605,7 +615,7 @@ class VoiceAssistant:
             full_response = "Sorry, I got an empty response."
 
         self.logger.info(f"Response: {full_response[:200]}...")
-        self._notify(f"🧙 {_strip_markdown(full_response)}", title="Clawbook", timeout_ms=10000)
+        self._notify(f"🧙 {_strip_markdown(full_response)}", title="Clawbook", replace_id=NOTIFY_ID_STREAMING, timeout_ms=10000)
 
         # Wait for TTS pipeline to drain
         if tts_thread:
