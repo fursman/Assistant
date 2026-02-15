@@ -383,8 +383,14 @@ class VoiceAssistant:
         data = payload.get("data", {})
         run_id = payload.get("runId")
 
-        # Only process events for our active run
-        if run_id != self._active_run_id:
+        # Track the run ID from the first agent event after we send a query
+        if self._active_run_id is None:
+            if self._active_req_id and run_id:
+                self._active_run_id = run_id
+                self.logger.info(f"Captured run ID: {run_id}")
+            else:
+                return
+        elif run_id != self._active_run_id:
             return
 
         if stream == "thinking":
@@ -459,8 +465,9 @@ class VoiceAssistant:
     def _query_and_speak(self, text):
         """Send query via WS, stream thinking as notifications, stream response to TTS.
         Returns full response text or None if aborted."""
-        run_id = f"voice-{uuid.uuid4().hex[:12]}"
-        self._active_run_id = run_id
+        req_id = f"voice-{uuid.uuid4().hex[:12]}"
+        self._active_run_id = None  # Will be set from first agent event
+        self._active_req_id = req_id
         self._thinking_text = ""
         self._assistant_pending = ""
         self._run_response_parts = []
@@ -538,13 +545,13 @@ class VoiceAssistant:
             with self._ws_lock:
                 self._ws.send(json.dumps({
                     "type": "req",
-                    "id": run_id,
+                    "id": req_id,
                     "method": "chat.send",
                     "params": {
                         "sessionKey": GATEWAY_SESSION_KEY,
                         "message": text,
                         "deliver": False,
-                        "idempotencyKey": run_id,
+                        "idempotencyKey": req_id,
                     },
                 }))
         except Exception as e:
@@ -563,6 +570,7 @@ class VoiceAssistant:
 
         self._sentence_queue = None
         self._active_run_id = None
+        self._active_req_id = None
 
         if self._abort_event.is_set():
             return None
