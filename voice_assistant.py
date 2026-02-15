@@ -58,6 +58,7 @@ GATEWAY_URL = "ws://127.0.0.1:18789"
 GATEWAY_SESSION_KEY = "agent:main:openai-user:voice-assistant"
 
 NOTIFY_ID_LISTENING = 59001
+NOTIFY_ID_THINKING = 59002
 
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
@@ -74,17 +75,14 @@ class VoiceAssistant:
         self._ws: Optional[websocket.WebSocket] = None
         self._ws_lock = threading.Lock()
         self._ws_connected = threading.Event()
-        self._ws_req_id = 0
-        self._ws_req_lock = threading.Lock()
 
         # Per-run state for streaming
-        self._active_run_id: Optional[str] = None
         self._active_req_id: Optional[str] = None
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
-        self._assistant_pending = ""
+        self._assistant_text = ""  # cumulative full text from data.text
+        self._assistant_spoken_pos = 0  # how much of _assistant_text we've already queued
         self._run_done_event = threading.Event()
-        self._run_response_parts: list[str] = []
 
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
@@ -103,7 +101,7 @@ class VoiceAssistant:
         signal.signal(signal.SIGUSR1, self._toggle_handler)
         self.pid_file.write_text(str(os.getpid()))
 
-        # Start WebSocket connection (handles thinking + queries + reasoning setup)
+        # Start WebSocket connection
         self._start_ws()
 
         self._set_waybar_status("off")
@@ -254,13 +252,12 @@ class VoiceAssistant:
         status_file.write_text(json.dumps({"text": symbols.get(state, ""), "class": state}))
 
     # ------------------------------------------------------------------
-    # WebSocket — single persistent connection for everything
+    # WebSocket — single persistent connection
     # ------------------------------------------------------------------
 
     def _start_ws(self):
         thread = threading.Thread(target=self._ws_loop, daemon=True)
         thread.start()
-        # Wait for initial connection
         self._ws_connected.wait(timeout=10)
 
     def _ws_loop(self):
@@ -273,11 +270,6 @@ class VoiceAssistant:
                 self.logger.warning(f"WS error: {e}")
             self._ws_connected.clear()
             time.sleep(3)
-
-    def _next_req_id(self):
-        with self._ws_req_lock:
-            self._ws_req_id += 1
-            return str(self._ws_req_id)
 
     def _ws_connect(self, token):
         ws = websocket.WebSocket()
@@ -300,8 +292,8 @@ class VoiceAssistant:
                 "minProtocol": 3,
                 "maxProtocol": 3,
                 "client": {
-                    "id": "gateway-client",
-                    "version": "voice-assistant",
+                    "id": "voice-assistant",
+                    "version": "2.0",
                     "platform": "linux",
                     "mode": "backend",
                 },
@@ -321,10 +313,10 @@ class VoiceAssistant:
         self._ws = ws
         self._ws_connected.set()
 
-        # Enable extended thinking (low budget) and stream thinking tokens
+        # Configure the voice-assistant session: enable thinking + stream reasoning
         ws.send(json.dumps({
             "type": "req",
-            "id": "set-reasoning",
+            "id": "patch-session",
             "method": "sessions.patch",
             "params": {
                 "key": GATEWAY_SESSION_KEY,
@@ -353,11 +345,10 @@ class VoiceAssistant:
 
         ws.close()
         self._ws = None
-        # Signal any waiting run so it doesn't hang
-        if self._active_run_id:
-            if self._sentence_queue:
-                self._sentence_queue.put(None)
-            self._run_done_event.set()
+        # Unblock any waiting run
+        if self._sentence_queue:
+            self._sentence_queue.put(None)
+        self._run_done_event.set()
         self.logger.info("WS disconnected")
 
     def _handle_ws_message(self, msg):
@@ -366,56 +357,39 @@ class VoiceAssistant:
         # Handle RPC responses
         if msg_type == "res":
             req_id = msg.get("id")
-            if req_id == "set-reasoning":
+            if req_id == "patch-session":
                 if msg.get("ok"):
-                    self.logger.info(f"Thinking+reasoning patch OK: {msg.get('payload', {})}")
+                    self.logger.info("Session patch OK (thinking + reasoning configured)")
                 else:
-                    self.logger.warning(f"Failed to set thinking: {msg.get('error')}")
+                    self.logger.warning(f"Session patch failed: {msg.get('error')}")
             elif req_id and req_id.startswith("voice-"):
                 payload = msg.get("payload", {})
-                status = payload.get("status", "")
-                self.logger.info(f"Query {req_id}: status={status} payload_keys={list(payload.keys())}")
-                # Capture runId from the chat.send response if available
-                resp_run_id = payload.get("runId")
-                if resp_run_id and self._active_req_id == req_id:
-                    self._active_run_id = resp_run_id
-                    self.logger.info(f"Captured run ID from response: {resp_run_id}")
+                self.logger.info(f"chat.send response for {req_id}: status={payload.get('status')}")
             return
 
-        # Handle agent events
+        # Handle agent events — filter by sessionKey
         if msg_type == "event" and msg.get("event") == "agent":
-            self._handle_agent_event(msg.get("payload", {}))
+            payload = msg.get("payload", {})
+            session_key = payload.get("sessionKey", "")
+            if session_key != GATEWAY_SESSION_KEY:
+                return  # Ignore events from other sessions
+            self._handle_agent_event(payload)
 
     def _handle_agent_event(self, payload):
         stream = payload.get("stream")
         data = payload.get("data", {})
-        run_id = payload.get("runId")
 
-        # Debug: log every agent event type we receive
-        delta_preview = ""
-        if data.get("delta"):
-            delta_preview = f" delta={data['delta'][:60]}..."
-        elif data.get("phase"):
-            delta_preview = f" phase={data['phase']}"
-        self.logger.info(f"Agent event: stream={stream} runId={run_id}{delta_preview}")
-
-        # Track the run ID from the first agent event after we send a query
-        if self._active_run_id is None:
-            if self._active_req_id and run_id:
-                self._active_run_id = run_id
-                self.logger.info(f"Captured run ID: {run_id}")
-            else:
-                return
-        elif run_id != self._active_run_id:
+        # Only process events while we have an active query
+        if not self._active_req_id:
             return
 
         if stream == "thinking":
             delta = data.get("delta", "")
             if delta:
                 self._thinking_text += delta
-                # Fire notification per sentence
+                # Show thinking as a rolling notification (replace same ID)
                 while True:
-                    match = re.search(r"[.!?](?:\s|$)", self._thinking_text)
+                    match = re.search(r"[.!?\n](?:\s|$)", self._thinking_text)
                     if not match:
                         break
                     pos = match.end()
@@ -423,56 +397,80 @@ class VoiceAssistant:
                     self._thinking_text = self._thinking_text[pos:]
                     if sentence:
                         self._notify(
-                            f"🧠 {sentence}\n",
+                            f"🧠 {sentence}",
                             title="Thinking...",
+                            replace_id=NOTIFY_ID_THINKING,
                             timeout_ms=8000,
                         )
-                        self.logger.info(f"Thinking: {sentence[:60]}...")
+                        self.logger.info(f"Thinking: {sentence[:80]}...")
 
         elif stream == "assistant":
-            delta = data.get("delta", "")
-            if delta:
-                self._assistant_pending += delta
-                # Split completed sentences and queue for TTS
-                while True:
-                    match = re.search(r"[.!?](?:\s|$)", self._assistant_pending)
-                    if not match:
-                        break
-                    pos = match.end()
-                    sentence = self._assistant_pending[:pos].strip()
-                    self._assistant_pending = self._assistant_pending[pos:]
-                    if sentence:
-                        self._run_response_parts.append(sentence)
-                        self.logger.info(f"Sentence: {sentence[:60]}...")
-                        if self._sentence_queue:
-                            self._sentence_queue.put(sentence)
+            # data.text is the cumulative full text so far
+            # data.delta is just the new piece
+            text = data.get("text", "")
+            if text:
+                self._assistant_text = text
+                # Extract new complete sentences beyond what we've already queued
+                self._flush_sentences(final=False)
 
         elif stream == "lifecycle":
             phase = data.get("phase")
-            if phase in ("end", "error"):
+            if phase == "start":
+                self.logger.info("Agent run started")
+            elif phase in ("end", "error"):
+                if phase == "error":
+                    self.logger.warning(f"Agent run error: {data.get('error', 'unknown')}")
+
                 # Flush remaining thinking
                 if self._thinking_text.strip():
                     self._notify(
-                        f"🧠 {self._thinking_text.strip()}\n",
+                        f"🧠 {self._thinking_text.strip()}",
                         title="Thinking...",
+                        replace_id=NOTIFY_ID_THINKING,
                         timeout_ms=8000,
                     )
                     self._thinking_text = ""
 
-                # Flush remaining assistant text
-                if self._assistant_pending.strip():
-                    sentence = self._assistant_pending.strip()
-                    self._run_response_parts.append(sentence)
-                    self.logger.info(f"Final fragment: {sentence[:60]}...")
-                    if self._sentence_queue:
-                        self._sentence_queue.put(sentence)
-                    self._assistant_pending = ""
+                # Flush any remaining assistant text as a final sentence
+                self._flush_sentences(final=True)
 
                 # Signal end of TTS sentences
                 if self._sentence_queue:
                     self._sentence_queue.put(None)
 
                 self._run_done_event.set()
+
+    def _flush_sentences(self, final=False):
+        """Extract complete sentences from _assistant_text beyond _assistant_spoken_pos."""
+        text = self._assistant_text
+        pos = self._assistant_spoken_pos
+
+        remaining = text[pos:]
+        if not remaining:
+            return
+
+        # Find complete sentences (end with . ! ? followed by space or end)
+        while True:
+            match = re.search(r"[.!?](?:\s|$)", remaining)
+            if not match:
+                break
+            end = match.end()
+            sentence = remaining[:end].strip()
+            remaining = remaining[end:]
+            pos += end
+            if sentence and self._sentence_queue:
+                self._sentence_queue.put(sentence)
+                self.logger.info(f"→ TTS: {sentence[:80]}...")
+
+        if final and remaining.strip():
+            # Queue whatever's left
+            sentence = remaining.strip()
+            pos += len(remaining)
+            if sentence and self._sentence_queue:
+                self._sentence_queue.put(sentence)
+                self.logger.info(f"→ TTS (final): {sentence[:80]}...")
+
+        self._assistant_spoken_pos = pos
 
     # ------------------------------------------------------------------
     # Query via WebSocket
@@ -482,11 +480,12 @@ class VoiceAssistant:
         """Send query via WS, stream thinking as notifications, stream response to TTS.
         Returns full response text or None if aborted."""
         req_id = f"voice-{uuid.uuid4().hex[:12]}"
-        self._active_run_id = None  # Will be set from first agent event
+
+        # Reset per-run state
         self._active_req_id = req_id
         self._thinking_text = ""
-        self._assistant_pending = ""
-        self._run_response_parts = []
+        self._assistant_text = ""
+        self._assistant_spoken_pos = 0
         self._run_done_event.clear()
 
         # Set up TTS pipeline
@@ -520,6 +519,7 @@ class VoiceAssistant:
                     return
                 path = audio_q.get()
                 if path is None:
+                    # Wait for last playback to finish
                     if self._tts_process and self._tts_process.poll() is None:
                         self._tts_process.wait()
                     self._tts_process = None
@@ -529,10 +529,12 @@ class VoiceAssistant:
                 if first:
                     self._set_waybar_status("speaking")
                     first = False
+                # Wait for previous playback to finish
                 if self._tts_process and self._tts_process.poll() is None:
                     self._tts_process.wait()
                 if self._abort_event.is_set():
                     return
+                # Clean up previous temp file
                 if prev_path and prev_path.exists():
                     prev_path.unlink(missing_ok=True)
                 self.logger.info(f"Playing: {path.name}")
@@ -570,6 +572,7 @@ class VoiceAssistant:
                         "idempotencyKey": req_id,
                     },
                 }))
+            self.logger.info(f"Sent query: {text[:80]}...")
         except Exception as e:
             self.logger.error(f"Failed to send query: {e}")
             self._sentence_queue = None
@@ -581,29 +584,28 @@ class VoiceAssistant:
             if self._abort_event.is_set():
                 self._sentence_queue = None
                 sentence_q.put(None)
-                self._active_run_id = None
+                self._active_req_id = None
                 return None
 
         self._sentence_queue = None
-        self._active_run_id = None
         self._active_req_id = None
 
         if self._abort_event.is_set():
             return None
 
-        full_response = " ".join(self._run_response_parts).strip()
+        full_response = self._assistant_text.strip()
         if not full_response:
             full_response = "Sorry, I got an empty response."
 
-        # Show reply notification now (TTS may still be playing)
-        self.logger.info(f"Response: {full_response}")
-        self._notify(f"🧙 {full_response}\n", title="Clawbook", timeout_ms=10000)
+        # Show reply notification
+        self.logger.info(f"Full response: {full_response[:200]}...")
+        self._notify(f"🧙 {full_response}", title="Clawbook", timeout_ms=10000)
 
-        # Wait for TTS to finish
+        # Wait for TTS pipeline to drain
         if tts_thread:
-            tts_thread.join()
+            tts_thread.join(timeout=60)
         if play_thread:
-            play_thread.join()
+            play_thread.join(timeout=60)
 
         return full_response
 
@@ -624,16 +626,17 @@ class VoiceAssistant:
         def send_stop():
             try:
                 if self._ws and self._ws_connected.is_set():
+                    stop_id = f"stop-{uuid.uuid4().hex[:8]}"
                     with self._ws_lock:
                         self._ws.send(json.dumps({
                             "type": "req",
-                            "id": self._next_req_id(),
+                            "id": stop_id,
                             "method": "chat.send",
                             "params": {
                                 "sessionKey": GATEWAY_SESSION_KEY,
                                 "message": "/stop",
                                 "deliver": False,
-                                "idempotencyKey": f"stop-{uuid.uuid4().hex[:8]}",
+                                "idempotencyKey": stop_id,
                             },
                         }))
                     self.logger.info("Sent /stop via WS")
