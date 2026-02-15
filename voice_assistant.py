@@ -104,6 +104,8 @@ class VoiceAssistant:
         self._active_req_id: Optional[str] = None
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
+        self._thinking_shown = False     # True once thinking has been displayed
+        self._pending_sentences: list[str] = []  # held until thinking is shown
         self._assistant_text = ""        # cumulative text from data.text
         self._assistant_spoken_pos = 0   # cursor: how much we've already queued for TTS
         self._run_done_event = threading.Event()
@@ -406,7 +408,7 @@ class VoiceAssistant:
             delta = data.get("delta", "")
             if delta:
                 self._thinking_text += delta
-                # Show each complete sentence as a notification (replaces previous)
+                # Show each complete sentence as a notification
                 while True:
                     match = re.search(r"[.!?\n](?:\s|$)", self._thinking_text)
                     if not match:
@@ -419,9 +421,14 @@ class VoiceAssistant:
                             f"🧠 {sentence}",
                             title="Thinking...",
                             replace_id=NOTIFY_ID_THINKING,
-                            timeout_ms=8000,
+                            timeout_ms=10000,
                         )
                         self.logger.info(f"Thinking: {sentence[:80]}...")
+
+                # Thinking arrived — flush any held sentences to TTS
+                if not self._thinking_shown:
+                    self._thinking_shown = True
+                    self._release_pending_sentences()
 
         elif stream == "assistant":
             text = data.get("text", "")
@@ -437,15 +444,20 @@ class VoiceAssistant:
                 if phase == "error":
                     self.logger.warning(f"Agent run error: {data.get('error', 'unknown')}")
 
-                # Flush remaining thinking as final notification
+                # Flush remaining thinking
                 if self._thinking_text.strip():
                     self._notify(
                         f"🧠 {self._thinking_text.strip()}",
                         title="Thinking...",
                         replace_id=NOTIFY_ID_THINKING,
-                        timeout_ms=8000,
+                        timeout_ms=10000,
                     )
                     self._thinking_text = ""
+
+                # If thinking never arrived, release held sentences anyway
+                if not self._thinking_shown:
+                    self._thinking_shown = True
+                    self._release_pending_sentences()
 
                 # Flush remaining assistant text
                 self._flush_sentences(final=True)
@@ -453,6 +465,29 @@ class VoiceAssistant:
                 if self._sentence_queue:
                     self._sentence_queue.put(None)
                 self._run_done_event.set()
+
+    def _release_pending_sentences(self):
+        """Release any sentences held while waiting for thinking to arrive."""
+        if self._pending_sentences and self._sentence_queue:
+            for sentence in self._pending_sentences:
+                self._sentence_queue.put(sentence)
+                self.logger.info(f"→ TTS (released): {sentence[:80]}...")
+            self._pending_sentences.clear()
+
+    def _queue_sentence(self, sentence: str, label: str = ""):
+        """Queue a sentence for TTS, or hold it if thinking hasn't arrived yet."""
+        clean = _strip_markdown(sentence)
+        if not clean:
+            return
+        if self._thinking_shown:
+            # Thinking already displayed, send directly to TTS
+            if self._sentence_queue:
+                self._sentence_queue.put(clean)
+                self.logger.info(f"→ TTS{label}: {sentence[:80]}...")
+        else:
+            # Hold until thinking arrives
+            self._pending_sentences.append(clean)
+            self.logger.info(f"→ Held{label}: {sentence[:80]}...")
 
     def _flush_sentences(self, final=False):
         """Extract complete sentences from _assistant_text beyond _assistant_spoken_pos."""
@@ -468,16 +503,14 @@ class VoiceAssistant:
             sentence = remaining[:end].strip()
             remaining = remaining[end:]
             self._assistant_spoken_pos += end
-            if sentence and self._sentence_queue:
-                self._sentence_queue.put(_strip_markdown(sentence))
-                self.logger.info(f"→ TTS: {sentence[:80]}...")
+            if sentence:
+                self._queue_sentence(sentence)
 
         if final and remaining.strip():
             sentence = remaining.strip()
             self._assistant_spoken_pos += len(remaining)
-            if sentence and self._sentence_queue:
-                self._sentence_queue.put(_strip_markdown(sentence))
-                self.logger.info(f"→ TTS (final): {sentence[:80]}...")
+            if sentence:
+                self._queue_sentence(sentence, " (final)")
 
     # ------------------------------------------------------------------
     # Query via WebSocket
@@ -490,6 +523,8 @@ class VoiceAssistant:
         # Reset per-run state
         self._active_req_id = req_id
         self._thinking_text = ""
+        self._thinking_shown = False
+        self._pending_sentences.clear()
         self._assistant_text = ""
         self._assistant_spoken_pos = 0
         self._run_done_event.clear()
