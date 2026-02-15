@@ -718,6 +718,9 @@ class VoiceAssistant:
         if play_thread:
             play_thread.join(timeout=60)
 
+        # Dismiss all notifications after playback finishes
+        subprocess.run(["swaync-client", "--close-all"], capture_output=True, check=False)
+
         return full_response
 
     # ------------------------------------------------------------------
