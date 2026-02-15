@@ -320,13 +320,14 @@ class VoiceAssistant:
         self._ws = ws
         self._ws_connected.set()
 
-        # Set reasoning level to stream
+        # Enable extended thinking (low budget) and stream thinking tokens
         ws.send(json.dumps({
             "type": "req",
             "id": "set-reasoning",
             "method": "sessions.patch",
             "params": {
                 "key": GATEWAY_SESSION_KEY,
+                "thinking": "low",
                 "reasoningLevel": "stream",
             },
         }))
@@ -370,8 +371,14 @@ class VoiceAssistant:
                 else:
                     self.logger.warning(f"Failed to set reasoning: {msg.get('error')}")
             elif req_id and req_id.startswith("voice-"):
-                status = msg.get("payload", {}).get("status", "")
-                self.logger.info(f"Query {req_id}: {status}")
+                payload = msg.get("payload", {})
+                status = payload.get("status", "")
+                self.logger.info(f"Query {req_id}: status={status} payload_keys={list(payload.keys())}")
+                # Capture runId from the chat.send response if available
+                resp_run_id = payload.get("runId")
+                if resp_run_id and self._active_req_id == req_id:
+                    self._active_run_id = resp_run_id
+                    self.logger.info(f"Captured run ID from response: {resp_run_id}")
             return
 
         # Handle agent events
@@ -382,6 +389,14 @@ class VoiceAssistant:
         stream = payload.get("stream")
         data = payload.get("data", {})
         run_id = payload.get("runId")
+
+        # Debug: log every agent event type we receive
+        delta_preview = ""
+        if data.get("delta"):
+            delta_preview = f" delta={data['delta'][:60]}..."
+        elif data.get("phase"):
+            delta_preview = f" phase={data['phase']}"
+        self.logger.info(f"Agent event: stream={stream} runId={run_id}{delta_preview}")
 
         # Track the run ID from the first agent event after we send a query
         if self._active_run_id is None:
