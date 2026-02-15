@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import uuid
-import wave
+import wave  # used by chime generation
 from pathlib import Path
 from typing import Optional
 
@@ -56,9 +56,6 @@ TTS_SPEED = 1.0
 GATEWAY_URL = "ws://127.0.0.1:18789"
 GATEWAY_SESSION_KEY = "agent:main:openai-user:voice-assistant"
 
-NOTIFY_ID_LISTENING = 59001
-NOTIFY_ID_THINKING = 59002
-NOTIFY_ID_STREAMING = 59003
 
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
@@ -89,10 +86,32 @@ def _strip_markdown(text: str) -> str:
     return _MD_STRIP.sub(_pick, text).strip()
 
 
+# Common Whisper hallucination patterns (on silence/noise)
+_HALLUCINATION_PATTERNS = {
+    "thank you for watching", "thanks for watching", "subscribe",
+    "like and subscribe", "please subscribe", "see you next time",
+    "bye bye", "thank you", "thanks for listening",
+    "you", "the end", "so",
+}
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Simple word-overlap similarity ratio (0.0 to 1.0)."""
+    if not a or not b:
+        return 0.0
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    overlap = len(words_a & words_b)
+    return overlap / max(len(words_a), len(words_b))
+
+
 class VoiceAssistant:
     def __init__(self):
         self.is_active = False
         self.is_processing = False
+        self._flush_mic_buffer = False
         self._abort_event = threading.Event()
         self._tts_process: Optional[subprocess.Popen] = None
 
@@ -105,10 +124,13 @@ class VoiceAssistant:
         self._active_req_id: Optional[str] = None
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
+        self._thinking_shown_len = 0
+        self._last_thinking_notify = 0.0
+        self._last_tool_notify = 0.0
         self._assistant_text = ""        # cumulative text from data.text
         self._assistant_spoken_pos = 0   # cursor: how much we've already queued for TTS
         self._run_done_event = threading.Event()
-        self._last_notify: dict[int, str] = {}  # replace_id → last content sent
+        self._last_tts_text = ""  # last text spoken by TTS, for echo detection
 
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
@@ -196,16 +218,9 @@ class VoiceAssistant:
 
     def _warmup(self):
         self.logger.info("Warming up models...")
-        temp_path = self.state_dir / "warmup.wav"
-        dummy = np.zeros(SAMPLE_RATE, dtype=np.int16)
-        with wave.open(str(temp_path), "wb") as f:
-            f.setnchannels(CHANNELS)
-            f.setsampwidth(2)
-            f.setframerate(SAMPLE_RATE)
-            f.writeframes(dummy.tobytes())
-        segments, _ = self.whisper_model.transcribe(str(temp_path))
+        dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        segments, _ = self.whisper_model.transcribe(dummy)
         list(segments)
-        temp_path.unlink(missing_ok=True)
         self.logger.info("Whisper warmup complete")
 
         if self.tts_available and self.kokoro:
@@ -259,16 +274,10 @@ class VoiceAssistant:
     # Notifications
     # ------------------------------------------------------------------
 
-    def _notify(self, message, title="Voice Assistant", replace_id=None, timeout_ms=None):
-        # Skip if content hasn't changed (prevents swaync re-animation pulse)
-        if replace_id is not None:
-            key = f"{title}\0{message}"
-            if self._last_notify.get(replace_id) == key:
-                return
-            self._last_notify[replace_id] = key
+    def _notify(self, message, title="Voice Assistant", timeout_ms=None, silent=False):
         cmd = ["notify-send", title, message]
-        if replace_id is not None:
-            cmd.extend(["-r", str(replace_id)])
+        if silent:
+            cmd.extend(["-h", "string:suppress-popup:true"])
         if timeout_ms is not None:
             cmd.extend(["-t", str(timeout_ms)])
         subprocess.run(cmd, capture_output=True, check=False)
@@ -291,15 +300,18 @@ class VoiceAssistant:
         self._ws_connected.wait(timeout=10)
 
     def _ws_loop(self):
-        """Persistent WS connection with auto-reconnect."""
+        """Persistent WS connection with auto-reconnect (exponential backoff)."""
         token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+        backoff = 1.0
         while True:
             try:
                 self._ws_connect(token)
+                backoff = 1.0  # reset on successful connection
             except Exception as e:
                 self.logger.warning(f"WS error: {e}")
             self._ws_connected.clear()
-            time.sleep(3)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     def _ws_connect(self, token):
         ws = websocket.WebSocket()
@@ -325,7 +337,7 @@ class VoiceAssistant:
                     "platform": "linux",
                     "mode": "backend",
                 },
-                "caps": [],
+                "caps": ["tool-events"],
                 "auth": {"token": token},
                 "scopes": ["agent", "operator.admin"],
             },
@@ -342,6 +354,7 @@ class VoiceAssistant:
         self._ws_connected.set()
 
         # Configure voice-assistant session: thinking + reasoning stream
+        # (gateway patched to allow text streaming alongside reasoning stream)
         ws.send(json.dumps({
             "type": "req",
             "id": "patch-session",
@@ -404,38 +417,74 @@ class VoiceAssistant:
             return
 
         if stream == "thinking":
-            delta = data.get("delta", "")
-            if delta:
-                self._thinking_text += delta
-                while True:
-                    match = re.search(r"[.!?\n](?:\s|$)", self._thinking_text)
-                    if not match:
-                        break
-                    pos = match.end()
-                    sentence = self._thinking_text[:pos].strip()
-                    self._thinking_text = self._thinking_text[pos:]
-                    if sentence:
-                        self._notify(
-                            f"🧠 {sentence}",
-                            title="Thinking...",
-                            replace_id=NOTIFY_ID_THINKING,
-                            timeout_ms=10000,
-                        )
+            # text = full accumulated thinking, use it as source of truth
+            full_text = data.get("text", "")
+            if full_text:
+                self._thinking_text = full_text
+                # Strip "Reasoning:\n" prefix and italic underscores from formatting
+                clean = full_text
+                if clean.startswith("Reasoning:\n"):
+                    clean = clean[len("Reasoning:\n"):]
+                clean = re.sub(r"(?m)^_(.*)_$", r"\1", clean).strip()
+
+                # Find sendable text: everything up to last real sentence end
+                # Real sentence end = .!? followed by space, but NOT after a number (e.g. "1.")
+                prev_len = self._thinking_shown_len
+                if len(clean) > prev_len:
+                    now = time.time()
+                    last = self._last_thinking_notify
+                    if now - last >= 2.0:
+                        new_text = clean[prev_len:]
+                        # Match sentence ends: .!? followed by whitespace,
+                        # but not digits before . (avoids "1." "2." etc)
+                        last_boundary = -1
+                        for m in re.finditer(r"(?<!\d)[.!?](?:\s|$)", new_text):
+                            last_boundary = m.end()
+                        if last_boundary > 0:
+                            to_send = new_text[:last_boundary].strip()
+                            if len(to_send) >= 20:
+                                self._last_thinking_notify = now
+                                self._thinking_shown_len = prev_len + last_boundary
+                                self._notify(
+                                    f"🧠 {to_send}",
+                                    title="Thinking...",
+                                    silent=True,
+                                    timeout_ms=0,
+                                )
+
+        elif stream == "tool":
+            phase = data.get("phase", "")
+            tool_name = data.get("name", "tool")
+            if phase == "start":
+                labels = {
+                    "exec": "Running command",
+                    "web_search": "Searching web",
+                    "web_fetch": "Fetching page",
+                    "Read": "Reading file",
+                    "Edit": "Editing file",
+                    "Write": "Writing file",
+                    "browser": "Using browser",
+                    "image": "Analyzing image",
+                    "memory_search": "Searching memory",
+                }
+                label = labels.get(tool_name, f"Using {tool_name}")
+                now = time.time()
+                last_tool = self._last_tool_notify
+                if now - last_tool >= 2.0:
+                    self._last_tool_notify = now
+                    self._notify(
+                        f"🔧 {label}",
+                        title="Working...",
+                        silent=True,
+                        timeout_ms=0,
+                    )
 
         elif stream == "assistant":
             text = data.get("text", "")
             if text:
                 self._assistant_text = text
-                # Show streaming text as a live-updating notification
-                preview = _strip_markdown(text)
-                if preview:
-                    self._notify(
-                        f"🧙 {preview}",
-                        title="Clawbook",
-                        replace_id=NOTIFY_ID_STREAMING,
-                        timeout_ms=15000,
-                    )
-                # Don't flush to TTS during streaming — wait for final
+                # Stream sentences to TTS as they arrive
+                self._flush_sentences(final=False)
 
         elif stream == "lifecycle":
             phase = data.get("phase")
@@ -445,18 +494,44 @@ class VoiceAssistant:
                 if phase == "error":
                     self.logger.warning(f"Agent run error: {data.get('error', 'unknown')}")
 
-                # Flush remaining thinking
-                if self._thinking_text.strip():
-                    self._notify(
-                        f"🧠 {self._thinking_text.strip()}",
-                        title="Thinking...",
-                        replace_id=NOTIFY_ID_THINKING,
-                        timeout_ms=10000,
-                    )
-                    self._thinking_text = ""
+                # Flush any unsent thinking
+                if self._thinking_text:
+                    clean = self._thinking_text
+                    if clean.startswith("Reasoning:\n"):
+                        clean = clean[len("Reasoning:\n"):]
+                    clean = re.sub(r"(?m)^_(.*)_$", r"\1", clean).strip()
+                    prev_len = self._thinking_shown_len
+                    remaining = clean[prev_len:].strip()
+                    if remaining:
+                        self._notify(
+                            f"🧠 {remaining}",
+                            title="Thinking...",
+                            silent=True,
+                            timeout_ms=0,
+                        )
+
+                # Skip silent/empty replies (NO_REPLY token or fragments)
+                _silent = self._assistant_text.strip().upper().replace("_", "").replace(" ", "")
+                _is_silent = not self._assistant_text.strip() or _silent in ("NOREPLY", "NO", "HEARTBEATOK")
+
+                # Clear thinking/tool notifications before showing response
+                subprocess.run(["swaync-client", "--close-all"], capture_output=True, check=False)
+
+                # Show final response as one notification
+                if not _is_silent:
+                    preview = _strip_markdown(self._assistant_text)
+                    if preview:
+                        self._notify(
+                            f"🧙 {preview}",
+                            title="Clawbook",
+                            timeout_ms=15000,
+                        )
 
                 # Now flush ALL text to TTS at once
-                self._flush_sentences(final=True)
+                if not _is_silent:
+                    self._flush_sentences(final=True)
+                else:
+                    self.logger.info("Silent reply — skipping TTS")
 
                 if self._sentence_queue:
                     self._sentence_queue.put(None)
@@ -469,7 +544,7 @@ class VoiceAssistant:
             return
 
         while True:
-            match = re.search(r"[.!?](?:\s|$)", remaining)
+            match = re.search(r"(?<!\d)[.!?](?:\s|$)", remaining)
             if not match:
                 break
             end = match.end()
@@ -498,10 +573,12 @@ class VoiceAssistant:
         # Reset per-run state
         self._active_req_id = req_id
         self._thinking_text = ""
+        self._thinking_shown_len = 0
+        self._last_thinking_notify = 0.0
+        self._last_tool_notify = 0.0
         self._assistant_text = ""
         self._assistant_spoken_pos = 0
         self._run_done_event.clear()
-        self._last_notify.clear()
 
         # Clean up any leftover TTS files from a previous run
         for f in self.tts_dir.glob("tts_*.wav"):
@@ -616,7 +693,7 @@ class VoiceAssistant:
             full_response = "Sorry, I got an empty response."
 
         self.logger.info(f"Response: {full_response[:200]}...")
-        self._notify(f"🧙 {_strip_markdown(full_response)}", title="Clawbook", replace_id=NOTIFY_ID_STREAMING, timeout_ms=10000)
+        self._last_tts_text = full_response
 
         # Wait for TTS pipeline to drain
         if tts_thread:
@@ -726,16 +803,11 @@ class VoiceAssistant:
 
     def _transcribe(self, audio_data):
         try:
-            temp_path = self.state_dir / "temp_audio.wav"
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-            with wave.open(str(temp_path), "wb") as f:
-                f.setnchannels(CHANNELS)
-                f.setsampwidth(2)
-                f.setframerate(SAMPLE_RATE)
-                f.writeframes(audio_int16.tobytes())
-            segments, _ = self.whisper_model.transcribe(str(temp_path))
+            duration = len(audio_data) / SAMPLE_RATE
+            self.logger.info(f"Processing audio with duration {int(duration // 60):02d}:{duration % 60:06.3f}")
+            # faster-whisper accepts numpy arrays directly — skip disk I/O
+            segments, _ = self.whisper_model.transcribe(audio_data)
             text = " ".join(seg.text for seg in segments).strip()
-            temp_path.unlink(missing_ok=True)
             return text
         except Exception as e:
             self.logger.error(f"Transcription error: {e}")
@@ -748,6 +820,7 @@ class VoiceAssistant:
     async def _listen_loop(self):
         loop = asyncio.get_event_loop()
         stream = None
+        prev_chunk = None
 
         while True:
             if not self.is_active:
@@ -783,6 +856,18 @@ class VoiceAssistant:
                 await asyncio.sleep(0.05)
                 continue
 
+            # Flush stale mic buffer after TTS playback ends
+            if self._flush_mic_buffer:
+                self._flush_mic_buffer = False
+                try:
+                    avail = stream.get_read_available()
+                    while avail > 0:
+                        stream.read(min(avail, CHUNK_SIZE), exception_on_overflow=False)
+                        avail = stream.get_read_available()
+                except OSError:
+                    pass
+                continue
+
             try:
                 audio_chunk = await loop.run_in_executor(
                     None, self._read_chunk, stream, VAD_CHUNK_DURATION
@@ -797,32 +882,62 @@ class VoiceAssistant:
                 continue
 
             if not self.is_active:
+                prev_chunk = None
                 continue
 
             if self._detect_speech(audio_chunk):
                 self._set_waybar_status("listening")
                 self.logger.info("Speech detected, recording...")
-                self._notify("🔊 Listening...", replace_id=NOTIFY_ID_LISTENING)
+
+                # Include the previous chunk to capture speech onset
+                if prev_chunk is not None:
+                    pre_audio = np.concatenate([prev_chunk, audio_chunk])
+                else:
+                    pre_audio = audio_chunk
 
                 full_audio = await loop.run_in_executor(
-                    None, self._record_until_silence, stream, audio_chunk
+                    None, self._record_until_silence, stream, pre_audio
                 )
+                prev_chunk = None
                 self.is_processing = True
                 self._set_waybar_status("thinking")
                 asyncio.create_task(self._process_audio(full_audio))
+            else:
+                prev_chunk = audio_chunk
 
             await asyncio.sleep(0.05)
 
     async def _process_audio(self, audio_data):
         loop = asyncio.get_event_loop()
+        did_tts = False
         try:
             transcription = await loop.run_in_executor(None, self._transcribe, audio_data)
             if not transcription:
                 self.is_processing = False
                 return
 
+            # Filter hallucinations: too short, known patterns, low-content
+            words = transcription.split()
+            lower = transcription.lower().strip().rstrip(".")
+            if len(words) < 3:
+                self.logger.info(f"Rejected (too short): {transcription}")
+                self.is_processing = False
+                return
+            if lower in _HALLUCINATION_PATTERNS:
+                self.logger.info(f"Rejected (hallucination): {transcription}")
+                self.is_processing = False
+                return
+
+            # Echo detection: reject if too similar to last TTS output
+            if self._last_tts_text and _text_similarity(transcription, self._last_tts_text) > 0.6:
+                self.logger.info(f"Rejected (echo of TTS): {transcription}")
+                self.is_processing = False
+                return
+
+            did_tts = True
+
             self.logger.info(f"Transcription: {transcription}")
-            self._notify(f"🎤 {transcription}", title="You Said", replace_id=NOTIFY_ID_LISTENING)
+            self._notify(f"🎤 {transcription}", title="You Said")
 
             response = await loop.run_in_executor(None, self._query_and_speak, transcription)
 
@@ -842,6 +957,10 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.error(f"Processing error: {e}")
         finally:
+            if did_tts:
+                # Keep draining mic for 1.5s after playback ends to clear any echo
+                await asyncio.sleep(1.5)
+            self._flush_mic_buffer = True
             self.is_processing = False
             if self.is_active:
                 self._set_waybar_status("ready")
