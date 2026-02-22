@@ -75,8 +75,166 @@ _MD_STRIP = re.compile(
     , re.MULTILINE
 )
 
+# Number words for speech normalization
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
+         "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+         "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+         "eighty", "ninety"]
+
+def _num_to_words(n: int) -> str:
+    """Convert integer to English words (handles 0 to 999 billion)."""
+    if n < 0:
+        return "negative " + _num_to_words(-n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("" if n % 10 == 0 else " " + _ONES[n % 10])
+    if n < 1000:
+        rest = n % 100
+        return _ONES[n // 100] + " hundred" + ("" if rest == 0 else " and " + _num_to_words(rest))
+    if n < 1000000:
+        rest = n % 1000
+        return _num_to_words(n // 1000) + " thousand" + ("" if rest == 0 else " " + _num_to_words(rest))
+    if n < 1000000000:
+        rest = n % 1000000
+        return _num_to_words(n // 1000000) + " million" + ("" if rest == 0 else " " + _num_to_words(rest))
+    if n < 1000000000000:
+        rest = n % 1000000000
+        return _num_to_words(n // 1000000000) + " billion" + ("" if rest == 0 else " " + _num_to_words(rest))
+    return str(n)
+
+# Pre-compiled abbreviation expansions for TTS
+_ABBREVS = [
+    (re.compile(r"\bvs\."), "versus"),
+    (re.compile(r"\bvs\b"), "versus"),
+    (re.compile(r"\betc\."), "et cetera"),
+    (re.compile(r"\be\.g\.\s?"), "for example, "),
+    (re.compile(r"\bi\.e\.\s?"), "that is, "),
+    (re.compile(r"\bw/o\b"), "without"),
+    (re.compile(r"\bw/\b"), "with"),
+    (re.compile(r"\bGPUs\b"), "G P Us"),
+    (re.compile(r"\bGPU\b"), "G P U"),
+    (re.compile(r"\bCPUs\b"), "C P Us"),
+    (re.compile(r"\bCPU\b"), "C P U"),
+    (re.compile(r"\bVRAM\b"), "V ram"),
+    (re.compile(r"\bAPIs\b"), "A P Is"),
+    (re.compile(r"\bAPI\b"), "A P I"),
+    (re.compile(r"\bLLMs\b"), "L L Ms"),
+    (re.compile(r"\bLLM\b"), "L L M"),
+    (re.compile(r"\bTTS\b"), "T T S"),
+    (re.compile(r"\bSTT\b"), "S T T"),
+    (re.compile(r"\bUI\b"), "U I"),
+    (re.compile(r"\bURLs\b"), "U R Ls"),
+    (re.compile(r"\bURL\b"), "U R L"),
+    (re.compile(r"\bGB\b"), "gigabytes"),
+    (re.compile(r"\bMB\b"), "megabytes"),
+    (re.compile(r"\bTB\b"), "terabytes"),
+    (re.compile(r"\bSSH\b"), "S S H"),
+    (re.compile(r"\bNVLink\b"), "N V Link"),
+    (re.compile(r"\bRTX\b"), "R T X"),
+    (re.compile(r"\bRAM\b"), "ram"),
+    (re.compile(r"\bEDA\b"), "E D A"),
+    (re.compile(r"\bIMO\b"), "in my opinion"),
+    (re.compile(r"\bSOTA\b"), "state of the art"),
+    (re.compile(r"\bINT4\b"), "int four"),
+    (re.compile(r"\bINT8\b"), "int eight"),
+    (re.compile(r"\bFP16\b"), "F P sixteen"),
+    (re.compile(r"\bFP32\b"), "F P thirty-two"),
+]
+
+def _prepare_for_speech(text: str) -> str:
+    """Strip markdown and normalize text for natural TTS pronunciation."""
+    # Step 1: Strip markdown
+    def _pick(m):
+        for g in m.groups():
+            if g is not None:
+                return g
+        return ""
+    text = _MD_STRIP.sub(_pick, text).strip()
+
+    # Step 2: Remove bare URLs
+    text = re.sub(r"https?://\S+", "", text)
+
+    # Step 3: Remove emoji
+    text = re.sub(r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000feff]", "", text)
+
+    # Step 4: Currency — $1,234.56 → "one thousand two hundred thirty four dollars and fifty six cents"
+    def _currency(m):
+        sign = m.group(1) or ""
+        whole = m.group(2).replace(",", "")
+        cents = m.group(4) or ""
+        prefix = "negative " if sign == "-" else ""
+        w = int(whole) if whole else 0
+        result = prefix + _num_to_words(w) + (" dollar" if w == 1 else " dollars")
+        if cents:
+            c = int(cents)
+            if c > 0:
+                result += " and " + _num_to_words(c) + (" cent" if c == 1 else " cents")
+        return result
+    text = re.sub(r"(-?)\$([0-9,]+)(\.(\d{1,2}))?", _currency, text)
+
+    # Step 5: Percentages — 80.2% → "eighty point two percent"
+    def _percent(m):
+        whole = m.group(1)
+        dec = m.group(3)
+        result = _num_to_words(int(whole))
+        if dec:
+            result += " point " + " ".join(_ONES[int(d)] for d in dec)
+        return result + " percent"
+    text = re.sub(r"(\d+)(\.(\d+))?%", _percent, text)
+
+    # Step 6: Multipliers — 3.5x → "three point five x"
+    def _multiplier(m):
+        whole = m.group(1)
+        dec = m.group(3)
+        result = _num_to_words(int(whole))
+        if dec:
+            result += " point " + " ".join(_ONES[int(d)] for d in dec)
+        return result + " x"
+    text = re.sub(r"(\d+)(\.(\d+))x\b", _multiplier, text)
+
+    # Step 7: Decimal numbers — 3.14 → "three point one four"
+    def _decimal(m):
+        whole = m.group(1).replace(",", "")
+        dec = m.group(2)
+        result = _num_to_words(int(whole))
+        result += " point " + " ".join(_ONES[int(d)] for d in dec)
+        return result
+    text = re.sub(r"(\d[\d,]*)\.([\d]+)", _decimal, text)
+
+    # Step 8: Large numbers with commas — 1,000,000 → "one million"
+    def _big_num(m):
+        n = int(m.group(0).replace(",", ""))
+        return _num_to_words(n)
+    text = re.sub(r"\d{1,3}(?:,\d{3})+", _big_num, text)
+
+    # Step 9: Split number+unit combos — "16GB" → "16 GB", "3080Ti" → "3080 Ti"
+    text = re.sub(r"(\d)([A-Z]{2,})\b", r"\1 \2", text)
+
+    # Step 10: Remaining standalone numbers (up to 6 digits)
+    def _plain_num(m):
+        n = int(m.group(0))
+        if n <= 999999:
+            return _num_to_words(n)
+        return m.group(0)
+    text = re.sub(r"\b\d{1,6}\b", _plain_num, text)
+
+    # Step 11: Abbreviations
+    for pattern, replacement in _ABBREVS:
+        text = pattern.sub(replacement, text)
+
+    # Step 12: Slash alternatives — "input/output" → "input or output"
+    text = re.sub(r"(\w)/(\w)", r"\1 or \2", text)
+
+    # Step 13: Clean up extra whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
 def _strip_markdown(text: str) -> str:
-    """Remove common markdown so TTS reads cleanly."""
+    """Remove common markdown so TTS reads cleanly (used for notifications)."""
     def _pick(m):
         # Return first non-None captured group (the inner text)
         for g in m.groups():
@@ -569,14 +727,14 @@ class VoiceAssistant:
             remaining = remaining[end:]
             self._assistant_spoken_pos += end
             if sentence and self._sentence_queue:
-                self._sentence_queue.put(_strip_markdown(sentence))
+                self._sentence_queue.put(_prepare_for_speech(sentence))
                 self.logger.info(f"→ TTS: {sentence[:80]}...")
 
         if final and remaining.strip():
             sentence = remaining.strip()
             self._assistant_spoken_pos += len(remaining)
             if sentence and self._sentence_queue:
-                self._sentence_queue.put(_strip_markdown(sentence))
+                self._sentence_queue.put(_prepare_for_speech(sentence))
                 self.logger.info(f"→ TTS (final): {sentence[:80]}...")
 
     # ------------------------------------------------------------------
@@ -758,6 +916,10 @@ class VoiceAssistant:
 
         threading.Thread(target=send_stop, daemon=True).start()
 
+    def _delayed_dismiss(self):
+        time.sleep(2)
+        subprocess.run(["swaync-client", "--close-all"], capture_output=True, check=False)
+
     def _toggle_handler(self, signum, frame):
         self.is_active = not self.is_active
         if self.is_active:
@@ -772,6 +934,8 @@ class VoiceAssistant:
             self._set_waybar_status("off")
             self._abort_inflight()
             self._play_chime_async("deactivate")
+            # Dismiss all notifications after a short delay
+            threading.Thread(target=self._delayed_dismiss, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Audio capture
@@ -877,15 +1041,17 @@ class VoiceAssistant:
                 continue
 
             # Flush stale mic buffer after TTS playback ends
+            # Close and reopen the stream to guarantee a clean buffer
             if self._flush_mic_buffer:
                 self._flush_mic_buffer = False
                 try:
-                    avail = stream.get_read_available()
-                    while avail > 0:
-                        stream.read(min(avail, CHUNK_SIZE), exception_on_overflow=False)
-                        avail = stream.get_read_available()
+                    stream.stop_stream()
+                    stream.close()
                 except OSError:
                     pass
+                stream = None
+                prev_chunk = None
+                self.logger.info("Flushed mic buffer (stream reset)")
                 continue
 
             try:
@@ -978,8 +1144,9 @@ class VoiceAssistant:
             self.logger.error(f"Processing error: {e}")
         finally:
             if did_tts:
-                # Keep draining mic for 1.5s after playback ends to clear any echo
-                await asyncio.sleep(1.5)
+                # Keep draining mic after playback ends to clear any echo
+                # 1.5s wasn't enough — room reverb can linger longer
+                await asyncio.sleep(3.0)
             self._flush_mic_buffer = True
             self.is_processing = False
             if self.is_active:
