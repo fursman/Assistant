@@ -47,13 +47,23 @@ show_status() {
         echo -e "Process: ${RED}NOT RUNNING${NC}"
     fi
     
-    # Gateway token status
-    if [[ -n "$OPENCLAW_GATEWAY_TOKEN" ]]; then
-        echo -e "Gateway Token: ${GREEN}SET${NC}"
+    # Claude Code status
+    if command -v claude &>/dev/null; then
+        CLAUDE_VER=$(claude --version 2>/dev/null)
+        echo -e "Claude Code: ${GREEN}$CLAUDE_VER${NC}"
     else
-        echo -e "Gateway Token: ${YELLOW}NOT SET (loaded from service env)${NC}"
+        echo -e "Claude Code: ${RED}NOT FOUND${NC}"
     fi
-    
+
+    # Session info
+    SESSION_FILE="$HOME/.local/state/voice-assistant/session_id"
+    if [[ -f "$SESSION_FILE" ]] && [[ -s "$SESSION_FILE" ]]; then
+        SID=$(cat "$SESSION_FILE")
+        echo -e "Session: ${GREEN}${SID:0:12}...${NC} (continuing)"
+    else
+        echo -e "Session: ${YELLOW}NONE${NC} (will start new)"
+    fi
+
     # Log file
     LOG_FILE="$HOME/.local/state/voice-assistant/voice-assistant.log"
     if [[ -f "$LOG_FILE" ]]; then
@@ -94,14 +104,39 @@ restart_service() {
     fi
 }
 
+PID_FILE="$HOME/.local/state/voice-assistant/voice-assistant.pid"
+
+_send_signal() {
+    local sig="$1"
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -"$sig" "$pid"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 toggle_voice() {
-    if pgrep -f voice-assistant &>/dev/null; then
+    if _send_signal USR1; then
         log_info "Toggling voice mode..."
-        pkill -USR1 voice-assistant
         log_success "Voice mode toggled"
     else
         log_error "Voice assistant is not running"
         exit 1
+    fi
+}
+
+new_session() {
+    if _send_signal USR2; then
+        log_info "Starting new conversation..."
+        log_success "New conversation will begin on next query"
+    else
+        log_warning "Voice assistant is not running, clearing persisted session..."
+        rm -f "$HOME/.local/state/voice-assistant/session_id"
+        log_success "Session cleared"
     fi
 }
 
@@ -128,6 +163,7 @@ show_help() {
     echo "  stop        Stop the voice assistant service"
     echo "  restart     Restart the voice assistant service"
     echo "  toggle      Toggle voice mode on/off (same as SUPER key)"
+    echo "  new-session Start a new conversation (clear session)"
     echo "  logs [N]    Show last N lines of logs (default: 50)"
     echo "  logs -f     Follow logs in real-time"
     echo "  test        Run installation tests"
@@ -167,6 +203,9 @@ case "${1:-}" in
         ;;
     "toggle")
         toggle_voice
+        ;;
+    "new-session"|"new"|"reset")
+        new_session
         ;;
     "logs"|"log")
         if [[ "$2" == "-f" ]]; then
