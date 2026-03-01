@@ -2,7 +2,7 @@
 """
 Hyprland Voice Assistant
 
-Pipeline: VAD → Whisper STT → OpenClaw LLM (streaming via WS) → Kokoro TTS (streaming) → PipeWire playback
+Pipeline: VAD → Whisper STT → Claude Code LLM (streaming subprocess) → Kokoro TTS (streaming) → PipeWire playback
 
 Thinking events stream as 🧠 notifications; response sentences stream to TTS as they arrive.
 """
@@ -19,7 +19,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 import wave  # used by chime generation
 from pathlib import Path
 from typing import Optional
@@ -28,7 +27,6 @@ import numpy as np
 import pyaudio
 import soundfile as sf
 import torch
-import websocket
 from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, get_speech_timestamps
 
@@ -43,7 +41,7 @@ CHUNK_SIZE = 1024
 AUDIO_FORMAT = pyaudio.paInt16
 
 VAD_CHUNK_DURATION = 0.5
-SILENCE_TIMEOUT = 1.5
+SILENCE_TIMEOUT = 2.5
 MAX_RECORD_DURATION = 30
 
 WHISPER_MODEL = "small"
@@ -53,9 +51,34 @@ WHISPER_COMPUTE = "float16"
 TTS_VOICE = "af_heart"
 TTS_SPEED = 1.0
 
-GATEWAY_URL = "ws://127.0.0.1:18789"
-GATEWAY_SESSION_KEY = "agent:main:openai-user:voice-assistant"
+CLAUDE_MODEL = os.getenv("VOICE_ASSISTANT_MODEL", "sonnet")
+CLAUDE_VOICE_PROMPT = (
+    "You are a voice assistant integrated into a Linux desktop (Hyprland on Wayland). "
+    "The user speaks to you and hears your responses via text-to-speech. "
+    "Keep responses concise and conversational — avoid code blocks, markdown formatting, "
+    "and long lists unless specifically asked. Prefer natural spoken language. "
+    "You have full access to the system and can run commands, read/write files, search the web, and more. "
+    "Be helpful, proactive, and efficient. When the user asks you to do something on their system, just do it. "
+    "Give brief confirmations rather than lengthy explanations.\n\n"
+    "IMPORTANT — You are running INSIDE the voice assistant service. "
+    "To stop listening / turn off voice mode / deactivate, run: "
+    "kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid) "
+    "— this toggles voice mode off gracefully. "
+    "To start a new conversation, run: "
+    "kill -USR2 $(cat ~/.local/state/voice-assistant/voice-assistant.pid) "
+    "— NEVER stop or restart the voice-assistant systemd service, "
+    "as that kills the process you are running inside of."
+)
 
+SESSION_FILE = Path.home() / ".local/state/voice-assistant/session_id"
+
+# Voice commands that trigger a new session (checked after lowercasing + stripping trailing punctuation)
+_NEW_SESSION_PHRASES = {
+    "new conversation", "start a new conversation",
+    "fresh start", "start fresh", "new session",
+    "reset conversation", "clear conversation",
+    "begin a new conversation",
+}
 
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
@@ -145,7 +168,9 @@ _ABBREVS = [
 
 def _prepare_for_speech(text: str) -> str:
     """Strip markdown and normalize text for natural TTS pronunciation."""
-    # Step 1: Strip markdown
+    # Step 1: Replace code blocks with spoken placeholder before stripping
+    text = re.sub(r"```[\s\S]*?```", "code block", text)
+    # Step 1b: Strip remaining markdown
     def _pick(m):
         for g in m.groups():
             if g is not None:
@@ -235,6 +260,7 @@ def _prepare_for_speech(text: str) -> str:
 
 def _strip_markdown(text: str) -> str:
     """Remove common markdown so TTS reads cleanly (used for notifications)."""
+    text = re.sub(r"```[\s\S]*?```", "[code block]", text)
     def _pick(m):
         # Return first non-None captured group (the inner text)
         for g in m.groups():
@@ -270,25 +296,29 @@ class VoiceAssistant:
         self.is_active = False
         self.is_processing = False
         self._flush_mic_buffer = False
+        self._post_tts_gate = False
+        self._post_tts_silence_count = 0
         self._abort_event = threading.Event()
         self._tts_process: Optional[subprocess.Popen] = None
 
-        # WebSocket state
-        self._ws: Optional[websocket.WebSocket] = None
-        self._ws_lock = threading.Lock()
-        self._ws_connected = threading.Event()
+        # Claude subprocess state
+        self._claude_process: Optional[subprocess.Popen] = None
+        self._session_id: Optional[str] = None
 
         # Per-run state for streaming
-        self._active_req_id: Optional[str] = None
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
         self._thinking_shown_len = 0
         self._last_thinking_notify = 0.0
         self._last_tool_notify = 0.0
-        self._assistant_text = ""        # cumulative text from data.text
+        self._assistant_text = ""        # cumulative text from deltas
         self._assistant_spoken_pos = 0   # cursor: how much we've already queued for TTS
-        self._run_done_event = threading.Event()
         self._last_tts_text = ""  # last text spoken by TTS, for echo detection
+
+        # Stream parser state for tool tracking
+        self._current_tool_idx: Optional[int] = None
+        self._current_tool_name: str = ""
+        self._current_tool_input: str = ""
 
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
@@ -302,16 +332,107 @@ class VoiceAssistant:
 
         # Initialize components
         self._setup_logging()
+        self._preflight_checks()
+        self._session_id = self._load_session_id()
         self._setup_audio()
         self._setup_models()
         self._ensure_chimes()
 
         signal.signal(signal.SIGUSR1, self._toggle_handler)
+        signal.signal(signal.SIGUSR2, self._new_session_handler)
         self.pid_file.write_text(str(os.getpid()))
 
-        # Start WebSocket connection
-        self._start_ws()
         self._set_waybar_status("off")
+
+    # ------------------------------------------------------------------
+    # Preflight checks
+    # ------------------------------------------------------------------
+
+    def _preflight_checks(self):
+        """Verify critical runtime requirements at startup."""
+        ok = True
+
+        # Claude Code must be installed
+        claude_path = subprocess.run(
+            ["which", "claude"], capture_output=True, text=True
+        ).stdout.strip()
+        if not claude_path:
+            self.logger.error("PREFLIGHT FAIL: 'claude' CLI not found in PATH")
+            ok = False
+        else:
+            self.logger.info(f"Claude CLI: {claude_path}")
+
+        # --dangerously-skip-permissions must be accepted in settings
+        settings_file = Path.home() / ".claude/settings.json"
+        if settings_file.exists():
+            try:
+                settings = json.loads(settings_file.read_text())
+                if settings.get("skipDangerousModePermissionPrompt"):
+                    self.logger.info("Claude skipDangerousModePermissionPrompt: enabled")
+                else:
+                    self.logger.warning(
+                        "PREFLIGHT WARN: skipDangerousModePermissionPrompt not set in "
+                        "~/.claude/settings.json — voice assistant needs "
+                        "--dangerously-skip-permissions to work non-interactively"
+                    )
+            except (json.JSONDecodeError, Exception):
+                pass
+        else:
+            self.logger.warning(
+                "PREFLIGHT WARN: ~/.claude/settings.json not found — "
+                "set skipDangerousModePermissionPrompt: true"
+            )
+
+        # Passwordless sudo is required for system commands
+        sudo_check = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, timeout=5
+        )
+        if sudo_check.returncode == 0:
+            self.logger.info("Passwordless sudo: available")
+        else:
+            self.logger.warning(
+                "PREFLIGHT WARN: passwordless sudo not available — "
+                "Claude may fail on system commands. "
+                "Fix: echo '%s ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/%s"
+                % (os.getenv("USER", "user"), os.getenv("USER", "user"))
+            )
+            ok = False
+
+        if ok:
+            self.logger.info("Preflight checks passed")
+
+    # ------------------------------------------------------------------
+    # Session persistence
+    # ------------------------------------------------------------------
+
+    def _load_session_id(self) -> Optional[str]:
+        """Load persisted session ID from state file."""
+        try:
+            if SESSION_FILE.exists():
+                sid = SESSION_FILE.read_text().strip()
+                if sid:
+                    self.logger.info(f"Loaded persisted session: {sid}")
+                    return sid
+        except Exception:
+            pass
+        return None
+
+    def _save_session_id(self, sid: str):
+        """Persist session ID to state file."""
+        try:
+            SESSION_FILE.write_text(sid)
+            self.logger.info(f"Persisted session: {sid}")
+        except Exception as e:
+            self.logger.error(f"Failed to persist session ID: {e}")
+
+    def _clear_session(self):
+        """Clear session ID from memory and disk, so next query starts fresh."""
+        self._session_id = None
+        try:
+            SESSION_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        self.logger.info("Session cleared — next query starts a new conversation")
 
     # ------------------------------------------------------------------
     # Setup
@@ -436,8 +557,11 @@ class VoiceAssistant:
         cmd = ["notify-send", title, message]
         if silent:
             cmd.extend(["-h", "string:suppress-popup:true", "-u", "low"])
-        if timeout_ms is not None:
-            cmd.extend(["-t", str(timeout_ms)])
+        # Always set an explicit expire time so voice assistant notifications
+        # remain persistent regardless of swaync's global timeout setting.
+        # -1 = never expire (freedesktop spec), overrides any server default.
+        expire = str(timeout_ms) if timeout_ms is not None else "-1"
+        cmd.extend(["--expire-time=" + expire])
         subprocess.run(cmd, capture_output=True, check=False)
 
     # ------------------------------------------------------------------
@@ -446,271 +570,166 @@ class VoiceAssistant:
 
     def _set_waybar_status(self, state):
         status_file = self.state_dir / "waybar-status"
-        symbols = {"off": "◯", "ready": "●", "listening": "●", "thinking": "●", "speaking": "●"}
+        symbols = {"off": "◯", "ready": "●", "listening": "◉", "thinking": "◈", "speaking": "◆"}
         status_file.write_text(json.dumps({"text": symbols.get(state, ""), "class": state}))
 
     # ------------------------------------------------------------------
-    # WebSocket — single persistent connection
+    # Claude Code — subprocess per query with streaming JSON
     # ------------------------------------------------------------------
 
-    def _start_ws(self):
-        threading.Thread(target=self._ws_loop, daemon=True).start()
-        self._ws_connected.wait(timeout=10)
+    def _build_claude_cmd(self, message: str) -> list:
+        """Build the claude CLI command for a query."""
+        cmd = [
+            "claude", "-p", message,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--dangerously-skip-permissions",
+            "--model", CLAUDE_MODEL,
+            "--append-system-prompt", CLAUDE_VOICE_PROMPT,
+        ]
+        if self._session_id:
+            cmd.extend(["--resume", self._session_id])
+        else:
+            cmd.extend(["--continue"])
+        return cmd
 
-    def _ws_loop(self):
-        """Persistent WS connection with auto-reconnect (exponential backoff)."""
-        token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
-        backoff = 1.0
-        while True:
-            try:
-                self._ws_connect(token)
-                backoff = 1.0  # reset on successful connection
-            except Exception as e:
-                self.logger.warning(f"WS error: {e}")
-            self._ws_connected.clear()
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
-
-    def _ws_connect(self, token):
-        ws = websocket.WebSocket()
-        ws.connect(GATEWAY_URL)
-        self.logger.info("WS connected")
-
-        challenge = json.loads(ws.recv())
-        if challenge.get("event") != "connect.challenge":
-            self.logger.warning(f"Expected connect.challenge, got: {challenge.get('event')}")
-            ws.close()
-            return
-
-        ws.send(json.dumps({
-            "type": "req",
-            "id": "connect",
-            "method": "connect",
-            "params": {
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": {
-                    "id": "gateway-client",
-                    "version": "2.0",
-                    "platform": "linux",
-                    "mode": "backend",
-                },
-                "caps": ["tool-events"],
-                "auth": {"token": token},
-                "scopes": ["agent", "operator.admin"],
-            },
-        }))
-
-        resp = json.loads(ws.recv())
-        if not (resp.get("type") == "res" and resp.get("ok")):
-            self.logger.warning(f"WS handshake failed: {resp}")
-            ws.close()
-            return
-        self.logger.info("WS handshake OK")
-
-        self._ws = ws
-        self._ws_connected.set()
-
-        # Configure voice-assistant session: thinking + reasoning stream
-        # (gateway patched to allow text streaming alongside reasoning stream)
-        ws.send(json.dumps({
-            "type": "req",
-            "id": "patch-session",
-            "method": "sessions.patch",
-            "params": {
-                "key": GATEWAY_SESSION_KEY,
-                "thinkingLevel": "high",
-                "reasoningLevel": "stream",
-            },
-        }))
-
-        # Listen loop
-        ws.settimeout(60)
-        while True:
-            try:
-                raw = ws.recv()
-                if not raw:
-                    break
-                self._handle_ws_message(json.loads(raw))
-            except websocket.WebSocketTimeoutException:
-                try:
-                    ws.ping()
-                except Exception:
-                    break
-            except Exception as e:
-                self.logger.warning(f"WS recv error: {e}")
+    def _parse_claude_stream(self, process):
+        """Parse claude stream-json stdout line by line, driving notifications and TTS."""
+        for raw_line in iter(process.stdout.readline, b''):
+            if self._abort_event.is_set():
                 break
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        ws.close()
-        self._ws = None
-        # Unblock any waiting run
-        if self._sentence_queue:
-            self._sentence_queue.put(None)
-        self._run_done_event.set()
-        self.logger.info("WS disconnected")
+            etype = event.get("type")
 
-    def _handle_ws_message(self, msg):
-        msg_type = msg.get("type")
+            if etype == "system":
+                sid = event.get("session_id")
+                if sid:
+                    self._session_id = sid
+                    self._save_session_id(sid)
+                    self.logger.info(f"Claude session: {sid}")
 
-        if msg_type == "res":
-            req_id = msg.get("id")
-            if req_id == "patch-session":
-                if msg.get("ok"):
-                    self.logger.info("Session configured (thinking=high, reasoning=stream)")
+            elif etype == "stream_event":
+                self._handle_stream_event(event.get("event", {}))
+
+            elif etype == "result":
+                if event.get("is_error"):
+                    self.logger.warning(f"Claude error: {event.get('result', '')}")
                 else:
-                    self.logger.warning(f"Session patch failed: {msg.get('error')}")
-            return
-
-        if msg_type == "event" and msg.get("event") == "agent":
-            payload = msg.get("payload", {})
-            if payload.get("sessionKey") != GATEWAY_SESSION_KEY:
-                return
-            self._handle_agent_event(payload)
-
-    def _handle_agent_event(self, payload):
-        stream = payload.get("stream")
-        data = payload.get("data", {})
-
-        if not self._active_req_id:
-            return
-
-        if stream == "thinking":
-            # text = full accumulated thinking, use it as source of truth
-            full_text = data.get("text", "")
-            if full_text:
-                self._thinking_text = full_text
-                # Strip "Reasoning:\n" prefix and italic underscores from formatting
-                clean = full_text
-                if clean.startswith("Reasoning:\n"):
-                    clean = clean[len("Reasoning:\n"):]
-                clean = re.sub(r"(?m)^_(.*)_$", r"\1", clean).strip()
-
-                # Find sendable text: everything up to last real sentence end
-                # Real sentence end = .!? followed by space, but NOT after a number (e.g. "1.")
-                prev_len = self._thinking_shown_len
-                if len(clean) > prev_len:
-                    now = time.time()
-                    last = self._last_thinking_notify
-                    if now - last >= 2.0:
-                        new_text = clean[prev_len:]
-                        # Match sentence ends: .!? followed by whitespace,
-                        # but not digits before . (avoids "1." "2." etc)
-                        last_boundary = -1
-                        for m in re.finditer(r"(?<!\d)[.!?](?:\s|$)", new_text):
-                            last_boundary = m.end()
-                        if last_boundary > 0:
-                            to_send = new_text[:last_boundary].strip()
-                            if len(to_send) >= 20:
-                                self._last_thinking_notify = now
-                                self._thinking_shown_len = prev_len + last_boundary
-                                self._notify(
-                                    f"🧠 {to_send}",
-                                    title="Thinking...",
-                                    silent=True,
-                                )
-
-        elif stream == "tool":
-            phase = data.get("phase", "")
-            tool_name = data.get("name", "tool")
-            if phase == "start":
-                labels = {
-                    "exec": "Running command",
-                    "web_search": "Searching web",
-                    "web_fetch": "Fetching page",
-                    "Read": "Reading file",
-                    "Edit": "Editing file",
-                    "Write": "Writing file",
-                    "browser": "Using browser",
-                    "image": "Analyzing image",
-                    "memory_search": "Searching memory",
-                }
-                label = labels.get(tool_name, f"Using {tool_name}")
-                args = data.get("args", {})
-                detail = ""
-                if tool_name == "exec":
-                    cmd = args.get("command", "")
-                    if cmd:
-                        # Show first line, truncated
-                        first_line = cmd.split("\n")[0].strip()
-                        detail = f"\n{first_line[:120]}"
-                elif tool_name in ("Read", "Edit", "Write"):
-                    path = args.get("file_path", "") or args.get("path", "")
-                    if path:
-                        detail = f"\n{path}"
-                elif tool_name == "web_search":
-                    query = args.get("query", "")
-                    if query:
-                        detail = f"\n{query}"
-                elif tool_name == "web_fetch":
-                    url = args.get("url", "")
-                    if url:
-                        detail = f"\n{url[:120]}"
-                now = time.time()
-                last_tool = self._last_tool_notify
-                if now - last_tool >= 2.0:
-                    self._last_tool_notify = now
-                    self._notify(
-                        f"🔧 {label}{detail}",
-                        title="Working...",
-                        silent=True,
+                    self.logger.info(
+                        f"Claude done (cost=${event.get('total_cost_usd', 0):.4f}, "
+                        f"turns={event.get('num_turns', 1)})"
                     )
+                return True
 
-        elif stream == "assistant":
-            text = data.get("text", "")
-            if text:
-                self._assistant_text = text
-                # Stream sentences to TTS as they arrive
+        return False  # process ended without a result event
+
+    def _handle_stream_event(self, se):
+        """Handle a single stream_event from claude's raw API stream."""
+        se_type = se.get("type")
+
+        if se_type == "content_block_start":
+            cb = se.get("content_block", {})
+            idx = se.get("index")
+            if cb.get("type") == "tool_use":
+                self._current_tool_idx = idx
+                self._current_tool_name = cb.get("name", "")
+                self._current_tool_input = ""
+
+        elif se_type == "content_block_delta":
+            delta = se.get("delta", {})
+            dt = delta.get("type")
+
+            if dt == "thinking_delta":
+                self._thinking_text += delta.get("thinking", "")
+                self._maybe_notify_thinking()
+
+            elif dt == "text_delta":
+                self._assistant_text += delta.get("text", "")
                 self._flush_sentences(final=False)
 
-        elif stream == "lifecycle":
-            phase = data.get("phase")
-            if phase == "start":
-                self.logger.info("Agent run started")
-            elif phase in ("end", "error"):
-                if phase == "error":
-                    self.logger.warning(f"Agent run error: {data.get('error', 'unknown')}")
+            elif dt == "input_json_delta":
+                if se.get("index") == self._current_tool_idx:
+                    self._current_tool_input += delta.get("partial_json", "")
 
-                # Flush any unsent thinking
-                if self._thinking_text:
-                    clean = self._thinking_text
-                    if clean.startswith("Reasoning:\n"):
-                        clean = clean[len("Reasoning:\n"):]
-                    clean = re.sub(r"(?m)^_(.*)_$", r"\1", clean).strip()
-                    prev_len = self._thinking_shown_len
-                    remaining = clean[prev_len:].strip()
-                    if remaining:
-                        self._notify(
-                            f"🧠 {remaining}",
-                            title="Thinking...",
-                            silent=True,
-                            
-                        )
+        elif se_type == "content_block_stop":
+            idx = se.get("index")
+            if idx == self._current_tool_idx and self._current_tool_name:
+                self._notify_tool_use(self._current_tool_name, self._current_tool_input)
+                self._current_tool_idx = None
+                self._current_tool_name = ""
+                self._current_tool_input = ""
 
-                # Skip silent/empty replies (NO_REPLY token or fragments)
-                _silent = self._assistant_text.strip().upper().replace("_", "").replace(" ", "")
-                _is_silent = not self._assistant_text.strip() or _silent in ("NOREPLY", "NO", "HEARTBEATOK")
+    def _maybe_notify_thinking(self):
+        """Rate-limited thinking notifications (every 2 seconds, sentence-aligned)."""
+        text = self._thinking_text
+        prev_len = self._thinking_shown_len
+        if len(text) <= prev_len:
+            return
+        now = time.time()
+        if now - self._last_thinking_notify < 2.0:
+            return
+        new_text = text[prev_len:]
+        last_boundary = -1
+        for m in re.finditer(r"(?<!\d)[.!?](?:\s|$)", new_text):
+            last_boundary = m.end()
+        if last_boundary > 0:
+            to_send = new_text[:last_boundary].strip()
+            if len(to_send) >= 20:
+                self._last_thinking_notify = now
+                self._thinking_shown_len = prev_len + last_boundary
+                self._notify(f"🧠 {to_send}", title="Thinking...", silent=True)
 
-                # Clear thinking/tool notifications before showing response
-                subprocess.run(["swaync-client", "--close-all"], capture_output=True, check=False)
+    def _notify_tool_use(self, tool_name, input_json_str):
+        """Show a tool-use notification with friendly label and details."""
+        labels = {
+            "Bash": "Running command",
+            "Read": "Reading file",
+            "Edit": "Editing file",
+            "Write": "Writing file",
+            "Glob": "Searching files",
+            "Grep": "Searching code",
+            "WebSearch": "Searching web",
+            "WebFetch": "Fetching page",
+            "Task": "Running agent",
+            "NotebookEdit": "Editing notebook",
+        }
+        label = labels.get(tool_name, f"Using {tool_name}")
+        detail = ""
+        try:
+            args = json.loads(input_json_str) if input_json_str else {}
+        except json.JSONDecodeError:
+            args = {}
 
-                # Show final response as one notification
-                if not _is_silent:
-                    preview = _strip_markdown(self._assistant_text)
-                    if preview:
-                        self._notify(
-                            f"🧙 {preview}",
-                            title="Clawbook",
-                        )
+        if tool_name == "Bash":
+            cmd = args.get("command", "")
+            if cmd:
+                first_line = cmd.split("\n")[0].strip()
+                detail = f"\n{first_line[:120]}"
+        elif tool_name in ("Read", "Edit", "Write"):
+            path = args.get("file_path", "")
+            if path:
+                detail = f"\n{path}"
+        elif tool_name == "WebSearch":
+            query = args.get("query", "")
+            if query:
+                detail = f"\n{query}"
+        elif tool_name == "WebFetch":
+            url = args.get("url", "")
+            if url:
+                detail = f"\n{url[:120]}"
 
-                # Now flush ALL text to TTS at once
-                if not _is_silent:
-                    self._flush_sentences(final=True)
-                else:
-                    self.logger.info("Silent reply — skipping TTS")
-
-                if self._sentence_queue:
-                    self._sentence_queue.put(None)
-                self._run_done_event.set()
+        now = time.time()
+        if now - self._last_tool_notify >= 2.0:
+            self._last_tool_notify = now
+            self._notify(f"🔧 {label}{detail}", title="Working...", silent=True)
 
     def _flush_sentences(self, final=False):
         """Extract complete sentences from _assistant_text beyond _assistant_spoken_pos."""
@@ -738,22 +757,21 @@ class VoiceAssistant:
                 self.logger.info(f"→ TTS (final): {sentence[:80]}...")
 
     # ------------------------------------------------------------------
-    # Query via WebSocket
+    # Query via Claude Code subprocess
     # ------------------------------------------------------------------
 
     def _query_and_speak(self, text):
-        """Send query via WS, stream thinking as notifications, stream response to TTS."""
-        req_id = f"voice-{uuid.uuid4().hex[:12]}"
-
+        """Send query to Claude Code subprocess, stream thinking/tools/response to TTS."""
         # Reset per-run state
-        self._active_req_id = req_id
         self._thinking_text = ""
         self._thinking_shown_len = 0
         self._last_thinking_notify = 0.0
         self._last_tool_notify = 0.0
         self._assistant_text = ""
         self._assistant_spoken_pos = 0
-        self._run_done_event.clear()
+        self._current_tool_idx = None
+        self._current_tool_name = ""
+        self._current_tool_input = ""
 
         # Clean up any leftover TTS files from a previous run
         for f in self.tts_dir.glob("tts_*.wav"):
@@ -779,7 +797,6 @@ class VoiceAssistant:
                     idx += 1
                 except Exception as e:
                     self.logger.error(f"TTS error on sentence: {e}")
-                    # Skip this sentence, keep going
                     continue
 
         def playback_worker():
@@ -819,51 +836,86 @@ class VoiceAssistant:
             tts_thread.start()
             play_thread.start()
 
-        # Send query
-        if not self._ws_connected.is_set() or not self._ws:
-            self.logger.error("WS not connected")
-            self._sentence_queue = None
-            sentence_q.put(None)
-            return "Sorry, I'm not connected to the gateway."
-
-        try:
-            with self._ws_lock:
-                self._ws.send(json.dumps({
-                    "type": "req",
-                    "id": req_id,
-                    "method": "chat.send",
-                    "params": {
-                        "sessionKey": GATEWAY_SESSION_KEY,
-                        "message": text,
-                        "deliver": False,
-                        "idempotencyKey": req_id,
-                    },
-                }))
-            self.logger.info(f"Query: {text[:80]}...")
-        except Exception as e:
-            self.logger.error(f"Failed to send query: {e}")
-            self._sentence_queue = None
-            sentence_q.put(None)
-            return "Sorry, I couldn't send that query."
+        # Build and launch Claude subprocess
+        cmd = self._build_claude_cmd(text)
+        self.logger.info(f"Query: {text[:80]}...")
 
         # Play processing chime while waiting (non-blocking)
         self._play_chime_async("processing")
 
-        # Wait for run to complete (or abort)
-        while not self._run_done_event.wait(timeout=0.5):
-            if self._abort_event.is_set():
-                self._sentence_queue = None
-                sentence_q.put(None)
-                self._active_req_id = None
-                return None
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)  # prevent nesting check
+        try:
+            self._claude_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                cwd=str(Path(__file__).parent),
+            )
+        except FileNotFoundError:
+            self.logger.error("'claude' CLI not found in PATH")
+            self._sentence_queue = None
+            sentence_q.put(None)
+            return "Sorry, Claude Code is not installed."
+        except Exception as e:
+            self.logger.error(f"Failed to spawn claude: {e}")
+            self._sentence_queue = None
+            sentence_q.put(None)
+            return "Sorry, I couldn't start Claude."
 
+        # Parse streaming output (blocks until done or abort)
+        success = self._parse_claude_stream(self._claude_process)
+
+        # Reap the process
+        try:
+            self._claude_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._claude_process.kill()
+            self._claude_process.wait(timeout=2)
+        except Exception:
+            pass
+
+        self._claude_process = None
         self._sentence_queue = None
-        self._active_req_id = None
 
         if self._abort_event.is_set():
+            sentence_q.put(None)
             return None
 
+        # Flush any remaining thinking as notification
+        if self._thinking_text:
+            remaining = self._thinking_text[self._thinking_shown_len:].strip()
+            if remaining:
+                self._notify(f"🧠 {remaining}", title="Thinking...", silent=True)
+
         full_response = self._assistant_text.strip()
+
+        # If Claude used tools but produced no text response, say "Done"
+        if not full_response and success:
+            full_response = "Done."
+            self._assistant_text = full_response
+
+        _is_silent = not full_response
+
+        # Clear thinking/tool notifications before showing response
+        subprocess.run(["swaync-client", "--close-all"], capture_output=True, check=False)
+
+        # Show final response as one notification
+        if not _is_silent:
+            preview = _strip_markdown(full_response)
+            if preview:
+                self._notify(f"🧙 {preview}", title="Assistant")
+
+        # Flush ALL remaining text to TTS
+        if not _is_silent:
+            self._flush_sentences(final=True)
+        else:
+            self.logger.info("Empty reply — skipping TTS")
+
+        # Signal end of TTS pipeline
+        sentence_q.put(None)
+
         if not full_response:
             full_response = "Sorry, I got an empty response."
 
@@ -888,33 +940,21 @@ class VoiceAssistant:
     def _abort_inflight(self):
         self._abort_event.set()
 
+        # Kill Claude subprocess
+        if self._claude_process and self._claude_process.poll() is None:
+            self._claude_process.kill()
+            self.logger.info("Killed Claude process")
+
+        # Kill TTS playback
         if self._tts_process and self._tts_process.poll() is None:
             self._tts_process.kill()
             self.logger.info("Killed TTS playback")
 
         subprocess.run(["pkill", "-f", "pw-play.*tts_"], capture_output=True, check=False)
 
-        def send_stop():
-            try:
-                if self._ws and self._ws_connected.is_set():
-                    stop_id = f"stop-{uuid.uuid4().hex[:8]}"
-                    with self._ws_lock:
-                        self._ws.send(json.dumps({
-                            "type": "req",
-                            "id": stop_id,
-                            "method": "chat.send",
-                            "params": {
-                                "sessionKey": GATEWAY_SESSION_KEY,
-                                "message": "/stop",
-                                "deliver": False,
-                                "idempotencyKey": stop_id,
-                            },
-                        }))
-                    self.logger.info("Sent /stop")
-            except Exception as e:
-                self.logger.warning(f"Failed to send /stop: {e}")
-
-        threading.Thread(target=send_stop, daemon=True).start()
+        # Signal end to TTS pipeline
+        if self._sentence_queue:
+            self._sentence_queue.put(None)
 
     def _delayed_dismiss(self):
         time.sleep(2)
@@ -936,6 +976,12 @@ class VoiceAssistant:
             self._play_chime_async("deactivate")
             # Dismiss all notifications after a short delay
             threading.Thread(target=self._delayed_dismiss, daemon=True).start()
+
+    def _new_session_handler(self, signum, frame):
+        """SIGUSR2 handler: clear session so next query starts fresh."""
+        self._clear_session()
+        self._notify("🔄 New conversation ready", title="Voice Assistant")
+        self._play_chime_async("deactivate")
 
     # ------------------------------------------------------------------
     # Audio capture
@@ -1051,7 +1097,27 @@ class VoiceAssistant:
                     pass
                 stream = None
                 prev_chunk = None
+                self._post_tts_gate = True
+                self._post_tts_silence_count = 0
                 self.logger.info("Flushed mic buffer (stream reset)")
+                continue
+
+            # After flush, wait for room to go quiet before listening
+            if self._post_tts_gate and stream is not None:
+                try:
+                    chunk = await loop.run_in_executor(
+                        None, self._read_chunk, stream, VAD_CHUNK_DURATION
+                    )
+                except OSError:
+                    continue
+                if self._detect_speech(chunk):
+                    self._post_tts_silence_count = 0
+                else:
+                    self._post_tts_silence_count += 1
+                    if self._post_tts_silence_count >= 3:
+                        self._post_tts_gate = False
+                        self._post_tts_silence_count = 0
+                        self.logger.info("Room quiet — resuming listening")
                 continue
 
             try:
@@ -1102,9 +1168,32 @@ class VoiceAssistant:
                 self.is_processing = False
                 return
 
-            # Filter hallucinations: too short, known patterns, low-content
+            # Check for new-session voice commands (before length filter)
             words = transcription.split()
             lower = transcription.lower().strip().rstrip(".")
+            if lower in _NEW_SESSION_PHRASES:
+                self.logger.info(f"Voice command: new session ({transcription})")
+                self._clear_session()
+                self._notify("🔄 New conversation started", title="Voice Assistant")
+                if self.tts_available and self.kokoro:
+                    self._set_waybar_status("speaking")
+                    try:
+                        samples, sr = self.kokoro.create(
+                            "Starting a new conversation.", voice=TTS_VOICE, speed=TTS_SPEED
+                        )
+                        path = self.tts_dir / "tts_new_session.wav"
+                        sf.write(str(path), samples, sr)
+                        subprocess.run(["pw-play", str(path)], capture_output=True, check=False)
+                        path.unlink(missing_ok=True)
+                    except Exception as e:
+                        self.logger.error(f"TTS confirmation error: {e}")
+                self.is_processing = False
+                self._flush_mic_buffer = True
+                if self.is_active:
+                    self._set_waybar_status("ready")
+                return
+
+            # Filter hallucinations: too short, known patterns, low-content
             if len(words) < 3:
                 self.logger.info(f"Rejected (too short): {transcription}")
                 self.is_processing = False
@@ -1143,10 +1232,6 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.error(f"Processing error: {e}")
         finally:
-            if did_tts:
-                # Keep draining mic after playback ends to clear any echo
-                # 1.5s wasn't enough — room reverb can linger longer
-                await asyncio.sleep(3.0)
             self._flush_mic_buffer = True
             self.is_processing = False
             if self.is_active:
