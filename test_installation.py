@@ -127,6 +127,44 @@ def main():
             tests_passed += 1
         total_tests += 1
     
+    # Test voice assistant runtime requirements
+    print("\n🔑 Runtime Requirements:")
+
+    # Claude Code --dangerously-skip-permissions
+    settings_file = Path.home() / ".claude/settings.json"
+    if settings_file.exists():
+        import json as _json
+        try:
+            _settings = _json.loads(settings_file.read_text())
+            if _settings.get("skipDangerousModePermissionPrompt"):
+                print("✅ Claude skipDangerousModePermissionPrompt: enabled")
+                tests_passed += 1
+            else:
+                print("❌ Claude skipDangerousModePermissionPrompt: not set")
+                print("   Fix: Add '\"skipDangerousModePermissionPrompt\": true' to ~/.claude/settings.json")
+        except Exception:
+            print("❌ Claude settings.json: could not parse")
+    else:
+        print("❌ Claude settings.json: not found")
+        print("   Fix: echo '{\"skipDangerousModePermissionPrompt\": true}' > ~/.claude/settings.json")
+    total_tests += 1
+
+    # Passwordless sudo
+    try:
+        sudo_result = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, text=True, timeout=5
+        )
+        if sudo_result.returncode == 0:
+            print("✅ Passwordless sudo: available")
+            tests_passed += 1
+        else:
+            user = os.getenv("USER", "user")
+            print("❌ Passwordless sudo: not available")
+            print(f"   Fix: echo '{user} ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/{user}")
+    except Exception as e:
+        print(f"❌ Passwordless sudo: FAILED - {e}")
+    total_tests += 1
+
     # Test special components
     print("\n🧠 AI Components:")
     if test_cuda():
