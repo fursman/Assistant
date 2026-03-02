@@ -1,18 +1,14 @@
 # Core dependencies
 numpy>=1.24.0
 pyaudio>=0.2.11
+soundfile>=0.12.0
 
-# AI/ML models
+# AI/ML models (local mode — skipped in remote mode by setup.sh)
 torch>=2.0.0
 torchaudio>=2.0.0
 faster-whisper>=0.9.0
-openai>=1.0.0
 onnxruntime-gpu>=1.16.0
 silero-vad>=4.0.1
 
-# Audio processing
-wave
-pathlib
-
-# System integration
-asyncio
+# Remote mode
+websockets>=12.0

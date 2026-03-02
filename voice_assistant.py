@@ -25,10 +25,18 @@ from typing import Optional
 
 import numpy as np
 import pyaudio
-import soundfile as sf
 import torch
-from faster_whisper import WhisperModel
 from silero_vad import load_silero_vad, get_speech_timestamps
+
+# Remote mode: set VOICE_REMOTE=hostname to offload STT+LLM+TTS to a server
+REMOTE_HOST = os.getenv("VOICE_REMOTE")
+REMOTE_PORT = int(os.getenv("VOICE_REMOTE_PORT", "8767"))
+
+if REMOTE_HOST:
+    import websockets
+else:
+    import soundfile as sf
+    from faster_whisper import WhisperModel
 
 
 # ---------------------------------------------------------------------------
@@ -352,51 +360,77 @@ class VoiceAssistant:
         """Verify critical runtime requirements at startup."""
         ok = True
 
-        # Claude Code must be installed
-        claude_path = subprocess.run(
-            ["which", "claude"], capture_output=True, text=True
-        ).stdout.strip()
-        if not claude_path:
-            self.logger.error("PREFLIGHT FAIL: 'claude' CLI not found in PATH")
-            ok = False
-        else:
-            self.logger.info(f"Claude CLI: {claude_path}")
-
-        # --dangerously-skip-permissions must be accepted in settings
-        settings_file = Path.home() / ".claude/settings.json"
-        if settings_file.exists():
+        if REMOTE_HOST:
+            # Remote mode: check WebSocket server reachability
             try:
-                settings = json.loads(settings_file.read_text())
-                if settings.get("skipDangerousModePermissionPrompt"):
-                    self.logger.info("Claude skipDangerousModePermissionPrompt: enabled")
+                loop = asyncio.new_event_loop()
+                async def _test():
+                    ws = await websockets.connect(
+                        f"ws://{REMOTE_HOST}:{REMOTE_PORT}", open_timeout=5)
+                    await ws.send(json.dumps({"type": "ping"}))
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5)
+                    await ws.close()
+                    return json.loads(resp)
+                result = loop.run_until_complete(_test())
+                loop.close()
+                if result.get("type") == "pong":
+                    self.logger.info(
+                        f"RemoteVoice server: ws://{REMOTE_HOST}:{REMOTE_PORT} OK")
                 else:
-                    self.logger.warning(
-                        "PREFLIGHT WARN: skipDangerousModePermissionPrompt not set in "
-                        "~/.claude/settings.json — voice assistant needs "
-                        "--dangerously-skip-permissions to work non-interactively"
-                    )
-            except (json.JSONDecodeError, Exception):
-                pass
+                    self.logger.error(
+                        f"Unexpected response from RemoteVoice server: {result}")
+                    ok = False
+            except Exception as e:
+                self.logger.error(
+                    f"PREFLIGHT FAIL: RemoteVoice server at "
+                    f"ws://{REMOTE_HOST}:{REMOTE_PORT} not reachable: {e}")
+                ok = False
         else:
-            self.logger.warning(
-                "PREFLIGHT WARN: ~/.claude/settings.json not found — "
-                "set skipDangerousModePermissionPrompt: true"
-            )
+            # Local mode: Claude Code must be installed
+            claude_path = subprocess.run(
+                ["which", "claude"], capture_output=True, text=True
+            ).stdout.strip()
+            if not claude_path:
+                self.logger.error("PREFLIGHT FAIL: 'claude' CLI not found in PATH")
+                ok = False
+            else:
+                self.logger.info(f"Claude CLI: {claude_path}")
 
-        # Passwordless sudo is required for system commands
-        sudo_check = subprocess.run(
-            ["sudo", "-n", "true"], capture_output=True, timeout=5
-        )
-        if sudo_check.returncode == 0:
-            self.logger.info("Passwordless sudo: available")
-        else:
-            self.logger.warning(
-                "PREFLIGHT WARN: passwordless sudo not available — "
-                "Claude may fail on system commands. "
-                "Fix: echo '%s ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/%s"
-                % (os.getenv("USER", "user"), os.getenv("USER", "user"))
+            # --dangerously-skip-permissions must be accepted in settings
+            settings_file = Path.home() / ".claude/settings.json"
+            if settings_file.exists():
+                try:
+                    settings = json.loads(settings_file.read_text())
+                    if settings.get("skipDangerousModePermissionPrompt"):
+                        self.logger.info("Claude skipDangerousModePermissionPrompt: enabled")
+                    else:
+                        self.logger.warning(
+                            "PREFLIGHT WARN: skipDangerousModePermissionPrompt not set in "
+                            "~/.claude/settings.json — voice assistant needs "
+                            "--dangerously-skip-permissions to work non-interactively"
+                        )
+                except (json.JSONDecodeError, Exception):
+                    pass
+            else:
+                self.logger.warning(
+                    "PREFLIGHT WARN: ~/.claude/settings.json not found — "
+                    "set skipDangerousModePermissionPrompt: true"
+                )
+
+            # Passwordless sudo is required for system commands
+            sudo_check = subprocess.run(
+                ["sudo", "-n", "true"], capture_output=True, timeout=5
             )
-            ok = False
+            if sudo_check.returncode == 0:
+                self.logger.info("Passwordless sudo: available")
+            else:
+                self.logger.warning(
+                    "PREFLIGHT WARN: passwordless sudo not available — "
+                    "Claude may fail on system commands. "
+                    "Fix: echo '%s ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/%s"
+                    % (os.getenv("USER", "user"), os.getenv("USER", "user"))
+                )
+                ok = False
 
         if ok:
             self.logger.info("Preflight checks passed")
@@ -464,13 +498,22 @@ class VoiceAssistant:
             self.vad_model = load_silero_vad(onnx=False)
             self.logger.info("Silero VAD loaded")
 
-            self.whisper_model = WhisperModel(
-                WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
-            )
-            self.logger.info("Faster Whisper loaded")
+            if REMOTE_HOST:
+                self.whisper_model = None
+                self.kokoro = None
+                self.tts_available = False
+                self._ws = None  # persistent WebSocket, connected lazily
+                self.logger.info(
+                    f"Remote mode: ws://{REMOTE_HOST}:{REMOTE_PORT} "
+                    "(Whisper/Kokoro on server)")
+            else:
+                self.whisper_model = WhisperModel(
+                    WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
+                )
+                self.logger.info("Faster Whisper loaded")
 
-            self._setup_tts()
-            self._warmup()
+                self._setup_tts()
+                self._warmup()
         except Exception as e:
             self.logger.error(f"Error loading models: {e}")
             sys.exit(1)
@@ -979,6 +1022,13 @@ class VoiceAssistant:
 
     def _new_session_handler(self, signum, frame):
         """SIGUSR2 handler: clear session so next query starts fresh."""
+        if REMOTE_HOST and self._ws:
+            # Tell the remote server to clear its session too
+            try:
+                asyncio.get_event_loop().create_task(
+                    self._ws.send(json.dumps({"type": "new_session"})))
+            except Exception:
+                pass
         self._clear_session()
         self._notify("🔄 New conversation ready", title="Voice Assistant")
         self._play_chime_async("deactivate")
@@ -1159,7 +1209,142 @@ class VoiceAssistant:
 
             await asyncio.sleep(0.05)
 
+    # ------------------------------------------------------------------
+    # Remote mode: WebSocket client
+    # ------------------------------------------------------------------
+
+    def _audio_to_wav_bytes(self, audio_data):
+        """Convert float32 numpy audio to WAV bytes for sending to server."""
+        import io
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes((audio_data * 32768).astype(np.int16).tobytes())
+        return buf.getvalue()
+
+    async def _ensure_ws(self):
+        """Ensure persistent WebSocket connection to RemoteVoice server."""
+        if self._ws is not None:
+            try:
+                await self._ws.ping()
+                return self._ws
+            except Exception:
+                self._ws = None
+        url = f"ws://{REMOTE_HOST}:{REMOTE_PORT}"
+        self.logger.info(f"Connecting to RemoteVoice: {url}")
+        self._ws = await websockets.connect(
+            url, ping_interval=20, ping_timeout=10, max_size=10_000_000)
+        return self._ws
+
+    async def _remote_process_audio(self, audio_data):
+        """Send audio to RemoteVoice server, receive and handle streaming events."""
+        try:
+            ws = await self._ensure_ws()
+
+            # Send audio as WAV binary
+            wav_bytes = self._audio_to_wav_bytes(audio_data.flatten())
+            await ws.send(wav_bytes)
+
+            self._play_chime_async("processing")
+
+            # Receive events until done
+            first_audio = True
+            while True:
+                if self._abort_event.is_set():
+                    break
+
+                msg = await asyncio.wait_for(ws.recv(), timeout=120)
+
+                if isinstance(msg, bytes):
+                    # Binary frame = WAV audio to play
+                    if self._abort_event.is_set():
+                        break
+                    if first_audio:
+                        self._set_waybar_status("speaking")
+                        first_audio = False
+                    path = self.tts_dir / f"tts_remote_{time.time()}.wav"
+                    path.write_bytes(msg)
+                    proc = subprocess.Popen(
+                        ["pw-play", str(path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    self._tts_process = proc
+                    await asyncio.get_event_loop().run_in_executor(None, proc.wait)
+                    self._tts_process = None
+                    path.unlink(missing_ok=True)
+                    continue
+
+                # Text frame = JSON event
+                try:
+                    event = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type")
+
+                if etype == "stt":
+                    text = event.get("text", "")
+                    self.logger.info(f"Transcription: {text}")
+                    self._notify(f"🎤 {text}", title="You Said")
+                    self._last_tts_text = text
+
+                elif etype == "thinking":
+                    text = event.get("text", "")
+                    self._notify(f"🧠 {text}", title="Thinking...", silent=True)
+
+                elif etype == "tool":
+                    labels = {
+                        "Bash": "Running command", "Read": "Reading file",
+                        "Edit": "Editing file", "Write": "Writing file",
+                        "Glob": "Searching files", "Grep": "Searching code",
+                        "WebSearch": "Searching web", "WebFetch": "Fetching page",
+                    }
+                    name = event.get("name", "")
+                    label = labels.get(name, f"Using {name}")
+                    detail = event.get("detail", "")
+                    msg_text = f"🔧 {label}"
+                    if detail:
+                        msg_text += f"\n{detail[:120]}"
+                    self._notify(msg_text, title="Working...", silent=True)
+
+                elif etype == "tts":
+                    # Next binary frame will be audio for this sentence
+                    text = event.get("text", "")
+                    self._last_tts_text = text
+                    self.logger.info(f"→ TTS: {text[:80]}...")
+
+                elif etype == "done":
+                    break
+
+                elif etype == "session_cleared":
+                    self._notify("🔄 New conversation ready", title="Voice Assistant")
+
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.error("RemoteVoice connection lost")
+            self._ws = None
+        except asyncio.TimeoutError:
+            self.logger.error("RemoteVoice timeout (120s)")
+        except Exception as e:
+            self.logger.error(f"Remote processing error: {e}")
+            self._ws = None
+
     async def _process_audio(self, audio_data):
+        if REMOTE_HOST:
+            try:
+                await self._remote_process_audio(audio_data)
+            finally:
+                self._flush_mic_buffer = True
+                self.is_processing = False
+                subprocess.run(
+                    ["swaync-client", "--close-all"],
+                    capture_output=True, check=False)
+                if self.is_active:
+                    self._set_waybar_status("ready")
+            return
+
         loop = asyncio.get_event_loop()
         did_tts = False
         try:

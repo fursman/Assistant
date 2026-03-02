@@ -1,0 +1,16 @@
+[Unit]
+Description=RemoteVoice Server (Whisper STT + Claude + Kokoro TTS)
+After=network.target kokoro-tts.service
+Wants=kokoro-tts.service
+
+[Service]
+Type=simple
+User=claw
+Environment="PATH=/home/claw/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 -u /home/claw/Assistant/RemoteVoice/server.py
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/home/claw/Assistant/RemoteVoice
+
+[Install]
+WantedBy=multi-user.target
