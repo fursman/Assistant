@@ -50,7 +50,7 @@ AUDIO_FORMAT = pyaudio.paInt16
 
 VAD_CHUNK_DURATION = 0.2
 RECORD_CHUNK_DURATION = 0.5
-SILENCE_TIMEOUT = 2.0
+SILENCE_TIMEOUT = 3.0
 MAX_RECORD_DURATION = 30
 
 WHISPER_MODEL = "small"
@@ -729,7 +729,7 @@ class VoiceAssistant:
             if len(to_send) >= 20:
                 self._last_thinking_notify = now
                 self._thinking_shown_len = prev_len + last_boundary
-                self._notify(f"🧠 {to_send}", title="Thinking...", silent=True)
+                self._notify(f"🧠 {to_send}", title="Thinking...", timeout_ms=5000)
 
     def _notify_tool_use(self, tool_name, input_json_str):
         """Show a tool-use notification with friendly label and details."""
@@ -773,7 +773,7 @@ class VoiceAssistant:
         now = time.time()
         if now - self._last_tool_notify >= 2.0:
             self._last_tool_notify = now
-            self._notify(f"🔧 {label}{detail}", title="Working...", silent=True)
+            self._notify(f"🔧 {label}{detail}", title="Working...", timeout_ms=5000)
 
     def _flush_sentences(self, final=False):
         """Extract complete sentences from _assistant_text beyond _assistant_spoken_pos."""
@@ -1069,20 +1069,18 @@ class VoiceAssistant:
         return False
 
     def _record_until_silence(self, stream, pre_audio=None):
-        self.vad_model.reset_states()
         frames = []
         silence_limit = int(SILENCE_TIMEOUT / RECORD_CHUNK_DURATION)
         silence_chunks = 0
         had_speech = pre_audio is not None
         if pre_audio is not None:
             frames.append(pre_audio)
-            self._detect_speech_streaming(pre_audio)  # prime model state
         for _ in range(int(MAX_RECORD_DURATION / RECORD_CHUNK_DURATION)):
             if not self.is_active:
                 break
             chunk = self._read_chunk(stream, RECORD_CHUNK_DURATION)
             frames.append(chunk)
-            if self._detect_speech_streaming(chunk):
+            if self._detect_speech(chunk):
                 had_speech = True
                 silence_chunks = 0
             elif had_speech:
@@ -1325,7 +1323,7 @@ class VoiceAssistant:
 
                 elif etype == "thinking":
                     text = event.get("text", "")
-                    self._notify(f"🧠 {text}", title="Thinking...", silent=True)
+                    self._notify(f"🧠 {text}", title="Thinking...", timeout_ms=5000)
 
                 elif etype == "tool":
                     labels = {
@@ -1340,13 +1338,14 @@ class VoiceAssistant:
                     msg_text = f"🔧 {label}"
                     if detail:
                         msg_text += f"\n{detail[:120]}"
-                    self._notify(msg_text, title="Working...", silent=True)
+                    self._notify(msg_text, title="Working...", timeout_ms=5000)
 
                 elif etype == "tts":
                     # Next binary frame will be audio for this sentence
                     text = event.get("text", "")
                     self._last_tts_text = text
                     self.logger.info(f"→ TTS: {text[:80]}...")
+                    self._notify(f"🗣️ {text[:200]}", title="Speaking...", timeout_ms=8000)
 
                 elif etype == "done":
                     break
