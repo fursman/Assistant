@@ -1371,13 +1371,10 @@ class VoiceAssistant:
             finally:
                 self.is_processing = False
                 if played_tts:
-                    # TTS was played through speakers — wait for room to go
-                    # quiet before resuming listening (avoids echo detection).
-                    # Set _post_tts_gate directly instead of _flush_mic_buffer
-                    # to avoid closing/reopening the stream, which can cause
-                    # PipeWire to stop delivering audio to the new stream.
-                    self._post_tts_gate = True
-                    self._post_tts_silence_count = 0
+                    # TTS was played — close/reopen stream to discard the
+                    # stale audio buffer (drain loop can't keep up with long
+                    # responses). Streaming VAD handles PipeWire reinit fine.
+                    self._flush_mic_buffer = True
                 subprocess.run(
                     ["swaync-client", "--close-all"],
                     capture_output=True, check=False)

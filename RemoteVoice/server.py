@@ -89,6 +89,72 @@ _MD_STRIP = re.compile(
     , re.MULTILINE
 )
 
+# Number words for speech normalization
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
+         "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+         "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+         "eighty", "ninety"]
+
+def _num_to_words(n: int) -> str:
+    if n < 0:
+        return "negative " + _num_to_words(-n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("" if n % 10 == 0 else " " + _ONES[n % 10])
+    if n < 1000:
+        rest = n % 100
+        return _ONES[n // 100] + " hundred" + ("" if rest == 0 else " and " + _num_to_words(rest))
+    if n < 1000000:
+        rest = n % 1000
+        return _num_to_words(n // 1000) + " thousand" + ("" if rest == 0 else " " + _num_to_words(rest))
+    if n < 1000000000:
+        rest = n % 1000000
+        return _num_to_words(n // 1000000) + " million" + ("" if rest == 0 else " " + _num_to_words(rest))
+    if n < 1000000000000:
+        rest = n % 1000000000
+        return _num_to_words(n // 1000000000) + " billion" + ("" if rest == 0 else " " + _num_to_words(rest))
+    return str(n)
+
+_ABBREVS = [
+    (re.compile(r"\bvs\."), "versus"),
+    (re.compile(r"\bvs\b"), "versus"),
+    (re.compile(r"\betc\."), "et cetera"),
+    (re.compile(r"\be\.g\.\s?"), "for example, "),
+    (re.compile(r"\bi\.e\.\s?"), "that is, "),
+    (re.compile(r"\bw/o\b"), "without"),
+    (re.compile(r"\bw/\b"), "with"),
+    (re.compile(r"\bGPUs\b"), "G P Us"),
+    (re.compile(r"\bGPU\b"), "G P U"),
+    (re.compile(r"\bCPUs\b"), "C P Us"),
+    (re.compile(r"\bCPU\b"), "C P U"),
+    (re.compile(r"\bVRAM\b"), "V ram"),
+    (re.compile(r"\bAPIs\b"), "A P Is"),
+    (re.compile(r"\bAPI\b"), "A P I"),
+    (re.compile(r"\bLLMs\b"), "L L Ms"),
+    (re.compile(r"\bLLM\b"), "L L M"),
+    (re.compile(r"\bTTS\b"), "T T S"),
+    (re.compile(r"\bSTT\b"), "S T T"),
+    (re.compile(r"\bUI\b"), "U I"),
+    (re.compile(r"\bURLs\b"), "U R Ls"),
+    (re.compile(r"\bURL\b"), "U R L"),
+    (re.compile(r"\bGB\b"), "gigabytes"),
+    (re.compile(r"\bMB\b"), "megabytes"),
+    (re.compile(r"\bTB\b"), "terabytes"),
+    (re.compile(r"\bSSH\b"), "S S H"),
+    (re.compile(r"\bNVLink\b"), "N V Link"),
+    (re.compile(r"\bRTX\b"), "R T X"),
+    (re.compile(r"\bRAM\b"), "ram"),
+    (re.compile(r"\bEDA\b"), "E D A"),
+    (re.compile(r"\bIMO\b"), "in my opinion"),
+    (re.compile(r"\bSOTA\b"), "state of the art"),
+    (re.compile(r"\bINT4\b"), "int four"),
+    (re.compile(r"\bINT8\b"), "int eight"),
+    (re.compile(r"\bFP16\b"), "F P sixteen"),
+    (re.compile(r"\bFP32\b"), "F P thirty-two"),
+]
+
 
 def _strip_markdown(text):
     text = re.sub(r"```[\s\S]*?```", "code block", text)
@@ -98,6 +164,71 @@ def _strip_markdown(text):
                 return g
         return ""
     return _MD_STRIP.sub(_pick, text).strip()
+
+
+def _prepare_for_speech(text):
+    """Strip markdown and normalize text for natural TTS pronunciation."""
+    text = re.sub(r"```[\s\S]*?```", "code block", text)
+    def _pick(m):
+        for g in m.groups():
+            if g is not None:
+                return g
+        return ""
+    text = _MD_STRIP.sub(_pick, text).strip()
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000feff]", "", text)
+    def _currency(m):
+        sign = m.group(1) or ""
+        whole = m.group(2).replace(",", "")
+        cents = m.group(4) or ""
+        prefix = "negative " if sign == "-" else ""
+        w = int(whole) if whole else 0
+        result = prefix + _num_to_words(w) + (" dollar" if w == 1 else " dollars")
+        if cents:
+            c = int(cents)
+            if c > 0:
+                result += " and " + _num_to_words(c) + (" cent" if c == 1 else " cents")
+        return result
+    text = re.sub(r"(-?)\$([0-9,]+)(\.(\d{1,2}))?", _currency, text)
+    def _percent(m):
+        whole = m.group(1)
+        dec = m.group(3)
+        result = _num_to_words(int(whole))
+        if dec:
+            result += " point " + " ".join(_ONES[int(d)] for d in dec)
+        return result + " percent"
+    text = re.sub(r"(\d+)(\.(\d+))?%", _percent, text)
+    def _multiplier(m):
+        whole = m.group(1)
+        dec = m.group(3)
+        result = _num_to_words(int(whole))
+        if dec:
+            result += " point " + " ".join(_ONES[int(d)] for d in dec)
+        return result + " x"
+    text = re.sub(r"(\d+)(\.(\d+))x\b", _multiplier, text)
+    def _decimal(m):
+        whole = m.group(1).replace(",", "")
+        dec = m.group(2)
+        result = _num_to_words(int(whole))
+        result += " point " + " ".join(_ONES[int(d)] for d in dec)
+        return result
+    text = re.sub(r"(\d[\d,]*)\.([\d]+)", _decimal, text)
+    def _big_num(m):
+        n = int(m.group(0).replace(",", ""))
+        return _num_to_words(n)
+    text = re.sub(r"\d{1,3}(?:,\d{3})+", _big_num, text)
+    text = re.sub(r"(\d)([A-Z]{2,})\b", r"\1 \2", text)
+    def _plain_num(m):
+        n = int(m.group(0))
+        if n <= 999999:
+            return _num_to_words(n)
+        return m.group(0)
+    text = re.sub(r"\b\d{1,6}\b", _plain_num, text)
+    for pattern, replacement in _ABBREVS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"(\w)/(\w)", r"\1 or \2", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 # ── Whisper STT ──────────────────────────────────────────────────────────
@@ -250,14 +381,14 @@ async def run_claude_pipeline(ws, text, client_id):
             if not match:
                 break
             end = match.end()
-            sentence = _strip_markdown(remaining[:end].strip())
+            sentence = _prepare_for_speech(remaining[:end].strip())
             remaining = remaining[end:]
             spoken_pos += end
             if sentence:
                 tts_queue.put_nowait(sentence)
 
         if final and remaining.strip():
-            sentence = _strip_markdown(remaining.strip())
+            sentence = _prepare_for_speech(remaining.strip())
             spoken_pos += len(remaining)
             if sentence:
                 tts_queue.put_nowait(sentence)
