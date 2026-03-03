@@ -1049,22 +1049,40 @@ class VoiceAssistant:
         timestamps = get_speech_timestamps(
             tensor, self.vad_model, sampling_rate=SAMPLE_RATE,
             min_speech_duration_ms=50,
+            threshold=0.3,
         )
         return len(timestamps) > 0
 
+    def _detect_speech_streaming(self, audio_data):
+        """Streaming speech detection that maintains VAD model state across calls.
+
+        Unlike _detect_speech (which resets state each call), this lets the model
+        build context across recording chunks for much more reliable detection
+        of speech with natural pauses.
+        """
+        _WINDOW = 512  # Silero VAD native window size at 16kHz
+        for i in range(0, len(audio_data) - _WINDOW + 1, _WINDOW):
+            chunk = torch.from_numpy(audio_data[i:i + _WINDOW])
+            prob = self.vad_model(chunk, SAMPLE_RATE).item()
+            if prob > 0.3:
+                return True
+        return False
+
     def _record_until_silence(self, stream, pre_audio=None):
+        self.vad_model.reset_states()
         frames = []
         silence_limit = int(SILENCE_TIMEOUT / RECORD_CHUNK_DURATION)
         silence_chunks = 0
         had_speech = pre_audio is not None
         if pre_audio is not None:
             frames.append(pre_audio)
+            self._detect_speech_streaming(pre_audio)  # prime model state
         for _ in range(int(MAX_RECORD_DURATION / RECORD_CHUNK_DURATION)):
             if not self.is_active:
                 break
             chunk = self._read_chunk(stream, RECORD_CHUNK_DURATION)
             frames.append(chunk)
-            if self._detect_speech(chunk):
+            if self._detect_speech_streaming(chunk):
                 had_speech = True
                 silence_chunks = 0
             elif had_speech:
@@ -1115,6 +1133,7 @@ class VoiceAssistant:
 
             if stream is None:
                 try:
+                    self.vad_model.reset_states()
                     stream = self.audio.open(
                         format=AUDIO_FORMAT, channels=CHANNELS, rate=SAMPLE_RATE,
                         input=True, input_device_index=self.input_device,
@@ -1159,13 +1178,14 @@ class VoiceAssistant:
                     )
                 except OSError:
                     continue
-                if self._detect_speech(chunk):
+                if self._detect_speech_streaming(chunk):
                     self._post_tts_silence_count = 0
                 else:
                     self._post_tts_silence_count += 1
                     if self._post_tts_silence_count >= 3:
                         self._post_tts_gate = False
                         self._post_tts_silence_count = 0
+                        self.vad_model.reset_states()
                         self.logger.info("Room quiet — resuming listening")
                 continue
 
@@ -1186,7 +1206,7 @@ class VoiceAssistant:
                 prev_chunk = None
                 continue
 
-            if self._detect_speech(audio_chunk):
+            if self._detect_speech_streaming(audio_chunk):
                 self._set_waybar_status("listening")
                 self.logger.info("Speech detected, recording...")
 
@@ -1245,6 +1265,14 @@ class VoiceAssistant:
         played_tts = False
         try:
             ws = await self._ensure_ws()
+
+            # Drain any stale messages left from a previously aborted interaction
+            try:
+                while True:
+                    await asyncio.wait_for(ws.recv(), timeout=0.01)
+                    self.logger.info("Drained stale WebSocket message")
+            except (asyncio.TimeoutError, Exception):
+                pass
 
             # Send audio as WAV binary
             wav_bytes = self._audio_to_wav_bytes(audio_data.flatten())
