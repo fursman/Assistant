@@ -48,8 +48,9 @@ CHANNELS = 1
 CHUNK_SIZE = 1024
 AUDIO_FORMAT = pyaudio.paInt16
 
-VAD_CHUNK_DURATION = 0.5
-SILENCE_TIMEOUT = 2.5
+VAD_CHUNK_DURATION = 0.2
+RECORD_CHUNK_DURATION = 0.5
+SILENCE_TIMEOUT = 2.0
 MAX_RECORD_DURATION = 30
 
 WHISPER_MODEL = "small"
@@ -1039,31 +1040,29 @@ class VoiceAssistant:
 
     def _read_chunk(self, stream, duration=0.5):
         num_frames = int(SAMPLE_RATE * duration)
-        frames = []
-        for _ in range(num_frames // CHUNK_SIZE):
-            data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-            frames.append(data)
-        if not frames:
-            return np.zeros(int(SAMPLE_RATE * duration), dtype=np.float32)
-        raw = np.frombuffer(b"".join(frames), dtype=np.int16)
+        data = stream.read(num_frames, exception_on_overflow=False)
+        raw = np.frombuffer(data, dtype=np.int16)
         return raw.astype(np.float32) / 32768.0
 
     def _detect_speech(self, audio_data):
         tensor = torch.from_numpy(audio_data)
-        timestamps = get_speech_timestamps(tensor, self.vad_model, sampling_rate=SAMPLE_RATE)
+        timestamps = get_speech_timestamps(
+            tensor, self.vad_model, sampling_rate=SAMPLE_RATE,
+            min_speech_duration_ms=50,
+        )
         return len(timestamps) > 0
 
     def _record_until_silence(self, stream, pre_audio=None):
         frames = []
-        silence_limit = int(SILENCE_TIMEOUT / VAD_CHUNK_DURATION)
+        silence_limit = int(SILENCE_TIMEOUT / RECORD_CHUNK_DURATION)
         silence_chunks = 0
         had_speech = pre_audio is not None
         if pre_audio is not None:
             frames.append(pre_audio)
-        for _ in range(int(MAX_RECORD_DURATION / VAD_CHUNK_DURATION)):
+        for _ in range(int(MAX_RECORD_DURATION / RECORD_CHUNK_DURATION)):
             if not self.is_active:
                 break
-            chunk = self._read_chunk(stream, VAD_CHUNK_DURATION)
+            chunk = self._read_chunk(stream, RECORD_CHUNK_DURATION)
             frames.append(chunk)
             if self._detect_speech(chunk):
                 had_speech = True
@@ -1239,7 +1238,11 @@ class VoiceAssistant:
         return self._ws
 
     async def _remote_process_audio(self, audio_data):
-        """Send audio to RemoteVoice server, receive and handle streaming events."""
+        """Send audio to RemoteVoice server, receive and handle streaming events.
+
+        Returns True if TTS audio was played, False otherwise.
+        """
+        played_tts = False
         try:
             ws = await self._ensure_ws()
 
@@ -1261,6 +1264,7 @@ class VoiceAssistant:
                     # Binary frame = WAV audio to play
                     if self._abort_event.is_set():
                         break
+                    played_tts = True
                     if first_audio:
                         self._set_waybar_status("speaking")
                         first_audio = False
@@ -1330,14 +1334,22 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.error(f"Remote processing error: {e}")
             self._ws = None
+        return played_tts
 
     async def _process_audio(self, audio_data):
         if REMOTE_HOST:
             try:
-                await self._remote_process_audio(audio_data)
+                played_tts = await self._remote_process_audio(audio_data)
             finally:
-                self._flush_mic_buffer = True
                 self.is_processing = False
+                if played_tts:
+                    # TTS was played through speakers — wait for room to go
+                    # quiet before resuming listening (avoids echo detection).
+                    # Set _post_tts_gate directly instead of _flush_mic_buffer
+                    # to avoid closing/reopening the stream, which can cause
+                    # PipeWire to stop delivering audio to the new stream.
+                    self._post_tts_gate = True
+                    self._post_tts_silence_count = 0
                 subprocess.run(
                     ["swaync-client", "--close-all"],
                     capture_output=True, check=False)
