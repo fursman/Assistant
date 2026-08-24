@@ -78,13 +78,20 @@ STT_ENGINE = os.getenv("VOICE_ASSISTANT_STT_ENGINE", "moonshine")
 #     tiny_streaming        0.03s
 #     medium_streaming      0.01s
 #
-# Because the compute overlaps with speech, a BIGGER streaming model costs
-# essentially nothing extra in perceived latency — medium_streaming is the
-# most accurate model Moonshine ships and still returns in ~10ms. It is not
-# the default only because it holds ~290MB more in RAM and burns more CPU
-# during speech, which matters on this thermally-limited laptop. If you want
-# the best accuracy and the machine is idle, set medium_streaming.
-MOONSHINE_MODEL = os.getenv("VOICE_ASSISTANT_MOONSHINE_MODEL", "tiny_streaming")
+# Because the compute overlaps with speech, a bigger streaming model is mostly
+# free in perceived latency — which is why small is the default rather than
+# tiny. Measured on 5 varied spoken commands (13s of audio):
+#
+#     model              WER     after-speech wait
+#     tiny_streaming    25.6%          0.02s
+#     small_streaming   12.8%          0.76s
+#     medium_streaming  12.8%          1.37s
+#
+# tiny gets roughly one word in four wrong, which is not usable. small halves
+# that. medium buys NO further accuracy here for nearly double the wait, so it
+# is not the default — but it is there if a harder microphone or accent shows
+# a difference that this synthetic test could not.
+MOONSHINE_MODEL = os.getenv("VOICE_ASSISTANT_MOONSHINE_MODEL", "small_streaming")
 
 WHISPER_MODEL = "small"
 # Device is decided at runtime by _pick_whisper_device(): CUDA when the dGPU is
