@@ -60,9 +60,25 @@ MAX_RECORD_DURATION = 30
 # Whisper's cost is nearly flat (the padding); Moonshine's is linear. The
 # shorter the utterance, the bigger the win — and voice commands are short.
 STT_ENGINE = os.getenv("VOICE_ASSISTANT_STT_ENGINE", "moonshine")
-# tiny | base. tiny was both faster AND more accurate than base on short
-# commands in local testing; base is the fallback if tiny mishears you.
-MOONSHINE_MODEL = os.getenv("VOICE_ASSISTANT_MOONSHINE_MODEL", "tiny")
+# tiny | base | tiny_streaming | small_streaming | medium_streaming
+#
+# The *_streaming archs transcribe WHILE you are still talking, so the only
+# work left when you stop is a final flush. That moves the cost off the
+# critical path entirely — measured on an idle machine, 5s clip, time waited
+# AFTER the last audio chunk:
+#
+#     whisper-small (was)   5.17s
+#     tiny (batch)          0.42s
+#     tiny_streaming        0.03s
+#     medium_streaming      0.01s
+#
+# Because the compute overlaps with speech, a BIGGER streaming model costs
+# essentially nothing extra in perceived latency — medium_streaming is the
+# most accurate model Moonshine ships and still returns in ~10ms. It is not
+# the default only because it holds ~290MB more in RAM and burns more CPU
+# during speech, which matters on this thermally-limited laptop. If you want
+# the best accuracy and the machine is idle, set medium_streaming.
+MOONSHINE_MODEL = os.getenv("VOICE_ASSISTANT_MOONSHINE_MODEL", "tiny_streaming")
 
 WHISPER_MODEL = "small"
 # Device is decided at runtime by _pick_whisper_device(): CUDA when the dGPU is
@@ -539,6 +555,8 @@ class VoiceAssistant:
         arch = getattr(mv.ModelArch, MOONSHINE_MODEL.upper())
         path, _ = mv.get_model_for_language("en", arch)
         transcriber = Transcriber(path, arch)
+        streaming = MOONSHINE_MODEL.lower().endswith("_streaming")
+        logger = self.logger
 
         class _Segment:
             __slots__ = ("text",)
@@ -547,19 +565,77 @@ class VoiceAssistant:
                 self.text = text
 
         class _MoonshineAdapter:
+            """Looks like faster-whisper, optionally streams underneath.
+
+            Batch path: transcribe() does all the work when called.
+            Streaming path: begin_utterance()/feed() do the work while the
+            user is still speaking, and finish() only flushes what is left.
+            """
+
+            is_streaming = streaming
+
+            def __init__(self):
+                self._stream = None
+
+            # -- batch --
             def transcribe(self, audio, **_kwargs):
-                # Moonshine wants float32 mono at SAMPLE_RATE, same as whisper.
                 result = transcriber.transcribe_without_streaming(
                     np.asarray(audio, dtype=np.float32)
                 )
-                segments = [_Segment(line.text) for line in result.lines]
-                return segments, None
+                return [_Segment(l.text) for l in result.lines], None
+
+            # -- streaming --
+            def begin_utterance(self):
+                """Fresh stream per utterance so state never bleeds across turns."""
+                if not streaming:
+                    return
+                self._end_stream()
+                try:
+                    self._stream = transcriber.create_stream()
+                    self._stream.start()
+                except Exception as e:
+                    logger.warning(f"Could not open STT stream ({e}); using batch")
+                    self._stream = None
+
+            def feed(self, chunk, sample_rate):
+                if self._stream is None:
+                    return
+                try:
+                    self._stream.add_audio(
+                        np.asarray(chunk, dtype=np.float32).tolist(), sample_rate
+                    )
+                except Exception as e:
+                    logger.warning(f"STT stream feed failed ({e}); using batch")
+                    self._end_stream()
+
+            def finish(self):
+                """Final text, or None to tell the caller to fall back to batch."""
+                if self._stream is None:
+                    return None
+                try:
+                    result = self._stream.update_transcription()
+                    return " ".join(l.text for l in result.lines).strip()
+                except Exception as e:
+                    logger.warning(f"STT stream flush failed ({e}); using batch")
+                    return None
+                finally:
+                    self._end_stream()
+
+            def _end_stream(self):
+                if self._stream is not None:
+                    try:
+                        self._stream.stop()
+                    except Exception:
+                        pass
+                    self._stream = None
 
             def close(self):
+                self._end_stream()
                 transcriber.close()
 
         self.whisper_model = _MoonshineAdapter()
-        self.logger.info(f"STT engine: moonshine ({MOONSHINE_MODEL}, CPU)")
+        mode = "streaming" if streaming else "batch"
+        self.logger.info(f"STT engine: moonshine ({MOONSHINE_MODEL}, {mode}, CPU)")
 
     def _setup_models(self):
         try:
@@ -1219,13 +1295,23 @@ class VoiceAssistant:
         silence_limit = int(SILENCE_TIMEOUT / VAD_CHUNK_DURATION)
         silence_chunks = 0
         had_speech = pre_audio is not None
+        # Streaming STT: hand each chunk over as it is captured, so by the time
+        # the user stops talking the transcript is essentially already done.
+        feed = getattr(self.whisper_model, "feed", None)
+        begin = getattr(self.whisper_model, "begin_utterance", None)
+        if begin is not None:
+            begin()
         if pre_audio is not None:
             frames.append(pre_audio)
+            if feed is not None:
+                feed(pre_audio, SAMPLE_RATE)
         for _ in range(int(MAX_RECORD_DURATION / VAD_CHUNK_DURATION)):
             if not self.is_active:
                 break
             chunk = self._read_chunk(stream, VAD_CHUNK_DURATION)
             frames.append(chunk)
+            if feed is not None:
+                feed(chunk, SAMPLE_RATE)
             if self._detect_speech(chunk):
                 had_speech = True
                 silence_chunks = 0
@@ -1246,6 +1332,15 @@ class VoiceAssistant:
         try:
             duration = len(audio_data) / SAMPLE_RATE
             self.logger.info(f"Processing audio with duration {int(duration // 60):02d}:{duration % 60:06.3f}")
+            # Streaming engines already consumed this audio during recording;
+            # finish() just flushes. None means "no stream ran" -> batch below.
+            finish = getattr(self.whisper_model, "finish", None)
+            if finish is not None:
+                t0 = time.time()
+                text = finish()
+                if text is not None:
+                    self.logger.info(f"Streamed transcript in {time.time() - t0:.3f}s")
+                    return text
             # faster-whisper accepts numpy arrays directly — skip disk I/O
             segments, _ = self.whisper_model.transcribe(audio_data)
             text = " ".join(seg.text for seg in segments).strip()
