@@ -1,6 +1,6 @@
 [Unit]
 Description=Hyprland Voice Assistant (Claude Code)
-Documentation=https://github.com/user/voice-assistant
+Documentation=https://github.com/fursman/Assistant
 After=pipewire.service
 Wants=pipewire.service
 
@@ -10,10 +10,10 @@ ExecStart=%h/.local/bin/voice-assistant
 Restart=on-failure
 RestartSec=5
 Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="PYTHONPATH=%h/voice-assistant/.venv/lib/python3.13/site-packages"
 Environment="WAYLAND_DISPLAY=wayland-1"
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
-WorkingDirectory=%h/voice-assistant
+# For remote mode, uncomment and set:
+# Environment="VOICE_REMOTE=clawbox.local"
 
 # Logging
 StandardOutput=journal
