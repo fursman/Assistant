@@ -115,9 +115,28 @@ pip install -e .
 log_info "Pre-downloading Moonshine STT model..."
 python3 -c "
 import moonshine_voice as mv
-mv.get_model_for_language('en', mv.ModelArch.TINY_STREAMING)
+mv.get_model_for_language('en', mv.ModelArch.SMALL_STREAMING)
 print('Moonshine streaming model cached')
 "
+
+# Kokoro TTS weights. These are ~340MB of binary and are NOT in this repo, so
+# a fresh clone has no voice at all until they are fetched -- download them
+# rather than leaving the first run to fail into the espeak fallback.
+KOKORO_RELEASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+for f in kokoro-v1.0.onnx voices-v1.0.bin; do
+    if [[ -s "$f" ]]; then
+        log_info "$f already present"
+    else
+        log_info "Downloading $f ..."
+        if ! curl -fL --retry 3 -o "$f.part" "$KOKORO_RELEASE/$f"; then
+            rm -f "$f.part"
+            log_error "Failed to download $f — TTS will fall back to espeak"
+            log_error "  fetch manually from $KOKORO_RELEASE/$f"
+        else
+            mv "$f.part" "$f"      # only rename once complete, so a killed
+        fi                          # download never looks like a good file
+    fi
+done
 
 # ── Executable Script ────────────────────────────────────────────────────
 
