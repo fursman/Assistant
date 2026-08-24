@@ -45,13 +45,34 @@ SILENCE_TIMEOUT = 2.5
 MAX_RECORD_DURATION = 30
 
 WHISPER_MODEL = "small"
-WHISPER_DEVICE = "cuda"
-WHISPER_COMPUTE = "float16"
+# Device is decided at runtime by _pick_whisper_device(): CUDA when the dGPU is
+# actually usable, CPU otherwise. The point is GPU passthrough -- while the card
+# is bound to vfio-pci for the Windows VM, torch sees no CUDA and a hardcoded
+# "cuda" would abort the whole assistant at startup. Override with
+# VOICE_ASSISTANT_WHISPER_DEVICE=cpu|cuda.
+WHISPER_DEVICE_OVERRIDE = os.getenv("VOICE_ASSISTANT_WHISPER_DEVICE", "auto")
 
 TTS_VOICE = "af_heart"
 TTS_SPEED = 1.0
+# TTS stays on the CPU unconditionally: Kokoro-82M is small and non-
+# autoregressive, so CPU synthesis is comfortably faster than realtime, and
+# pinning it here means speech keeps working while the GPU is passed through.
+# Engine: kokoro (default, vendored model files) | pocket | supertonic.
+TTS_ENGINE = os.getenv("VOICE_ASSISTANT_TTS_ENGINE", "kokoro")
+# Full precision, deliberately. The onnx-community quantized builds (q8f16
+# ~83MB, quantized ~89MB) load and run, but benchmarked 4.6x SLOWER on this
+# CPU (3.4s vs 0.74s per utterance): int8 needs hardware acceleration to pay
+# off, and without it the dequantize overhead dominates. They also name their
+# token input "input_ids" where kokoro-onnx feeds "tokens", so they are not
+# drop-in compatible with the package anyway.
+TTS_MODEL = os.getenv("VOICE_ASSISTANT_TTS_MODEL", "kokoro-v1.0.onnx")
+TTS_VOICES = os.getenv("VOICE_ASSISTANT_TTS_VOICES", "voices-v1.0.bin")
 
-CLAUDE_MODEL = os.getenv("VOICE_ASSISTANT_MODEL", "sonnet")
+CLAUDE_MODEL = os.getenv("VOICE_ASSISTANT_MODEL", "opus")
+# Deepest reasoning by default. The thinking stream is already surfaced as 🧠
+# notifications, so the extra latency is at least visible while it happens.
+# Valid: low, medium, high, xhigh, max.
+CLAUDE_EFFORT = os.getenv("VOICE_ASSISTANT_EFFORT", "max")
 CLAUDE_VOICE_PROMPT = (
     "You are a voice assistant integrated into a Linux desktop (Hyprland on Wayland). "
     "The user speaks to you and hears your responses via text-to-speech. "
@@ -459,15 +480,55 @@ class VoiceAssistant:
             f"native rate: {int(default_info['defaultSampleRate'])})"
         )
 
+    def _pick_whisper_device(self):
+        """Choose CUDA or CPU for STT, honouring an explicit override.
+
+        In GPU-passthrough mode the dGPU is bound to vfio-pci and CUDA simply
+        is not there; float16 on CPU is also not supported by CTranslate2, so
+        the compute type has to move with the device.
+        """
+        want = WHISPER_DEVICE_OVERRIDE
+        if want not in ("auto", "cpu", "cuda"):
+            self.logger.warning(f"Unknown whisper device {want!r}, using auto")
+            want = "auto"
+
+        if want == "cpu":
+            return "cpu", "int8"
+        if want == "cuda":
+            return "cuda", "float16"
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda", "float16"
+            self.logger.info("No CUDA visible (GPU passed through?) — STT on CPU")
+        except Exception as e:
+            self.logger.info(f"CUDA probe failed ({e}) — STT on CPU")
+        return "cpu", "int8"
+
     def _setup_models(self):
         try:
             self.vad_model = load_silero_vad(onnx=False)
             self.logger.info("Silero VAD loaded")
 
-            self.whisper_model = WhisperModel(
-                WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
-            )
-            self.logger.info("Faster Whisper loaded")
+            device, compute = self._pick_whisper_device()
+            try:
+                self.whisper_model = WhisperModel(
+                    WHISPER_MODEL, device=device, compute_type=compute
+                )
+            except Exception as e:
+                # A CUDA build can still fail at load time (driver mismatch,
+                # card grabbed mid-session). Never let STT take the whole
+                # assistant down when CPU would have worked.
+                if device == "cuda":
+                    self.logger.warning(f"CUDA Whisper failed ({e}) — falling back to CPU")
+                    device, compute = "cpu", "int8"
+                    self.whisper_model = WhisperModel(
+                        WHISPER_MODEL, device=device, compute_type=compute
+                    )
+                else:
+                    raise
+            self.logger.info(f"Faster Whisper loaded ({device}/{compute})")
 
             self._setup_tts()
             self._warmup()
@@ -476,24 +537,107 @@ class VoiceAssistant:
             sys.exit(1)
 
     def _setup_tts(self):
+        """Load a CPU TTS engine.
+
+        Engine is chosen by VOICE_ASSISTANT_TTS_ENGINE (kokoro|pocket|supertonic).
+        Whichever loads, `self.kokoro` ends up exposing the same call the rest of
+        this file already makes:
+
+            samples, sample_rate = self.kokoro.create(text, voice=..., speed=...)
+
+        so the streaming/playback paths never learn which engine won.
+
+        Everything here is deliberately CPU-only. onnxruntime-gpu may be present
+        for other things and would otherwise grab CUDAExecutionProvider, which
+        hard-fails the moment the dGPU is handed to the Windows VM. These models
+        are all ~100M and non-autoregressive (or explicitly CPU-realtime), so CPU
+        synthesis beats realtime anyway: pinning costs nothing and makes speech
+        survive passthrough.
+        """
         self.tts_available = False
         self.kokoro = None
-        try:
-            from kokoro_onnx import Kokoro
-            self.kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-            self.tts_available = True
-            self.logger.info("Kokoro TTS loaded")
-        except ImportError:
-            self.logger.warning("kokoro-onnx not installed, using espeak fallback")
-        except Exception as e:
-            self.logger.warning(f"Kokoro TTS setup failed: {e}")
+
+        # Read by kokoro-onnx when it builds its InferenceSession.
+        os.environ.setdefault("ONNX_PROVIDER", "CPUExecutionProvider")
+
+        engine = TTS_ENGINE.lower()
+        loaders = {
+            "kokoro": self._load_kokoro,
+            "pocket": self._load_pocket,
+            "supertonic": self._load_supertonic,
+        }
+        if engine not in loaders:
+            self.logger.warning(f"Unknown TTS engine {engine!r}, using kokoro")
+            engine = "kokoro"
+
+        # Try the requested engine, then fall back to kokoro (the one whose
+        # model files are vendored next to this script).
+        order = [engine] + [e for e in ("kokoro",) if e != engine]
+        for name in order:
             try:
-                from kokoro_onnx import Kokoro
-                self.kokoro = Kokoro.from_pretrained()
-                self.tts_available = True
-                self.logger.info("Kokoro TTS loaded from pretrained")
-            except Exception as e2:
-                self.logger.warning(f"Kokoro fallback also failed: {e2}, using espeak")
+                if loaders[name]():
+                    self.tts_available = True
+                    self.logger.info(f"TTS engine: {name} (CPU)")
+                    return
+            except ImportError as e:
+                self.logger.warning(f"TTS engine {name!r} not installed ({e})")
+            except Exception as e:
+                self.logger.warning(f"TTS engine {name!r} failed to load: {e}")
+        self.logger.warning("No TTS engine loaded, using espeak fallback")
+
+    def _load_kokoro(self) -> bool:
+        from kokoro_onnx import Kokoro
+        try:
+            self.kokoro = Kokoro(TTS_MODEL, TTS_VOICES)
+            self.logger.info(f"Kokoro model: {TTS_MODEL}")
+        except Exception as e:
+            self.logger.warning(f"Kokoro {TTS_MODEL} failed ({e}), trying pretrained")
+            self.kokoro = Kokoro.from_pretrained()
+        return True
+
+    def _load_pocket(self) -> bool:
+        """Kyutai Pocket TTS (~100M, CPU-realtime, preset voices).
+
+        Its native API is generate_audio(voice_state, text) at a fixed sample
+        rate, so wrap it in the create() shape the rest of the file expects.
+        Speed is not supported upstream; it is accepted and ignored rather than
+        silently changing pitch.
+        """
+        from pocket_tts import TTSModel
+
+        model = TTSModel.load_model()
+        voice = os.getenv("VOICE_ASSISTANT_POCKET_VOICE", "alba")
+        state = model.get_state_for_audio_prompt(voice)
+        sample_rate = model.sample_rate
+
+        class _PocketAdapter:
+            def create(self, text, voice=None, speed=None):
+                audio = model.generate_audio(state, text)
+                samples = audio.numpy() if hasattr(audio, "numpy") else np.asarray(audio)
+                return np.asarray(samples, dtype=np.float32).squeeze(), sample_rate
+
+        self.kokoro = _PocketAdapter()
+        self.logger.info(f"Pocket TTS voice: {voice}")
+        return True
+
+    def _load_supertonic(self) -> bool:
+        """Supertonic 3 (~99M, ONNX, 31 languages, preset voice styles)."""
+        from supertonic import TTS as SupertonicTTS
+
+        model = SupertonicTTS(auto_download=True)
+        voice = os.getenv("VOICE_ASSISTANT_SUPERTONIC_VOICE", "M1")
+        style = model.get_voice_style(voice_name=voice)
+
+        class _SupertonicAdapter:
+            def create(self, text, voice=None, speed=None):
+                wav, _duration = model.synthesize(text, voice_style=style, lang="en")
+                samples = wav.numpy() if hasattr(wav, "numpy") else np.asarray(wav)
+                sr = getattr(model, "sample_rate", 44100)
+                return np.asarray(samples, dtype=np.float32).squeeze(), sr
+
+        self.kokoro = _SupertonicAdapter()
+        self.logger.info(f"Supertonic voice: {voice}")
+        return True
 
     def _warmup(self):
         self.logger.info("Warming up models...")
@@ -586,6 +730,7 @@ class VoiceAssistant:
             "--include-partial-messages",
             "--dangerously-skip-permissions",
             "--model", CLAUDE_MODEL,
+            "--effort", CLAUDE_EFFORT,
             "--append-system-prompt", CLAUDE_VOICE_PROMPT,
         ]
         if self._session_id:
