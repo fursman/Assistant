@@ -44,6 +44,26 @@ VAD_CHUNK_DURATION = 0.5
 SILENCE_TIMEOUT = 2.5
 MAX_RECORD_DURATION = 30
 
+# STT engine: "moonshine" (default) or "whisper".
+#
+# Moonshine wins decisively for voice commands because of one architectural
+# difference: Whisper zero-pads EVERY clip to 30 seconds, so a 2-second command
+# costs the same as a 30-second one. Moonshine's encoder is variable-length, so
+# cost scales with what you actually said. Measured on this machine (throttled,
+# so absolute numbers are pessimistic — the ratio is what matters):
+#
+#     clip    whisper-small/int8    moonshine-tiny
+#      2s          8.29s               0.20s      <- 41x
+#      5s          9.33s               0.45s      <- 21x
+#     10s         14.47s               0.91s      <- 16x
+#
+# Whisper's cost is nearly flat (the padding); Moonshine's is linear. The
+# shorter the utterance, the bigger the win — and voice commands are short.
+STT_ENGINE = os.getenv("VOICE_ASSISTANT_STT_ENGINE", "moonshine")
+# tiny | base. tiny was both faster AND more accurate than base on short
+# commands in local testing; base is the fallback if tiny mishears you.
+MOONSHINE_MODEL = os.getenv("VOICE_ASSISTANT_MOONSHINE_MODEL", "tiny")
+
 WHISPER_MODEL = "small"
 # Device is decided at runtime by _pick_whisper_device(): CUDA when the dGPU is
 # actually usable, CPU otherwise. The point is GPU passthrough -- while the card
@@ -506,10 +526,56 @@ class VoiceAssistant:
             self.logger.info(f"CUDA probe failed ({e}) — STT on CPU")
         return "cpu", "int8"
 
+    def _load_moonshine(self):
+        """Moonshine STT, wrapped to look like faster-whisper.
+
+        Returns an object exposing `.transcribe(audio) -> (segments, info)`
+        where each segment has `.text`, so the call sites never learn which
+        engine is running.
+        """
+        import moonshine_voice as mv
+        from moonshine_voice.transcriber import Transcriber
+
+        arch = getattr(mv.ModelArch, MOONSHINE_MODEL.upper())
+        path, _ = mv.get_model_for_language("en", arch)
+        transcriber = Transcriber(path, arch)
+
+        class _Segment:
+            __slots__ = ("text",)
+
+            def __init__(self, text):
+                self.text = text
+
+        class _MoonshineAdapter:
+            def transcribe(self, audio, **_kwargs):
+                # Moonshine wants float32 mono at SAMPLE_RATE, same as whisper.
+                result = transcriber.transcribe_without_streaming(
+                    np.asarray(audio, dtype=np.float32)
+                )
+                segments = [_Segment(line.text) for line in result.lines]
+                return segments, None
+
+            def close(self):
+                transcriber.close()
+
+        self.whisper_model = _MoonshineAdapter()
+        self.logger.info(f"STT engine: moonshine ({MOONSHINE_MODEL}, CPU)")
+
     def _setup_models(self):
         try:
             self.vad_model = load_silero_vad(onnx=False)
             self.logger.info("Silero VAD loaded")
+
+            if STT_ENGINE.lower() == "moonshine":
+                try:
+                    self._load_moonshine()
+                    self._setup_tts()
+                    self._warmup()
+                    return
+                except Exception as e:
+                    self.logger.warning(
+                        f"Moonshine unavailable ({e}) — falling back to Whisper"
+                    )
 
             device, compute = self._pick_whisper_device()
             try:
@@ -644,7 +710,7 @@ class VoiceAssistant:
         dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
         segments, _ = self.whisper_model.transcribe(dummy)
         list(segments)
-        self.logger.info("Whisper warmup complete")
+        self.logger.info("STT warmup complete")
 
         if self.tts_available and self.kokoro:
             self.logger.info("Warming up Kokoro TTS...")

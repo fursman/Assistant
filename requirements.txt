@@ -11,7 +11,11 @@ torch>=2.0.0
 torchaudio>=2.0.0
 silero-vad>=4.0.1
 
-# STT
+# STT. Moonshine is the default engine: its encoder is variable-length, while
+# Whisper zero-pads every clip to 30s, so on short voice commands Moonshine is
+# ~40x faster on CPU (2s clip: 0.20s vs 8.29s). faster-whisper is kept as the
+# fallback and for long-form audio.
+moonshine-voice>=0.1.3
 faster-whisper>=0.9.0
 
 # TTS: kokoro-onnx is the default engine. onnxruntime (NOT -gpu) keeps
