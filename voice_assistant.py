@@ -1676,7 +1676,30 @@ class VoiceAssistant:
             self._cleanup()
 
 
+def _discover_wayland_display():
+    """Point WAYLAND_DISPLAY at whatever socket this session actually uses.
+
+    The systemd unit cannot hardcode this: the socket is named per session
+    (wayland-0, wayland-1, ...), so a fixed value works on the machine it was
+    written for and silently breaks notifications, hyprctl and waybar updates
+    everywhere else. Everything downstream is a subprocess, so fixing it in
+    os.environ is enough.
+    """
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    try:
+        socks = sorted(
+            p.name for p in Path(runtime).glob("wayland-*") if not p.name.endswith(".lock")
+        )
+    except OSError:
+        socks = []
+    if socks:
+        os.environ["WAYLAND_DISPLAY"] = socks[0]
+
+
 def main():
+    _discover_wayland_display()
     assistant = VoiceAssistant()
     assistant.run()
 

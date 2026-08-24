@@ -10,8 +10,12 @@ ExecStart=%h/.local/bin/voice-assistant
 Restart=on-failure
 RestartSec=5
 Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="WAYLAND_DISPLAY=wayland-1"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
+# %t is systemd's runtime directory (/run/user/$UID) -- do not hardcode 1000,
+# it is wrong for any user who is not the first one on the machine.
+Environment="XDG_RUNTIME_DIR=%t"
+# WAYLAND_DISPLAY is deliberately NOT set here: the socket is named per
+# session (wayland-0, wayland-1, ...), so any fixed value is wrong somewhere.
+# voice_assistant.py discovers it at startup instead.
 
 # Logging
 StandardOutput=journal

@@ -111,6 +111,27 @@ pip install -r requirements.txt
 log_info "Installing voice-assistant package..."
 pip install -e .
 
+# The `claude` CLI is a hard dependency, not an optional extra -- it IS the
+# LLM half of the pipeline, and the assistant's preflight fails without it.
+# A fresh install has no reason to already have it, so install it here rather
+# than letting the first run die on a missing binary.
+if command -v claude &>/dev/null; then
+    log_info "claude CLI: $(command -v claude)"
+else
+    log_info "Installing claude CLI (native installer)..."
+    if curl -fsSL https://claude.ai/install.sh | bash; then
+        # The installer drops a symlink in ~/.local/bin, which may not be on
+        # PATH yet in this shell.
+        export PATH="$HOME/.local/bin:$PATH"
+        command -v claude &>/dev/null \
+            && log_success "claude CLI installed: $(claude --version 2>&1 | head -1)" \
+            || log_warning "claude installed but not on PATH — add ~/.local/bin to PATH"
+    else
+        log_error "claude CLI install failed — the assistant cannot answer without it"
+        log_error "  install manually: https://claude.ai/install.sh"
+    fi
+fi
+
 # Pre-download the STT model so the first run is not a surprise download.
 log_info "Pre-downloading Moonshine STT model..."
 python3 -c "
