@@ -26,25 +26,14 @@ fi
 
 # ── GPU Detection ────────────────────────────────────────────────────────
 
-INSTALL_MODE="local"
-REMOTE_SERVER=""
-
-if nvidia-smi &>/dev/null; then
-    log_success "NVIDIA GPU detected — installing in LOCAL mode (full pipeline)"
-else
-    log_warning "No GPU detected — installing in REMOTE mode (thin client)"
-    INSTALL_MODE="remote"
-    echo
-    echo "Remote mode offloads STT, Claude, and TTS to a server with a GPU."
-    echo "You need a RemoteVoice server running (see RemoteVoice/server.py)."
-    echo
-    read -p "Enter voice server address (e.g. clawbox.local): " REMOTE_SERVER
-    if [[ -z "$REMOTE_SERVER" ]]; then
-        log_error "Server address is required for remote mode"
-        exit 1
-    fi
-    log_info "Remote server: $REMOTE_SERVER"
-fi
+# No GPU detection: the pipeline is CPU-only by design.
+#
+# Moonshine's streaming STT returns ~0.03s after you stop speaking and Kokoro
+# TTS is a small non-autoregressive ONNX model, so a GPU buys nothing here --
+# and the one remaining network call (the `claude` CLI) is an API request that
+# no local hardware speeds up. Staying on the CPU also means the assistant keeps
+# working while the dGPU is passed through to a VM.
+log_info "Installing CPU pipeline (Moonshine STT + Kokoro TTS + claude CLI)"
 
 # ── System Requirements ──────────────────────────────────────────────────
 
@@ -108,54 +97,27 @@ source .venv/bin/activate
 log_info "Upgrading pip..."
 pip install --upgrade pip wheel setuptools
 
-# ── Install Dependencies (mode-dependent) ────────────────────────────────
+# ── Install Dependencies ─────────────────────────────────────────────────
 
-if [[ "$INSTALL_MODE" == "local" ]]; then
-    # LOCAL MODE: full GPU stack
-    log_info "Installing PyTorch with CUDA 12.8 support..."
-    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+# CPU-only, deliberately. torch is here purely for Silero VAD, so the CUDA
+# build would be ~3.7GB of dead weight (it took the venv from 1.5GB to 5.2GB).
+log_info "Installing CPU-only PyTorch (for Silero VAD)..."
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-    log_info "Installing Python dependencies (full)..."
-    pip install -r requirements.txt
+log_info "Installing Python dependencies..."
+pip install -r requirements.txt
 
-    # Install project
-    log_info "Installing voice-assistant package..."
-    pip install -e .
+# Install project
+log_info "Installing voice-assistant package..."
+pip install -e .
 
-    # Download and cache Whisper model
-    log_info "Pre-downloading Whisper models..."
-    python3 -c "
-from faster_whisper import WhisperModel
-print('Downloading Whisper small model...')
-model = WhisperModel('small', device='cuda', compute_type='float16')
-print('Whisper model downloaded and cached')
+# Pre-download the STT model so the first run is not a surprise download.
+log_info "Pre-downloading Moonshine STT model..."
+python3 -c "
+import moonshine_voice as mv
+mv.get_model_for_language('en', mv.ModelArch.TINY_STREAMING)
+print('Moonshine streaming model cached')
 "
-
-    # Test CUDA
-    log_info "Testing CUDA availability..."
-    python3 -c "
-import torch
-print(f'CUDA available: {torch.cuda.is_available()}')
-if torch.cuda.is_available():
-    print(f'CUDA device: {torch.cuda.get_device_name()}')
-    print(f'CUDA version: {torch.version.cuda}')
-else:
-    print('WARNING: CUDA not available for PyTorch')
-"
-else
-    # REMOTE MODE: lightweight deps only (CPU torch for Silero VAD)
-    log_info "Installing CPU-only PyTorch (for Silero VAD)..."
-    pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-    log_info "Installing Python dependencies (remote mode)..."
-    pip install numpy pyaudio silero-vad websockets
-
-    # Install project
-    log_info "Installing voice-assistant package..."
-    pip install -e .
-
-    log_info "Skipping Whisper/Kokoro (handled by remote server)"
-fi
 
 # ── Executable Script ────────────────────────────────────────────────────
 
@@ -175,39 +137,7 @@ chmod +x ~/.local/bin/voice-assistant
 
 log_info "Installing systemd user service..."
 
-if [[ "$INSTALL_MODE" == "remote" ]]; then
-    # Generate service file with remote env vars
-    cat > ~/.config/systemd/user/voice-assistant.service << SVCEOF
-[Unit]
-Description=Hyprland Voice Assistant (Remote Mode)
-Documentation=https://github.com/fursman/Assistant
-After=pipewire.service
-Wants=pipewire.service
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/voice-assistant
-Restart=on-failure
-RestartSec=5
-Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="PYTHONPATH=%h/voice-assistant/.venv/lib/python3.13/site-packages"
-Environment="WAYLAND_DISPLAY=wayland-1"
-Environment="XDG_RUNTIME_DIR=/run/user/1000"
-Environment="VOICE_REMOTE=$REMOTE_SERVER"
-WorkingDirectory=$SCRIPT_DIR
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=voice-assistant
-
-[Install]
-WantedBy=default.target
-SVCEOF
-    log_info "Service configured for remote mode (VOICE_REMOTE=$REMOTE_SERVER)"
-else
-    cp voice-assistant.service ~/.config/systemd/user/
-fi
+cp voice-assistant.service ~/.config/systemd/user/
 
 systemctl --user daemon-reload
 systemctl --user enable voice-assistant.service
@@ -228,34 +158,18 @@ EOF
 
 # ── Summary ──────────────────────────────────────────────────────────────
 
-log_success "🎉 Voice Assistant setup complete! (${INSTALL_MODE} mode)"
+log_success "🎉 Voice Assistant setup complete!"
 echo
-if [[ "$INSTALL_MODE" == "local" ]]; then
-    echo "Next steps:"
-    echo "1. Add the Hyprland configuration:"
-    echo "   cat hyprland-voice-assistant.conf >> ~/.config/hypr/hyprland.conf"
-    echo
-    echo "2. Reload Hyprland config or restart Hyprland"
-    echo
-    echo "3. Start the service:"
-    echo "   systemctl --user start voice-assistant.service"
-    echo
-    echo "4. Toggle voice mode by pressing the SUPER key alone"
-else
-    echo "Next steps:"
-    echo "1. Ensure RemoteVoice server is running on $REMOTE_SERVER:"
-    echo "   ssh $REMOTE_SERVER 'systemctl status remote-voice'"
-    echo
-    echo "2. Add the Hyprland configuration:"
-    echo "   cat hyprland-voice-assistant.conf >> ~/.config/hypr/hyprland.conf"
-    echo
-    echo "3. Reload Hyprland config or restart Hyprland"
-    echo
-    echo "4. Start the service:"
-    echo "   systemctl --user start voice-assistant.service"
-    echo
-    echo "5. Toggle voice mode by pressing the SUPER key alone"
-fi
+echo "Next steps:"
+echo "1. Add the Hyprland configuration:"
+echo "   cat hyprland-voice-assistant.conf >> ~/.config/hypr/hyprland.conf"
+echo
+echo "2. Reload Hyprland config or restart Hyprland"
+echo
+echo "3. Start the service:"
+echo "   systemctl --user start voice-assistant.service"
+echo
+echo "4. Toggle voice mode by pressing the SUPER key alone"
 echo
 echo "Logs: journalctl --user -u voice-assistant -f"
 echo "Status: systemctl --user status voice-assistant"

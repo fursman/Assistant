@@ -21,8 +21,7 @@ moonshine-voice>=0.1.3
 faster-whisper>=0.9.0
 
 # TTS: kokoro-onnx is the default engine. onnxruntime (NOT -gpu) keeps
-# synthesis on the CPU so speech survives GPU passthrough. The RemoteVoice
-# server, which does have a GPU, can install onnxruntime-gpu instead.
+# synthesis on the CPU so speech survives GPU passthrough.
 kokoro-onnx>=0.4.0
 onnxruntime>=1.16.0
 
@@ -30,8 +29,6 @@ onnxruntime>=1.16.0
 anthropic>=0.8.0
 openai>=1.0.0
 
-# Remote mode
-websockets>=12.0
 
 # Optional alternative TTS engines, selected with VOICE_ASSISTANT_TTS_ENGINE:
 #   pocket-tts     # kyutai Pocket TTS  (~100M, CPU-realtime, preset voices)

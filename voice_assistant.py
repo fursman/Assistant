@@ -2,7 +2,11 @@
 """
 Hyprland Voice Assistant
 
-Pipeline: VAD → Whisper STT → Claude Code LLM (streaming subprocess) → Kokoro TTS (streaming) → PipeWire playback
+Pipeline: VAD → Moonshine STT (streams during speech) → Claude Code LLM
+(streaming subprocess) → Kokoro TTS (streaming) → PipeWire playback
+
+Everything except the Claude call runs on the CPU, so the assistant keeps
+working while the dGPU is passed through to a VM.
 
 Thinking events stream as 🧠 notifications; response sentences stream to TTS as they arrive.
 """
@@ -28,15 +32,8 @@ import pyaudio
 import torch
 from silero_vad import load_silero_vad, get_speech_timestamps
 
-# Remote mode: set VOICE_REMOTE=hostname to offload STT+LLM+TTS to a server
-REMOTE_HOST = os.getenv("VOICE_REMOTE")
-REMOTE_PORT = int(os.getenv("VOICE_REMOTE_PORT", "8767"))
-
-if REMOTE_HOST:
-    import websockets
-else:
-    import soundfile as sf
-    from faster_whisper import WhisperModel
+import soundfile as sf
+from faster_whisper import WhisperModel
 
 
 # ---------------------------------------------------------------------------
@@ -418,77 +415,51 @@ class VoiceAssistant:
         """Verify critical runtime requirements at startup."""
         ok = True
 
-        if REMOTE_HOST:
-            # Remote mode: check WebSocket server reachability
-            try:
-                loop = asyncio.new_event_loop()
-                async def _test():
-                    ws = await websockets.connect(
-                        f"ws://{REMOTE_HOST}:{REMOTE_PORT}", open_timeout=5)
-                    await ws.send(json.dumps({"type": "ping"}))
-                    resp = await asyncio.wait_for(ws.recv(), timeout=5)
-                    await ws.close()
-                    return json.loads(resp)
-                result = loop.run_until_complete(_test())
-                loop.close()
-                if result.get("type") == "pong":
-                    self.logger.info(
-                        f"RemoteVoice server: ws://{REMOTE_HOST}:{REMOTE_PORT} OK")
-                else:
-                    self.logger.error(
-                        f"Unexpected response from RemoteVoice server: {result}")
-                    ok = False
-            except Exception as e:
-                self.logger.error(
-                    f"PREFLIGHT FAIL: RemoteVoice server at "
-                    f"ws://{REMOTE_HOST}:{REMOTE_PORT} not reachable: {e}")
-                ok = False
+        # Local mode: Claude Code must be installed
+        claude_path = subprocess.run(
+            ["which", "claude"], capture_output=True, text=True
+        ).stdout.strip()
+        if not claude_path:
+            self.logger.error("PREFLIGHT FAIL: 'claude' CLI not found in PATH")
+            ok = False
         else:
-            # Local mode: Claude Code must be installed
-            claude_path = subprocess.run(
-                ["which", "claude"], capture_output=True, text=True
-            ).stdout.strip()
-            if not claude_path:
-                self.logger.error("PREFLIGHT FAIL: 'claude' CLI not found in PATH")
-                ok = False
-            else:
-                self.logger.info(f"Claude CLI: {claude_path}")
+            self.logger.info(f"Claude CLI: {claude_path}")
 
-            # --dangerously-skip-permissions must be accepted in settings
-            settings_file = Path.home() / ".claude/settings.json"
-            if settings_file.exists():
-                try:
-                    settings = json.loads(settings_file.read_text())
-                    if settings.get("skipDangerousModePermissionPrompt"):
-                        self.logger.info("Claude skipDangerousModePermissionPrompt: enabled")
-                    else:
-                        self.logger.warning(
-                            "PREFLIGHT WARN: skipDangerousModePermissionPrompt not set in "
-                            "~/.claude/settings.json — voice assistant needs "
-                            "--dangerously-skip-permissions to work non-interactively"
-                        )
-                except (json.JSONDecodeError, Exception):
-                    pass
-            else:
-                self.logger.warning(
-                    "PREFLIGHT WARN: ~/.claude/settings.json not found — "
-                    "set skipDangerousModePermissionPrompt: true"
-                )
-
-            # Passwordless sudo is required for system commands
-            sudo_check = subprocess.run(
-                ["sudo", "-n", "true"], capture_output=True, timeout=5
+        # --dangerously-skip-permissions must be accepted in settings
+        settings_file = Path.home() / ".claude/settings.json"
+        if settings_file.exists():
+            try:
+                settings = json.loads(settings_file.read_text())
+                if settings.get("skipDangerousModePermissionPrompt"):
+                    self.logger.info("Claude skipDangerousModePermissionPrompt: enabled")
+                else:
+                    self.logger.warning(
+                        "PREFLIGHT WARN: skipDangerousModePermissionPrompt not set in "
+                        "~/.claude/settings.json — voice assistant needs "
+                        "--dangerously-skip-permissions to work non-interactively"
+                    )
+            except (json.JSONDecodeError, Exception):
+                pass
+        else:
+            self.logger.warning(
+                "PREFLIGHT WARN: ~/.claude/settings.json not found — "
+                "set skipDangerousModePermissionPrompt: true"
             )
-            if sudo_check.returncode == 0:
-                self.logger.info("Passwordless sudo: available")
-            else:
-                self.logger.warning(
-                    "PREFLIGHT WARN: passwordless sudo not available — "
-                    "Claude may fail on system commands. "
-                    "Fix: echo '%s ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/%s"
-                    % (os.getenv("USER", "user"), os.getenv("USER", "user"))
-                )
-                ok = False
+
+        # Passwordless sudo is required for system commands
+        sudo_check = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True, timeout=5
+        )
+        if sudo_check.returncode == 0:
+            self.logger.info("Passwordless sudo: available")
+        else:
+            self.logger.warning(
+                "PREFLIGHT WARN: passwordless sudo not available — "
+                "Claude may fail on system commands. "
+                "Fix: echo '%s ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/%s"
+                % (os.getenv("USER", "user"), os.getenv("USER", "user"))
+            )
+            ok = False
 
         if ok:
             self.logger.info("Preflight checks passed")
@@ -677,50 +648,40 @@ class VoiceAssistant:
             self.vad_model = load_silero_vad(onnx=False)
             self.logger.info("Silero VAD loaded")
 
-            if REMOTE_HOST:
-                self.whisper_model = None
-                self.kokoro = None
-                self.tts_available = False
-                self._ws = None  # persistent WebSocket, connected lazily
-                self.logger.info(
-                    f"Remote mode: ws://{REMOTE_HOST}:{REMOTE_PORT} "
-                    "(Whisper/Kokoro on server)")
-            else:
-                # Local mode. Moonshine goes first: it transcribes while you
-                # are still speaking and needs no GPU, so it stays fast when
-                # no RemoteVoice server is reachable AND while the dGPU is
-                # passed through to the VM. Whisper remains the fallback.
-                loaded = False
-                if STT_ENGINE.lower() == "moonshine":
-                    try:
-                        self._load_moonshine()
-                        loaded = True
-                    except Exception as e:
+            # Moonshine goes first: it transcribes while you are still
+            # speaking and never wants a GPU, so it stays fast even while the
+            # dGPU is passed through to the VM. Whisper is the fallback.
+            loaded = False
+            if STT_ENGINE.lower() == "moonshine":
+                try:
+                    self._load_moonshine()
+                    loaded = True
+                except Exception as e:
+                    self.logger.warning(
+                        f"Moonshine unavailable ({e}) — falling back to Whisper")
+            if not loaded:
+                device, compute = self._pick_whisper_device()
+                try:
+                    self.whisper_model = WhisperModel(
+                        WHISPER_MODEL, device=device, compute_type=compute
+                    )
+                except Exception as e:
+                    # A CUDA build can still fail at load time (driver
+                    # mismatch, card grabbed mid-session). Never let STT
+                    # take the assistant down when CPU would have worked.
+                    if device == "cuda":
                         self.logger.warning(
-                            f"Moonshine unavailable ({e}) — falling back to Whisper")
-                if not loaded:
-                    device, compute = self._pick_whisper_device()
-                    try:
+                            f"CUDA Whisper failed ({e}) — falling back to CPU")
+                        device, compute = "cpu", "int8"
                         self.whisper_model = WhisperModel(
                             WHISPER_MODEL, device=device, compute_type=compute
                         )
-                    except Exception as e:
-                        # A CUDA build can still fail at load time (driver
-                        # mismatch, card grabbed mid-session). Never let STT
-                        # take the assistant down when CPU would have worked.
-                        if device == "cuda":
-                            self.logger.warning(
-                                f"CUDA Whisper failed ({e}) — falling back to CPU")
-                            device, compute = "cpu", "int8"
-                            self.whisper_model = WhisperModel(
-                                WHISPER_MODEL, device=device, compute_type=compute
-                            )
-                        else:
-                            raise
-                    self.logger.info(f"Faster Whisper loaded ({device}/{compute})")
+                    else:
+                        raise
+                self.logger.info(f"Faster Whisper loaded ({device}/{compute})")
 
-                self._setup_tts()
-                self._warmup()
+            self._setup_tts()
+            self._warmup()
         except Exception as e:
             self.logger.error(f"Error loading models: {e}")
             sys.exit(1)
@@ -1313,13 +1274,6 @@ class VoiceAssistant:
 
     def _new_session_handler(self, signum, frame):
         """SIGUSR2 handler: clear session so next query starts fresh."""
-        if REMOTE_HOST and self._ws:
-            # Tell the remote server to clear its session too
-            try:
-                asyncio.get_event_loop().create_task(
-                    self._ws.send(json.dumps({"type": "new_session"})))
-            except Exception:
-                pass
         self._clear_session()
         self._notify("🔄 New conversation ready", title="Voice Assistant")
         self._play_chime_async("deactivate")
@@ -1539,157 +1493,7 @@ class VoiceAssistant:
     # Remote mode: WebSocket client
     # ------------------------------------------------------------------
 
-    def _audio_to_wav_bytes(self, audio_data):
-        """Convert float32 numpy audio to WAV bytes for sending to server."""
-        import io
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes((audio_data * 32768).astype(np.int16).tobytes())
-        return buf.getvalue()
-
-    async def _ensure_ws(self):
-        """Ensure persistent WebSocket connection to RemoteVoice server."""
-        if self._ws is not None:
-            try:
-                await self._ws.ping()
-                return self._ws
-            except Exception:
-                self._ws = None
-        url = f"ws://{REMOTE_HOST}:{REMOTE_PORT}"
-        self.logger.info(f"Connecting to RemoteVoice: {url}")
-        self._ws = await websockets.connect(
-            url, ping_interval=20, ping_timeout=10, max_size=10_000_000)
-        return self._ws
-
-    async def _remote_process_audio(self, audio_data):
-        """Send audio to RemoteVoice server, receive and handle streaming events.
-
-        Returns True if TTS audio was played, False otherwise.
-        """
-        played_tts = False
-        try:
-            ws = await self._ensure_ws()
-
-            # Drain any stale messages left from a previously aborted interaction
-            try:
-                while True:
-                    await asyncio.wait_for(ws.recv(), timeout=0.01)
-                    self.logger.info("Drained stale WebSocket message")
-            except (asyncio.TimeoutError, Exception):
-                pass
-
-            # Send audio as WAV binary
-            wav_bytes = self._audio_to_wav_bytes(audio_data.flatten())
-            await ws.send(wav_bytes)
-
-            self._play_chime_async("processing")
-
-            # Receive events until done
-            first_audio = True
-            while True:
-                if self._abort_event.is_set():
-                    break
-
-                msg = await asyncio.wait_for(ws.recv(), timeout=120)
-
-                if isinstance(msg, bytes):
-                    # Binary frame = WAV audio to play
-                    if self._abort_event.is_set():
-                        break
-                    played_tts = True
-                    if first_audio:
-                        self._set_waybar_status("speaking")
-                        first_audio = False
-                    path = self.tts_dir / f"tts_remote_{time.time()}.wav"
-                    path.write_bytes(msg)
-                    proc = subprocess.Popen(
-                        ["pw-play", str(path)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    self._tts_process = proc
-                    await asyncio.get_event_loop().run_in_executor(None, proc.wait)
-                    self._tts_process = None
-                    path.unlink(missing_ok=True)
-                    continue
-
-                # Text frame = JSON event
-                try:
-                    event = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = event.get("type")
-
-                if etype == "stt":
-                    text = event.get("text", "")
-                    self.logger.info(f"Transcription: {text}")
-                    self._notify(f"🎤 {text}", title="You Said")
-                    self._last_tts_text = text
-
-                elif etype == "thinking":
-                    text = event.get("text", "")
-                    self._notify(f"🧠 {text}", title="Thinking...", timeout_ms=5000)
-
-                elif etype == "tool":
-                    labels = {
-                        "Bash": "Running command", "Read": "Reading file",
-                        "Edit": "Editing file", "Write": "Writing file",
-                        "Glob": "Searching files", "Grep": "Searching code",
-                        "WebSearch": "Searching web", "WebFetch": "Fetching page",
-                    }
-                    name = event.get("name", "")
-                    label = labels.get(name, f"Using {name}")
-                    detail = event.get("detail", "")
-                    msg_text = f"🔧 {label}"
-                    if detail:
-                        msg_text += f"\n{detail[:120]}"
-                    self._notify(msg_text, title="Working...", timeout_ms=5000)
-
-                elif etype == "tts":
-                    # Next binary frame will be audio for this sentence
-                    text = event.get("text", "")
-                    self._last_tts_text = text
-                    self.logger.info(f"→ TTS: {text[:80]}...")
-                    self._notify(f"🗣️ {text[:200]}", title="Speaking...", timeout_ms=8000)
-
-                elif etype == "done":
-                    break
-
-                elif etype == "session_cleared":
-                    self._notify("🔄 New conversation ready", title="Voice Assistant")
-
-        except websockets.exceptions.ConnectionClosed:
-            self.logger.error("RemoteVoice connection lost")
-            self._ws = None
-        except asyncio.TimeoutError:
-            self.logger.error("RemoteVoice timeout (120s)")
-        except Exception as e:
-            self.logger.error(f"Remote processing error: {e}")
-            self._ws = None
-        return played_tts
-
     async def _process_audio(self, audio_data):
-        if REMOTE_HOST:
-            try:
-                played_tts = await self._remote_process_audio(audio_data)
-            finally:
-                self.is_processing = False
-                if played_tts:
-                    # TTS was played — close/reopen stream to discard the
-                    # stale audio buffer (drain loop can't keep up with long
-                    # responses). Streaming VAD handles PipeWire reinit fine.
-                    self._flush_mic_buffer = True
-                subprocess.run(
-                    ["swaync-client", "--close-all"],
-                    capture_output=True, check=False)
-                if self.is_active:
-                    self._set_waybar_status("ready")
-            return
-
         loop = asyncio.get_event_loop()
         did_tts = False
         try:

@@ -12,8 +12,6 @@ RestartSec=5
 Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="WAYLAND_DISPLAY=wayland-1"
 Environment="XDG_RUNTIME_DIR=/run/user/1000"
-# For remote mode, uncomment and set:
-# Environment="VOICE_REMOTE=clawbox.local"
 
 # Logging
 StandardOutput=journal
