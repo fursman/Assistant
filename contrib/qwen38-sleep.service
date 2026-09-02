@@ -1,0 +1,13 @@
+[Unit]
+Description=Unload local LLM from VRAM before sleep
+# Must precede nvidia-suspend.service: that is what copies VRAM to disk.
+Before=nvidia-suspend.service
+Before=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/qwen38-sleep pre
+TimeoutStartSec=60
+
+[Install]
+WantedBy=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service

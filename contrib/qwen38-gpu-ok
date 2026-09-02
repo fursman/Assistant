@@ -1,0 +1,40 @@
+#!/bin/bash
+# ExecCondition= for qwen38.service.
+#
+#   exit 0  ->  start llama-server
+#   exit 1  ->  skip it; systemd leaves the unit INACTIVE (not failed) and the
+#               voice assistant answers with the claude CLI instead
+#
+# This is what makes one unit file safe to install on every machine: a laptop
+# with no NVIDIA card, a 12 GB card, or a card currently passed through to a VM
+# all skip cleanly instead of restart-looping on a 14 GB allocation failure.
+set -u
+
+# Measured resident size of Qwen3.8-27B UD-IQ4_XS with the MTP draft head and a
+# 32K q8_0 KV cache: 15341 MiB.
+NEED_MIB=${QWEN38_NEED_MIB:-15400}
+
+command -v nvidia-smi >/dev/null 2>&1 || {
+    echo "skip: nvidia-smi not installed"; exit 1; }
+
+total=""; used=""
+# After a stop, or on resume, the driver takes a moment to hand the memory back.
+for _ in $(seq 1 30); do
+    row=$(nvidia-smi --query-gpu=memory.total,memory.used \
+              --format=csv,noheader,nounits 2>/dev/null | sort -t, -k1 -nr | head -1)
+    if [ -z "$row" ]; then
+        echo "skip: no NVIDIA device (driver not loaded, or the card is passed through)"
+        exit 1
+    fi
+    total=$(echo "$row" | cut -d, -f1 | tr -d ' ')
+    used=$(echo "$row" | cut -d, -f2 | tr -d ' ')
+    if [ "$total" -lt "$NEED_MIB" ]; then
+        echo "skip: GPU has ${total} MiB, Qwen3.8-27B needs ${NEED_MIB} MiB"
+        exit 1
+    fi
+    [ $((total - used)) -ge "$NEED_MIB" ] && exit 0
+    sleep 0.5
+done
+
+echo "skip: only $((total - used)) MiB free of ${total} MiB (${used} MiB in use)"
+exit 1

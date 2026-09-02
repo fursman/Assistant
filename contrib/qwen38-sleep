@@ -1,0 +1,54 @@
+#!/bin/bash
+# Unload / reload the local LLM around sleep.  Called by qwen38-sleep.service
+# (pre) and qwen38-wake.service (post).
+#
+# Why: NVreg_PreserveVideoMemoryAllocations=1 makes the NVIDIA driver copy the
+# whole of VRAM out to NVreg_TemporaryFilePath on suspend. With Qwen3.8-27B
+# resident that is ~15.2 GB: measured 84s inside nvidia-suspend.service plus a
+# 40s filesystem sync, an "NVRM: Error in service of callback", and a black
+# screen on resume. Stopping the server first leaves almost nothing to preserve.
+#
+# This MUST run before nvidia-suspend.service, which is why it is a unit
+# ordered Before= it rather than a /usr/lib/systemd/system-sleep/ hook -- those
+# are executed by systemd-suspend.service, i.e. *after* the VRAM dump.
+SERVICE="qwen38.service"
+STATE_DIR="/run/qwen38-sleep"
+
+users() { loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'; }
+as_user() { # as_user <user> <uid> <args...>
+    local u="$1" uid="$2"; shift 2
+    runuser -u "$u" -- env "XDG_RUNTIME_DIR=/run/user/$uid" "$@" >/dev/null 2>&1
+}
+
+case "$1" in
+  pre)
+    mkdir -p "$STATE_DIR"; rm -f "$STATE_DIR"/* 2>/dev/null
+    for u in $(users); do
+        uid=$(id -u "$u" 2>/dev/null) || continue
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        if as_user "$u" "$uid" systemctl --user is-active "$SERVICE"; then
+            touch "$STATE_DIR/$u"
+            logger -t qwen38-sleep "stopping $SERVICE for $u before sleep"
+            as_user "$u" "$uid" systemctl --user stop "$SERVICE"
+        fi
+    done
+    # Wait for the driver to actually release the allocations before the
+    # NVIDIA suspend hook measures how much it has to preserve.
+    for _ in $(seq 1 30); do
+        used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+        [ -n "$used" ] && [ "$used" -lt 1000 ] && break
+        sleep 0.5
+    done
+    logger -t qwen38-sleep "VRAM in use before sleep: ${used:-unknown} MiB"
+    ;;
+  post)
+    for f in "$STATE_DIR"/*; do
+        [ -e "$f" ] || continue
+        u=$(basename "$f"); uid=$(id -u "$u" 2>/dev/null) || continue
+        logger -t qwen38-sleep "restarting $SERVICE for $u after resume"
+        as_user "$u" "$uid" systemctl --user start "$SERVICE"
+    done
+    rm -f "$STATE_DIR"/* 2>/dev/null
+    ;;
+esac
+exit 0

@@ -1,0 +1,77 @@
+[Unit]
+Description=Qwen3.8-27B (llama-server, CUDA + MTP speculative decoding)
+Documentation=https://github.com/ggml-org/llama.cpp
+# A half-provisioned machine (llama.cpp built, weights not downloaded yet) must
+# leave the unit inactive rather than restart-looping on a missing file.
+ConditionPathExists=%h/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf
+# Three failed starts in five minutes and we stop trying. The default limit of
+# 5 starts in 10 s can never trip at RestartSec=5, so with the card busy (or
+# bound to vfio-pci for the VM) this would otherwise mmap 14 GB, fail, and
+# retry every five seconds forever.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=exec
+# The dGPU only. The display runs on the Intel iGPU, so the 3080 is otherwise idle.
+Environment=CUDA_VISIBLE_DEVICES=0
+# Exit 1 = skip: no GPU big enough, or its VRAM is already spoken for. systemd
+# leaves the unit inactive (not failed) and the assistant answers with Claude.
+ExecCondition=%h/.local/bin/qwen38-gpu-ok
+#
+# Flags worth explaining:
+#   --spec-type draft-mtp --spec-draft-n-max 2
+#       The MTP draft head is embedded in the Unsloth GGUF (blk.64.nextn.*), so
+#       no separate draft model is needed. Measured 24.4 -> 35.2 tok/s (+48%)
+#       for ~900 MiB of VRAM. Depth 3 is WORSE (31.2 tok/s): acceptance falls
+#       from 0.56 to 0.40.
+#   --ctx-size 32768 with q8_0 KV
+#       Only 16 of 64 layers hold KV (full_attention_interval=4; the rest are
+#       Gated DeltaNet with a context-independent recurrent state), so 32K
+#       costs ~1.1 GB rather than the ~4.5 GB a dense model would need.
+#   --ctx-checkpoints 0
+#       This is a hybrid recurrent model, so the server snapshots ~150 MiB of
+#       recurrent state at fixed points of every prompt pass. Measured ~190-200
+#       ms per checkpoint and two per warm turn -- i.e. most of the 0.4-0.9 s
+#       the prompt phase costs on a turn that reuses the whole prefix. Turning
+#       them off drops that to ~0.1 s. The cost is that a divergent prompt (a
+#       new conversation) re-evaluates the ~590-token prefix, which is what it
+#       already did in practice: the default --checkpoint-min-step 8192 evicts
+#       the user-start checkpoint on the very next turn.
+#   --reasoning off
+#       Server-side default of no-think, so the WebUI and curl behave like the
+#       assistant. The per-request chat_template_kwargs.enable_thinking still
+#       wins, which is how VOICE_ASSISTANT_LOCAL_THINK=1 works.
+#   --cache-ram 0
+#       The RAM prompt cache is only consulted at session reset, where it
+#       copies the whole slot state (KV + ~150 MiB recurrent) to host RAM and
+#       can never hand back a state at a useful boundary. Pure cost here.
+ExecStart=%h/llama.cpp/build/bin/llama-server \
+    --model %h/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf \
+    --alias qwen3.8-27b \
+    --host 127.0.0.1 --port 8081 \
+    --n-gpu-layers 999 \
+    --ctx-size 32768 \
+    --flash-attn on \
+    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --spec-type draft-mtp --spec-draft-n-max 2 \
+    --parallel 1 \
+    --jinja --reasoning-format auto --reasoning off \
+    --ctx-checkpoints 0 \
+    --cache-ram 0 \
+    --threads 8 \
+    --temp 0.7 --top-p 0.8 --top-k 20 --presence-penalty 1.5 --min-p 0
+# Hold the unit in "activating" until /health answers 200, so that
+# `systemctl --user start qwen38` returns when the model SERVES rather than
+# when the binary exec'd. Loading takes ~5 s warm and ~35 s from cold, and
+# llama-server answers 503 the whole time.
+ExecStartPost=/bin/sh -c 'until curl -sf --max-time 2 http://127.0.0.1:8081/health >/dev/null; do kill -0 "$MAINPID" 2>/dev/null || exit 1; sleep 1; done'
+TimeoutStartSec=600
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qwen38
+
+[Install]
+WantedBy=default.target

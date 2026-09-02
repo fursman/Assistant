@@ -1,0 +1,11 @@
+[Unit]
+Description=Reload local LLM into VRAM after resume
+After=nvidia-resume.service
+After=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/qwen38-sleep post
+
+[Install]
+WantedBy=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service

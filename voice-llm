@@ -1,0 +1,184 @@
+#!/bin/bash
+# Switch the voice assistant between the Claude Code CLI and the local
+# Qwen3.8-27B llama-server, and start/stop the model server to match.
+#
+#   voice-llm status | auto | claude | qwen | logs
+#
+# The default is `auto`: the assistant uses the local model when this machine
+# has a >= 16 GB NVIDIA GPU and qwen38.service is installed, and the claude CLI
+# otherwise -- including for individual queries while the model is still
+# loading. `claude` and `qwen` force one or the other.
+#
+# The local model holds ~15.3 GB of the 16 GB dGPU while it runs, so
+# `voice-llm claude` stops it -- that is what frees the card for GPU
+# passthrough to a VM.
+set -euo pipefail
+
+ENV_FILE="$HOME/.config/voice-assistant/env"
+ASSISTANT="voice-assistant.service"
+SERVER="qwen38.service"
+HEALTH="http://127.0.0.1:8081/health"
+MIN_VRAM=15000
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YEL='\033[1;33m'; BLU='\033[0;34m'; NC='\033[0m'
+info() { echo -e "${BLU}[INFO]${NC} $1"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
+warn() { echo -e "${YEL}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERROR]${NC} $1"; }
+
+current_backend() {
+    local b=""
+    if [[ -r "$ENV_FILE" ]]; then
+        b=$(grep -E '^VOICE_ASSISTANT_LLM_BACKEND=' "$ENV_FILE" | tail -1 | cut -d= -f2 || true)
+    fi
+    echo "${b:-auto}"
+}
+
+set_backend() {
+    mkdir -p "$(dirname "$ENV_FILE")"
+    touch "$ENV_FILE"
+    if grep -qE '^VOICE_ASSISTANT_LLM_BACKEND=' "$ENV_FILE"; then
+        sed -i "s/^VOICE_ASSISTANT_LLM_BACKEND=.*/VOICE_ASSISTANT_LLM_BACKEND=$1/" "$ENV_FILE"
+    else
+        echo "VOICE_ASSISTANT_LLM_BACKEND=$1" >> "$ENV_FILE"
+    fi
+}
+
+# ready = serving; loading = port open but weights not in yet (llama-server
+# answers 503 for 5-35 s); down = nothing listening.
+server_state() {
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$HEALTH" 2>/dev/null || echo 000)
+    case "$code" in 200) echo ready;; 503) echo loading;; *) echo down;; esac
+}
+
+gpu_vram() {   # "<name>|<total MiB>" for the largest card, or nothing
+    command -v nvidia-smi &>/dev/null || return 1
+    local row
+    row=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null \
+          | sort -t, -k2 -nr | head -1) || return 1
+    [[ -n "$row" ]] || return 1
+    echo "$row" | sed 's/, */|/'
+}
+
+# Mirrors VoiceAssistant._resolve_backend() so `status` says what the assistant
+# will actually do, not just what is configured.
+resolve_backend() {
+    local cfg="$1" gpu total st
+    case "$cfg" in claude|local) echo "$cfg (forced)"; return;; esac
+    st=$(server_state)
+    [[ "$st" != down ]] && { echo "local (server $st)"; return; }
+    gpu=$(gpu_vram) || { echo "claude (no NVIDIA GPU)"; return; }
+    total=${gpu#*|}
+    (( total < MIN_VRAM )) && { echo "claude (${gpu%|*}: ${total} MiB < ${MIN_VRAM} MiB)"; return; }
+    [[ "$(systemctl --user show -p LoadState --value "$SERVER" 2>/dev/null)" == loaded ]] \
+        || { echo "claude ($SERVER not installed — run setup.sh)"; return; }
+    case "$(systemctl --user is-active "$SERVER" 2>/dev/null)" in
+        active|activating) echo "local (model loading)";;
+        failed)            echo "claude ($SERVER failed)";;
+        *)                 echo "claude ($SERVER stopped — voice-llm qwen)";;
+    esac
+}
+
+restart_assistant() {
+    if systemctl --user is-active "$ASSISTANT" &>/dev/null; then
+        info "Restarting $ASSISTANT"
+        systemctl --user restart "$ASSISTANT"
+    else
+        warn "$ASSISTANT is not running (start it with: systemctl --user start $ASSISTANT)"
+    fi
+}
+
+wait_ready() {
+    local deadline=$((SECONDS + ${1:-300}))
+    while (( SECONDS < deadline )); do
+        [[ "$(server_state)" == ready ]] && return 0
+        systemctl --user is-failed "$SERVER" &>/dev/null && return 1
+        sleep 2
+    done
+    return 1
+}
+
+case "${1:-status}" in
+  status)
+    echo "Voice assistant LLM backend"
+    echo "==========================="
+    cfg=$(current_backend)
+    echo -e "Configured:     ${GREEN}${cfg}${NC}"
+    echo -e "Resolved:       ${GREEN}$(resolve_backend "$cfg")${NC}"
+    case "$(server_state)" in
+        ready)   echo -e "Model server:   ${GREEN}serving${NC} ($HEALTH)";;
+        loading) echo -e "Model server:   ${YEL}loading${NC} (503 until the weights are in)";;
+        *)       echo -e "Model server:   ${RED}down${NC}";;
+    esac
+    systemctl --user is-active "$SERVER"    &>/dev/null \
+        && echo -e "$SERVER:  ${GREEN}active${NC}" || echo -e "$SERVER:  ${RED}inactive${NC}"
+    systemctl --user is-active "$ASSISTANT" &>/dev/null \
+        && echo -e "Assistant:      ${GREEN}running${NC}" || echo -e "Assistant:      ${RED}stopped${NC}"
+    if command -v nvidia-smi &>/dev/null; then
+        nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader \
+            | sed 's/^/GPU:            /'
+    else
+        echo "GPU:            none (nvidia-smi not installed)"
+    fi
+    ;;
+
+  auto)
+    set_backend auto
+    restart_assistant
+    ok "Backend is AUTO: local model when this machine can run it, Claude otherwise"
+    echo "   resolved right now: $(resolve_backend auto)"
+    ;;
+
+  qwen|local)
+    if ! systemctl --user cat "$SERVER" &>/dev/null; then
+        err "$SERVER is not installed on this machine — run ./setup.sh"
+        exit 1
+    fi
+    info "Starting $SERVER (loads ~15.3 GB onto the dGPU)"
+    systemctl --user enable --now "$SERVER" &>/dev/null || systemctl --user start "$SERVER"
+    info "Waiting for the model to load (~5 s warm, ~35 s cold)..."
+    if wait_ready 300; then
+        ok "Model server is serving"
+    else
+        err "Model server did not come up"
+        echo "  journalctl --user -u $SERVER -n 40 --no-pager"
+        exit 1
+    fi
+    # `auto` already prefers a server that answers, and the assistant's watcher
+    # adopts it within three seconds, so there is no restart to wait through.
+    was=$(current_backend)
+    set_backend auto
+    [[ "$was" == "claude" ]] && restart_assistant
+    ok "Voice assistant answers with the LOCAL Qwen3.8-27B (run_shell tool, offline)"
+    ;;
+
+  claude)
+    set_backend claude
+    restart_assistant
+    if systemctl --user is-active "$SERVER" &>/dev/null; then
+        info "Stopping $SERVER to free the dGPU"
+        systemctl --user stop "$SERVER"
+    fi
+    if [[ "${2:-}" == "--disable" ]]; then
+        systemctl --user disable "$SERVER" &>/dev/null && info "$SERVER will not return at boot"
+    fi
+    ok "Voice assistant answers with CLAUDE CODE (tools, filesystem, web)"
+    ;;
+
+  logs)
+    journalctl --user -u "$SERVER" -f
+    ;;
+
+  *)
+    echo "usage: voice-llm [status|auto|claude|qwen|logs]"
+    echo
+    echo "  status   what is configured, what it resolves to, and why"
+    echo "  auto     pick per machine: local model if it fits, Claude otherwise (default)"
+    echo "  qwen     start the model server and prefer it"
+    echo "  claude   force Claude and stop the model server (frees the GPU)"
+    echo "           add --disable to keep it from starting at boot"
+    echo "  logs     follow the model server"
+    exit 2
+    ;;
+esac
