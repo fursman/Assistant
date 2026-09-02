@@ -283,6 +283,19 @@ LOCAL_TOOL_MAX_OUTPUT = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_MAX_OUTPUT", "
 # How many tool round-trips before the model must answer in words.
 LOCAL_MAX_TOOL_ITERS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS", "5"))
 
+# Sent on the last step, where the tool schema is withheld. Withholding it is
+# not enough on its own: the model can still see its own tool calls in the
+# transcript, and imitates them in prose. Saying so explicitly is what actually
+# ends the loop, and telling it to report the failure keeps a fruitless search
+# from being answered with an invented result.
+LOCAL_TOOL_BUDGET_PROMPT = (
+    "You have used all the commands you get for this question, and there are "
+    "no more available. Answer now, in one to three spoken sentences, using "
+    "only what you already found. Do not write another command or describe one. "
+    "If what you found was not enough to answer, say plainly that you could not "
+    "find it -- do not guess or invent an answer."
+)
+
 LOCAL_TOOLS = [{
     "type": "function",
     "function": {
@@ -1435,6 +1448,57 @@ class ClaudeSession:
 
 
 # ---------------------------------------------------------------------------
+# Tool-call markup gate
+# ---------------------------------------------------------------------------
+
+class ToolMarkupGate:
+    """Keeps raw tool-call markup out of the speech pipeline.
+
+    A model several tool calls deep will sometimes emit the next one as plain
+    prose instead of a structured call, imitating the transcript it can see.
+    llama-server only parses tool syntax out of the stream while the request
+    carried a tool schema, so on a request that withheld one this arrives as
+    ordinary content and goes straight to TTS. That is how the assistant came
+    to read a curl pipeline out loud, one sentence at a time.
+
+    Deltas are a few characters wide, so an opener can straddle two of them.
+    Anything that could still grow into one is held back until the next delta
+    settles it, and released untouched if it does not.
+    """
+
+    # The openers that mean "this is a tool call, not speech".
+    _OPEN = re.compile(r"<\|?(?:tool_call|function|parameter|tool_response)\b")
+    # Longest of those, so a shorter tail is worth holding on to.
+    _MAX_LEAD = 16
+
+    def __init__(self):
+        self.buf = ""
+        self.tripped = False
+
+    def feed(self, delta: str) -> str:
+        """-> the part of `delta` that is safe to speak."""
+        if self.tripped:
+            return ""
+        self.buf += delta
+        m = self._OPEN.search(self.buf)
+        if m:
+            out, self.buf, self.tripped = self.buf[:m.start()], "", True
+            return out
+        # A '<' near the end may still become an opener; anything older cannot.
+        i = self.buf.rfind("<")
+        if i == -1 or len(self.buf) - i > self._MAX_LEAD:
+            out, self.buf = self.buf, ""
+            return out
+        out, self.buf = self.buf[:i], self.buf[i:]
+        return out
+
+    def close(self) -> str:
+        """-> whatever was held back, once the stream is done growing."""
+        out, self.buf = self.buf, ""
+        return "" if self.tripped else out
+
+
+# ---------------------------------------------------------------------------
 # Assistant
 # ---------------------------------------------------------------------------
 
@@ -2496,14 +2560,28 @@ class VoiceAssistant:
         t0 = time.time()
         first_token_at = None
         completed = False
+        # Index of the "you are out of commands" nudge, so it can be kept out
+        # of the saved history: it is not something the user said.
+        nudge_at = None
+        markup_suppressed = False
 
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
+            # Offer tools until the last allowed step, so the model has to
+            # answer in words rather than looping forever. On that last step the
+            # withheld schema also switches off llama-server's tool-call parser,
+            # so say in words that the budget is spent -- otherwise the model
+            # copies its own earlier calls and the raw markup reaches TTS.
+            if LOCAL_TOOLS_ENABLED and step == LOCAL_MAX_TOOL_ITERS:
+                self.logger.warning(
+                    f"Local LLM used all {LOCAL_MAX_TOOL_ITERS} tool calls; "
+                    "asking it to answer in words")
+                nudge_at = len(messages)
+                messages.append({"role": "user", "content": LOCAL_TOOL_BUDGET_PROMPT})
+
             kwargs = dict(
                 model=LOCAL_LLM_MODEL, messages=messages, stream=True,
                 temperature=LOCAL_LLM_TEMP, top_p=LOCAL_LLM_TOP_P,
                 max_tokens=LOCAL_LLM_MAX_TOKENS, extra_body=extra_body)
-            # Offer tools until the last allowed step, so the model is forced to
-            # answer in words rather than looping forever.
             if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS:
                 kwargs["tools"] = LOCAL_TOOLS
 
@@ -2511,6 +2589,7 @@ class VoiceAssistant:
             text_at_step_start = len(self._assistant_text)
             calls = {}
             finish = None
+            gate = ToolMarkupGate()
             try:
                 stream = client.chat.completions.create(**kwargs)
                 self._local_stream = stream
@@ -2533,8 +2612,10 @@ class VoiceAssistant:
                     if content:
                         if first_token_at is None:
                             first_token_at = time.time()
-                        self._assistant_text += content
-                        self._flush_sentences(final=False)
+                        speakable = gate.feed(content)
+                        if speakable:
+                            self._assistant_text += speakable
+                            self._flush_sentences(final=False)
                     for tc in (getattr(delta, "tool_calls", None) or []):
                         slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
                         if tc.id:
@@ -2560,6 +2641,18 @@ class VoiceAssistant:
                 except Exception:
                     pass
                 self._local_stream = None
+
+            # Nothing more is coming, so anything the gate was still holding
+            # back is ordinary text after all.
+            tail = gate.close()
+            if tail:
+                self._assistant_text += tail
+                self._flush_sentences(final=False)
+            if gate.tripped:
+                markup_suppressed = True
+                self.logger.warning(
+                    "Local LLM wrote a tool call as prose; suppressed it rather "
+                    "than speaking it")
 
             if not calls:
                 if finish == "length":
@@ -2615,10 +2708,21 @@ class VoiceAssistant:
                 f"total {time.time() - t0:.2f}s")
 
         if completed and not abort.is_set():
+            if markup_suppressed and not self._assistant_text.strip():
+                # Everything the model produced was suppressed markup, so the
+                # generic "Done." fallback downstream would claim a success that
+                # did not happen. Say what actually went wrong instead.
+                self._assistant_text = (
+                    "Sorry, I got stuck running commands and could not work that out.")
+                self._flush_sentences(final=False)
             reply = self._assistant_text.strip()
             # Persist the whole exchange (including tool traffic) so follow-up
-            # questions can refer back to what the commands returned.
-            self._local_history.extend(messages[turn_start:])
+            # questions can refer back to what the commands returned. The nudge
+            # is dropped: it came from us, not the user, and leaving it in makes
+            # the next turn think the budget is already spent.
+            turn_msgs = [m for i, m in enumerate(messages)
+                         if i >= turn_start and i != nudge_at]
+            self._local_history.extend(turn_msgs)
             if reply:
                 self._local_history.append({"role": "assistant", "content": reply})
             self._trim_local_history()
