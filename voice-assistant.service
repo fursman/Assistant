@@ -1,11 +1,20 @@
 [Unit]
-Description=Hyprland Voice Assistant (Claude Code)
+Description=Hyprland Voice Assistant
 Documentation=https://github.com/fursman/Assistant
 After=pipewire.service
 Wants=pipewire.service
+# Deliberately NOT ordered after qwen38.service. Type=exec would only mean
+# "the binary exec'd", and a real readiness gate would hold the assistant's own
+# 4 s of model loading behind the LLM's 35 s. Instead the assistant starts
+# immediately, answers with Claude while the local model loads, and adopts the
+# local model as soon as its /health endpoint says it is serving.
 
 [Service]
 Type=simple
+# Backend selection (auto | claude | local) and the rest of the runtime
+# configuration. Optional: the leading "-" means the service still starts if
+# the file is absent, and the built-in defaults apply.
+EnvironmentFile=-%h/.config/voice-assistant/env
 ExecStart=%h/.local/bin/voice-assistant
 Restart=on-failure
 RestartSec=5
@@ -13,9 +22,9 @@ Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 # %t is systemd's runtime directory (/run/user/$UID) -- do not hardcode 1000,
 # it is wrong for any user who is not the first one on the machine.
 Environment="XDG_RUNTIME_DIR=%t"
-# WAYLAND_DISPLAY is deliberately NOT set here: the socket is named per
-# session (wayland-0, wayland-1, ...), so any fixed value is wrong somewhere.
-# voice_assistant.py discovers it at startup instead.
+# WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE are deliberately NOT set
+# here: both are named per session, so any fixed value is wrong somewhere.
+# voice_assistant.py discovers them at startup instead.
 
 # Logging
 StandardOutput=journal

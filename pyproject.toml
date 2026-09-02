@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-assistant"
-version = "1.0.0"
-description = "Hyprland Voice Assistant with VAD, STT, LLM, and TTS"
-authors = [{name = "User", email = "user@localhost"}]
+version = "2.0.0"
+description = "Hyprland voice assistant: VAD, streaming STT, semantic end-of-turn, Claude or a local LLM, and streaming TTS"
+authors = [{name = "fursman"}]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
@@ -19,24 +19,38 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "Topic :: Desktop Environment",
 ]
+# Kept in step with requirements.txt, which is what setup.sh installs.
+# NOTE: onnxruntime, not onnxruntime-gpu -- they share an import namespace and
+# installing both is unsupported, and the GPU build would grab
+# CUDAExecutionProvider, which hard-fails the moment the dGPU is handed to a VM.
 dependencies = [
     "numpy>=1.24.0",
     "pyaudio>=0.2.11",
+    "soundfile>=0.12.0",
+    "scipy>=1.10.0",
     "torch>=2.0.0",
-    "torchaudio>=2.0.0", 
-    "faster-whisper>=0.9.0",
-    "anthropic>=0.8.0",
-    "onnxruntime-gpu>=1.16.0",
+    "torchaudio>=2.0.0",
     "silero-vad>=4.0.1",
+    "moonshine-voice>=0.1.3",
+    "faster-whisper>=0.9.0",
+    "kokoro-onnx>=0.4.0",
+    "onnxruntime>=1.16.0",
+    "openai>=1.0.0",
+    "huggingface_hub>=0.30.0",
 ]
 
+[project.optional-dependencies]
+# Alternative TTS engines (VOICE_ASSISTANT_TTS_ENGINE=pocket|supertonic)
+alt-tts = ["pocket-tts", "supertonic"]
+
 [project.urls]
-"Homepage" = "https://github.com/user/voice-assistant"
-"Bug Reports" = "https://github.com/user/voice-assistant/issues"
-"Source" = "https://github.com/user/voice-assistant"
+"Homepage" = "https://github.com/fursman/Assistant"
+"Bug Reports" = "https://github.com/fursman/Assistant/issues"
+"Source" = "https://github.com/fursman/Assistant"
 
 [project.scripts]
 voice-assistant = "voice_assistant:main"
