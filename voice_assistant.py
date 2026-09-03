@@ -33,6 +33,8 @@ Thinking streams as 🧠 notifications; reply sentences reach TTS as they arrive
 
 import asyncio
 import collections
+import difflib
+import html
 import json
 import logging
 import logging.handlers
@@ -167,6 +169,16 @@ STT_ENGINE = os.getenv("VOICE_ASSISTANT_STT_ENGINE", "moonshine")
 # Because the model runs while you speak, its extra cost is off the critical
 # path: the flush after the last word is 10-30 ms either way.
 MOONSHINE_MODEL = os.getenv("VOICE_ASSISTANT_MOONSHINE_MODEL", "medium_streaming")
+# Names the recogniser cannot be expected to know -- people, places, products,
+# jargon -- one per line, "#" for comments. Moonshine takes no hotword list, so
+# these are matched against the finished transcript instead. See
+# VocabularyCorrector for why the matching is deliberately timid.
+STT_VOCAB_FILE = Path(os.getenv("VOICE_ASSISTANT_VOCABULARY",
+                                str(Path.home() / ".config/voice-assistant/vocabulary.txt")))
+# How close a near-miss has to be before it is corrected. 0.80 fixes "Fersman"
+# and "Hyperland"; going lower starts rewriting ordinary words that merely
+# rhyme with something on the list.
+STT_VOCAB_MIN_RATIO = float(os.getenv("VOICE_ASSISTANT_VOCABULARY_RATIO", "0.80"))
 # Seconds of new audio between decoding passes while you are speaking. These
 # passes are not optional bookkeeping -- they ARE the transcription: measured
 # here, suppressing them entirely and asking for the text at the end returns an
@@ -1535,6 +1547,99 @@ class ClaudeSession:
 # Tool-call markup gate
 # ---------------------------------------------------------------------------
 
+class VocabularyCorrector:
+    """Repair names the recogniser cannot know, from a user-supplied list.
+
+    Moonshine has no biasing hook -- no initial prompt, no hotword list -- so
+    proper nouns come back as whatever ordinary words they sound like. In one
+    session it produced "Fersman" for the user's own surname and "Communication
+    and Securities Establishment" for the Communications Security Establishment.
+    Those are close misses, and close misses are repairable after the fact.
+
+    Deliberately conservative, because a wrong correction is worse than the
+    original: only near-misses are touched, an exact word is left alone, and a
+    window that is already correct is never rewritten. It cannot help with a
+    miss that is not phonetically close -- "dwarf" heard as "pork" is gone, and
+    no list brings it back.
+    """
+
+    # Windows are tried from this many words down to one. A term is not
+    # matched only against windows of its own length: the recogniser splits
+    # and joins words as readily as it mishears them, so "Moonshine" arrives
+    # as "moon shine" and a three-word name as four ("Communication and
+    # Securities Establishment").
+    MAX_WINDOW = 4
+
+    def __init__(self, terms, min_ratio, logger):
+        self.logger = logger
+        self.min_ratio = min_ratio
+        self.terms = [t for t in terms if t.strip()]
+        self.count = len(self.terms)
+
+    @classmethod
+    def load(cls, path, min_ratio, logger):
+        terms = []
+        try:
+            if path.exists():
+                terms = [l.strip() for l in path.read_text().splitlines()
+                         if l.strip() and not l.startswith("#")]
+        except OSError as e:
+            logger.warning(f"Could not read vocabulary {path}: {e}")
+        if terms:
+            logger.info(f"Vocabulary: {len(terms)} terms from {path}")
+        return cls(terms, min_ratio, logger)
+
+    def __call__(self, text: str) -> str:
+        if not self.count or not text:
+            return text
+        tokens = re.findall(r"\S+", text)
+        if not tokens:
+            return text
+        bare = [re.sub(r"^\W+|\W+$", "", t) for t in tokens]
+
+        # Score every window, then apply best-first. Taking the first window
+        # that cleared the bar instead let a longer one swallow its neighbour:
+        # "on salt spring island" matches "Salt Spring Island" well enough to
+        # pass, and "on" disappeared with it. The tight window always scores
+        # higher, so ranking by score picks it.
+        candidates = []
+        for n in range(self.MAX_WINDOW, 0, -1):
+            for i in range(len(tokens) - n + 1):
+                window = " ".join(x for x in bare[i:i + n] if x)
+                if len(window) < 4:
+                    continue
+                best, ratio = None, 0.0
+                for term in self.terms:
+                    if window == term:
+                        # Already right. Still claim the span, so no wider
+                        # window can match across it and eat a real word.
+                        best, ratio = None, 1.0
+                        break
+                    r = difflib.SequenceMatcher(None, window.lower(), term.lower()).ratio()
+                    if r > ratio:
+                        best, ratio = term, r
+                if ratio >= self.min_ratio:
+                    candidates.append((ratio, n, i, window, best))
+
+        used = [False] * len(tokens)
+        for ratio, n, i, window, best in sorted(candidates, key=lambda c: (-c[0], -c[1])):
+            if any(used[i:i + n]):
+                continue
+            for k in range(i, i + n):
+                used[k] = True
+            if best is None:
+                continue                    # exact match, nothing to rewrite
+            # Keep whatever punctuation hung off the ends of the window.
+            first, last = tokens[i], tokens[i + n - 1]
+            lead = first[:len(first) - len(first.lstrip("\"'([{"))]
+            tail = last[len(last.rstrip(".,!?;:\"')]}")):]
+            self.logger.info(f"Vocabulary: {window!r} -> {best!r} ({ratio:.2f})")
+            tokens[i] = lead + best + tail
+            for k in range(i + 1, i + n):
+                tokens[k] = ""
+        return " ".join(t for t in tokens if t)
+
+
 class ToolMarkupGate:
     """Keeps raw tool-call markup out of the speech pipeline.
 
@@ -1636,6 +1741,8 @@ class VoiceAssistant:
         self.chimes_dir.mkdir(exist_ok=True)
 
         self._setup_logging()
+        self._vocab = VocabularyCorrector.load(
+            STT_VOCAB_FILE, STT_VOCAB_MIN_RATIO, self.logger)
         self._preflight_checks()
         self._session_id = self._load_session_id()
         self._load_local_history()
@@ -3644,9 +3751,9 @@ class VoiceAssistant:
                 text = finish()
                 if text is not None:
                     self.logger.info(f"Streamed transcript in {time.time() - t0:.3f}s")
-                    return text
+                    return self._vocab(text)
             segments, _ = self.stt.transcribe(audio_data)
-            return " ".join(seg.text for seg in segments).strip()
+            return self._vocab(" ".join(seg.text for seg in segments).strip())
         except Exception as e:
             self.logger.error(f"Transcription error: {e}")
             return ""
