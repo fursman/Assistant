@@ -3533,12 +3533,18 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.error(f"Processing error: {e}", exc_info=True)
         finally:
-            # Swallow the room's tail rather than transcribe our own voice,
-            # then listen again. A fixed short gate: waiting for the room to go
-            # quiet threw away the user's reply whenever they answered promptly.
-            if TTS_TAIL_GATE > 0:
-                await asyncio.sleep(TTS_TAIL_GATE)
-            self.capture.flush()
+            # Both of these exist to swallow the room's tail rather than
+            # transcribe our own voice -- so both are conditional on having
+            # actually spoken. On a turn that produced nothing (a breath that
+            # tripped the detector, an echo, a rejected transcript) there is no
+            # tail to swallow, and holding the microphone shut for the gate and
+            # then discarding what it missed lands squarely on the first word of
+            # whatever the user is about to say. That accounted for 12 of 46
+            # turns in one session, seven of them immediately before a real one.
+            if spoke:
+                if TTS_TAIL_GATE > 0:
+                    await asyncio.sleep(TTS_TAIL_GATE)
+                self.capture.flush()
             self.capture.mute(False)
             self.vad.reset()
             self.is_processing = False
