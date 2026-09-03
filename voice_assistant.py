@@ -933,6 +933,49 @@ def _user_unit(unit: str) -> dict:
         return {}
 
 
+def _start_user_unit(unit: str) -> bool:
+    """Start a --user unit without waiting for it to be ready.
+
+    --no-block because qwen38.service takes ~35 s to load the model and its
+    ExecStartPost waits for /health. Blocking here would freeze the keypress
+    that asked for the switch.
+    """
+    try:
+        subprocess.run(["systemctl", "--user", "start", "--no-block", unit],
+                       capture_output=True, timeout=10, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def _write_env_setting(key: str, value: str):
+    """Persist one KEY=value in the env file the service reads at start.
+
+    Same file `voice-llm` edits, so the two agree about which backend is
+    selected. Written whole and replaced atomically; a partial env file would
+    take the assistant down on its next restart.
+    """
+    path = Path.home() / ".config/voice-assistant/env"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = path.read_text().splitlines() if path.exists() else []
+        out, done = [], False
+        for line in lines:
+            if re.match(rf"\s*{re.escape(key)}\s*=", line):
+                if not done:
+                    out.append(f"{key}={value}")
+                    done = True
+            else:
+                out.append(line)
+        if not done:
+            out.append(f"{key}={value}")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("\n".join(out) + "\n")
+        tmp.replace(path)
+    except OSError as e:
+        logging.getLogger("voice-assistant").warning(f"Could not persist {key}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # End-of-turn model
 # ---------------------------------------------------------------------------
@@ -1758,15 +1801,21 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _resolve_backend(self):
-        """Choose 'local' or 'claude' once at startup. Returns (backend, why)."""
+        """Choose 'local' or 'claude'. Returns (backend, why).
+
+        Reads self.backend_pref rather than the environment, so a runtime
+        switch (SUPER+M, `assistant --swap`) goes through the same reasoning as
+        startup does -- including the fallbacks for a card that is busy or a
+        server that is not up yet.
+        """
         self._claude_available = shutil.which("claude") is not None
-        if LLM_BACKEND == "claude":
-            return "claude", "VOICE_ASSISTANT_LLM_BACKEND=claude"
-        if LLM_BACKEND == "local":
-            return "local", "VOICE_ASSISTANT_LLM_BACKEND=local"
-        if LLM_BACKEND != "auto":
-            self.logger.warning(
-                f"Unknown VOICE_ASSISTANT_LLM_BACKEND={LLM_BACKEND!r}; using auto")
+        pref = getattr(self, "backend_pref", LLM_BACKEND)
+        if pref == "claude":
+            return "claude", "asked for claude"
+        if pref == "local":
+            return "local", "asked for the local model"
+        if pref != "auto":
+            self.logger.warning(f"Unknown backend preference {pref!r}; using auto")
 
         # A server that already answers wins: it may be on a GPU nvidia-smi
         # cannot see, or somewhere else entirely.
@@ -1794,6 +1843,7 @@ class VoiceAssistant:
     def _preflight_checks(self):
         """Verify runtime requirements. Never fatal: a degraded assistant that
         says why is more useful than one that refuses to start."""
+        self.backend_pref = LLM_BACKEND
         self.backend, why = self._resolve_backend()
         self.logger.info(f"LLM backend: {self.backend} ({why})")
 
@@ -3303,6 +3353,44 @@ class VoiceAssistant:
             self._cue_fallback(state)
             return "claude"
         return "local"
+
+    BACKEND_LABEL = {"local": "Local Qwen3.8", "claude": "Claude"}
+
+    def _switch_backend(self, value: str) -> dict:
+        """Change which model answers. 'local' | 'claude' | 'auto' | 'toggle'.
+
+        The preference is written back to the env file so it survives a restart
+        and `voice-llm status` agrees with what is actually happening. The local
+        server is started if it is not up, because otherwise switching to it
+        just falls back to Claude on every query and the switch looks broken.
+        Nothing is ever stopped here: `voice-llm claude` is the deliberate way
+        to free the card for GPU passthrough, and a hotkey should not do that
+        by surprise.
+        """
+        if value == "toggle":
+            value = "claude" if self.backend == "local" else "local"
+        if value not in ("local", "claude", "auto"):
+            return {"ok": False, "error": f"unknown backend {value!r}"}
+
+        self.backend_pref = value
+        self.backend, why = self._resolve_backend()
+        _write_env_setting("VOICE_ASSISTANT_LLM_BACKEND", value)
+
+        note = ""
+        if self.backend == "local":
+            state = _local_llm_health()
+            if state != "ready":
+                started = _start_user_unit(LOCAL_LLM_UNIT)
+                note = (" (loading, Claude answers meanwhile)" if started
+                        else f" ({LOCAL_LLM_UNIT} would not start)")
+                self.logger.info(f"Backend -> local; server {state}, start={started}")
+        label = self.BACKEND_LABEL.get(self.backend, self.backend)
+        self.logger.info(f"Backend switched to {self.backend} ({why}){note}")
+        self._notify(f"🔀 {label}{note}", title="Assistant model",
+                     timeout_ms=3000, slot="backend")
+        self._set_waybar_status("ready" if self.is_active else "off")
+        return {"ok": True, "backend": self.backend, "preference": self.backend_pref,
+                "label": label, "why": why, "note": note.strip()}
 
     def _cue_fallback(self, why):
         """Make it obvious this answer is coming from Claude, not the local model."""
