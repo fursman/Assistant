@@ -216,8 +216,8 @@ TTS_PREBUFFER_MAX_WAIT = float(os.getenv("VOICE_ASSISTANT_TTS_PREBUFFER_WAIT", "
 # be "wait for three quiet chunks", which threw away the user's reply whenever
 # they answered promptly -- exactly when the assistant had asked a question.
 TTS_TAIL_GATE = float(os.getenv("VOICE_ASSISTANT_TTS_TAIL_GATE", "0.35"))
-# Replay the activation chime when the microphone goes live again after a
-# reply, so "I have finished speaking" and "I am listening" are distinct events.
+# Ding when the microphone goes live again after a reply, so "I have finished
+# speaking" and "I am listening" are distinct events.
 LISTEN_RESUME_CHIME = os.getenv("VOICE_ASSISTANT_LISTEN_CHIME", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 
@@ -385,6 +385,17 @@ _NEW_SESSION_LEAD_INS = ("ok ", "okay ", "hey ", "please ", "can you ", "could y
 
 CHIME_SAMPLE_RATE = 44100
 CHIME_NOTE_DURATION = 0.2
+
+# The "your turn" ding. G5, the lowest of the pitches tried, kept short so it
+# reads as punctuation between turns rather than another announcement.
+CHIME_DING_FREQ = 784.0
+CHIME_DING_DURATION = 0.22
+# Quieter than the boops' 0.3, and quieter again in RMS because it decays
+# almost immediately: 0.062 against 0.176 for the rising triad.
+CHIME_DING_GAIN = 0.22
+# Bumped whenever a chime recipe above changes, so the cached WAVs in the state
+# directory are rebuilt instead of a stale one playing forever.
+CHIME_RECIPE_VERSION = "2"
 
 # Regex to strip markdown formatting before TTS
 _MD_STRIP = re.compile(
@@ -2140,23 +2151,31 @@ class VoiceAssistant:
 
     def _ensure_chimes(self):
         chimes = {
-            "listening": ([440, 523.25, 659.25], False),
-            "processing": ([440], True),
-            "deactivate": ([659.25, 523.25, 440], False),
+            "listening": lambda: self._create_chime([440, 523.25, 659.25]),
+            "processing": lambda: self._create_chime([440], fade=True),
+            "deactivate": lambda: self._create_chime([659.25, 523.25, 440]),
             # Distinct two-note fall for "this one is going to Claude instead".
-            "fallback": ([440, 349.23], True),
+            "fallback": lambda: self._create_chime([440, 349.23], fade=True),
+            # "Your turn" -- a bell, not a boop. See _create_ding.
+            "ready": self._create_ding,
         }
-        if all((self.chimes_dir / f"{n}.wav").exists() for n in chimes):
+        # The files are cached, so a changed recipe would otherwise never be
+        # heard. The version stamp is what makes editing one above take effect.
+        stamp = self.chimes_dir / ".version"
+        current = stamp.read_text().strip() if stamp.exists() else ""
+        if (current == CHIME_RECIPE_VERSION
+                and all((self.chimes_dir / f"{n}.wav").exists() for n in chimes)):
             return
-        for name, (freqs, fade) in chimes.items():
-            data = self._create_chime(freqs, fade)
+        for name, build in chimes.items():
+            data = build()
             path = self.chimes_dir / f"{name}.wav"
             with wave.open(str(path), "wb") as f:
                 f.setnchannels(1)
                 f.setsampwidth(2)
                 f.setframerate(CHIME_SAMPLE_RATE)
                 f.writeframes(data.tobytes())
-        self.logger.info("Chimes generated")
+        stamp.write_text(CHIME_RECIPE_VERSION + "\n")
+        self.logger.info(f"Chimes generated (recipe v{CHIME_RECIPE_VERSION})")
 
     def _create_chime(self, frequencies, fade=False):
         spn = int(CHIME_SAMPLE_RATE * CHIME_NOTE_DURATION)
@@ -2168,6 +2187,32 @@ class VoiceAssistant:
             if fade and i == len(frequencies) - 1:
                 env *= np.linspace(1, 0, spn)
             audio[i * spn:(i + 1) * spn] = note * env
+        return (audio * 32767).astype(np.int16)
+
+    def _create_ding(self):
+        """A short struck bell, for "your turn".
+
+        Deliberately not another boop. The rising triad means "voice mode is
+        on", and replaying it after every reply made a state change and an
+        ordinary turn boundary sound identical.
+
+        Three partials on a near-harmonic series, each decaying faster than the
+        one below it. That fall-off is the whole trick: it is what reads as
+        struck rather than blown, and it is why the tone darkens as it fades.
+        The 4 ms attack and the 20 ms cosine release exist so the speaker does
+        not click at either end -- an abrupt start or a waveform cut off
+        mid-cycle is a step, and a step is a click.
+        """
+        n = int(CHIME_SAMPLE_RATE * CHIME_DING_DURATION)
+        t = np.linspace(0, CHIME_DING_DURATION, n, endpoint=False)
+        audio = np.zeros(n)
+        for ratio, amp, decay in ((1.0, 1.0, 13.0), (2.0, 0.25, 19.0), (2.99, 0.08, 26.0)):
+            audio += amp * np.sin(2 * np.pi * CHIME_DING_FREQ * ratio * t) * np.exp(-decay * t)
+        attack = int(CHIME_SAMPLE_RATE * 0.004)
+        audio[:attack] *= 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, attack)))
+        release = int(CHIME_SAMPLE_RATE * 0.020)
+        audio[-release:] *= 0.5 * (1 + np.cos(np.pi * np.linspace(0, 1, release)))
+        audio *= CHIME_DING_GAIN / np.max(np.abs(audio))
         return (audio * 32767).astype(np.int16)
 
     def _play_chime(self, name):
@@ -3499,13 +3544,15 @@ class VoiceAssistant:
             self.is_processing = False
             if self.is_active:
                 self._set_waybar_status("ready")
-                # The same chime as switching voice mode on: it is the sound of
-                # "your turn". Without it the end of a reply and the moment the
-                # microphone is live again are indistinguishable. Only after we
-                # actually spoke -- a rejected or empty transcript never
-                # interrupted the listening state to begin with.
+                # A soft ding, not the rising triad that means "voice mode is
+                # on": this happens after every reply, and hearing the startup
+                # sound each time made an ordinary turn boundary sound like a
+                # state change. Without any cue at all, though, the end of a
+                # reply and the moment the microphone is live again are
+                # indistinguishable. Only after we actually spoke -- a rejected
+                # or empty transcript never interrupted listening to begin with.
                 if spoke and LISTEN_RESUME_CHIME:
-                    self._play_chime_async("listening")
+                    self._play_chime_async("ready")
 
     def _say(self, text):
         """Speak one short line outside the streaming pipeline (confirmations)."""
