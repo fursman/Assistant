@@ -21,6 +21,9 @@ on your machine.
 ## How it works
 
 1. **SUPER** toggles voice mode. Waybar shows the state; chimes mark the edges.
+   **SUPER+M** swaps between the local model and Claude; **SUPER+SHIFT+V**
+   starts a new conversation. You can also just type: `assistant <question>`
+   joins the same conversation from a terminal.
 2. **Silero VAD** watches the mic. Speech has to persist for ~96 ms before a
    turn starts, so a cough does not trigger one.
 3. **Moonshine** transcribes *while you are still speaking*, so when you stop
@@ -100,6 +103,41 @@ voice-llm claude                 # force Claude and stop the server (frees the G
 
 Say **"new conversation"** (or "start over", "forget everything") to clear the
 context by voice.
+
+### Asking from a terminal
+
+`assistant` talks to the running service over a control socket, so a typed
+question lands in the **same conversation** as a spoken one -- same history,
+same session, same tools. Ask out loud, follow up by typing, and either can
+refer to what the other said.
+
+```bash
+assistant what is using all my disk space
+assistant "remind me what we decided about the tomatoes"
+echo "summarise this" | assistant          # reads stdin when given no words
+assistant --speak "and read that one out"  # typed questions are silent by default
+assistant --status                         # model, local server, voice state, session
+assistant --new                            # start a fresh conversation
+```
+
+### Swapping models
+
+**SUPER+M** swaps which model answers -- the local Qwen3.8 or Claude -- and
+shows you which one you landed on. The same thing from a terminal:
+
+```bash
+assistant --swap                 # local <-> Claude
+assistant --backend local        # or claude, or auto
+```
+
+The choice is written to `~/.config/voice-assistant/env`, so it survives a
+restart and `voice-llm status` agrees with it. Switching *to* the local model
+starts the server if it is not up, and Claude answers the ~35 s it takes to
+load. Nothing is ever stopped by the swap: `voice-llm claude` remains the
+deliberate way to free the card for GPU passthrough.
+
+Each backend keeps its own thread. Swapping mid-conversation means the model
+you switch to has not heard what the other one did.
 
 ## LLM backend: Claude or a local Qwen3.8-27B
 
@@ -328,6 +366,7 @@ boot). The assistant keeps working either way.
 | `setup.sh` | One-shot installer, including the local LLM stack |
 | `voice-assistant-ctl` | start / stop / status / toggle / logs / test |
 | `voice-llm` | Switch and inspect the LLM backend |
+| `assistant` | Ask from a terminal, in the same conversation as the voice |
 | `voice-assistant.service` | Systemd user unit |
 | `test_installation.py` | Installation checks |
 | `contrib/qwen38.service` | Model server unit (installed when the GPU qualifies) |

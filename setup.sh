@@ -443,6 +443,7 @@ chmod +x ~/.local/bin/voice-assistant
 
 install -m 0755 voice-llm ~/.local/bin/voice-llm
 install -m 0755 voice-assistant-ctl ~/.local/bin/voice-assistant-ctl
+install -m 0755 assistant ~/.local/bin/assistant
 
 # ── Systemd Service ──────────────────────────────────────────────────────
 
@@ -466,6 +467,11 @@ exec-once = systemctl --user start voice-assistant.service
 # `python3 voice_assistant.py`, so `pkill -USR1 voice-assistant` matches nothing.
 bindr = SUPER, SUPER_L, exec, kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)
 bind = SUPER SHIFT, V, exec, kill -USR2 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)
+
+# SUPER+M swaps which model answers -- the local Qwen3.8 or Claude -- and shows
+# which one you landed on. This goes through the control socket rather than a
+# signal, so the assistant can notify and start the model server if it is down.
+bind = SUPER, M, exec, ~/.local/bin/assistant --swap
 EOF
 
 # ── Summary ──────────────────────────────────────────────────────────────

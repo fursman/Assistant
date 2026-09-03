@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Talk to the running voice assistant from a terminal.
+
+    assistant what is using all my disk space
+    assistant "remind me what we decided about the tomatoes"
+    assistant --swap                 # local model <-> Claude, with a notification
+    assistant --backend local        # or claude, or auto
+    assistant --status
+    assistant --new                  # start a fresh conversation
+
+The point is that this is the SAME conversation as the spoken one: same
+history, same session, same tools. Ask by voice, follow up by typing, and
+either one can refer to what the other said.
+
+Nothing is spoken unless you ask for it with --speak, on the assumption that
+if you are typing you would rather read the answer than wait for it to be
+read out.
+"""
+import argparse
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+SOCKET = Path(os.getenv(
+    "VOICE_ASSISTANT_SOCKET",
+    str(Path(os.getenv("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        / "voice-assistant.sock")))
+
+# Long enough for a local model that is still loading plus a few tool calls.
+TIMEOUT = float(os.getenv("VOICE_ASSISTANT_CLI_TIMEOUT", "300"))
+
+
+def request(payload: dict) -> dict:
+    if not SOCKET.exists():
+        die("the voice assistant is not running (no control socket at "
+            f"{SOCKET}).\nStart it with: systemctl --user start voice-assistant.service")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(TIMEOUT)
+    try:
+        s.connect(str(SOCKET))
+    except OSError as e:
+        die(f"could not reach the assistant: {e}")
+    try:
+        s.sendall((json.dumps(payload) + "\n").encode())
+        # One reply, one line. Read until the newline rather than a fixed
+        # size: a long answer arrives in several TCP-ish chunks even on a
+        # Unix socket.
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        die(f"the assistant did not answer within {TIMEOUT:.0f}s")
+    except OSError as e:
+        die(f"lost the connection: {e}")
+    finally:
+        s.close()
+    if not buf.strip():
+        die("the assistant closed the connection without answering")
+    try:
+        return json.loads(buf)
+    except json.JSONDecodeError as e:
+        die(f"could not read the reply: {e}")
+
+
+def die(message: str, code: int = 1):
+    print(f"assistant: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="assistant", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("words", nargs="*", help="your question, quoted or not")
+    p.add_argument("--speak", action="store_true", help="read the answer aloud too")
+    p.add_argument("--swap", action="store_true",
+                   help="switch between the local model and Claude")
+    p.add_argument("--backend", choices=("local", "claude", "auto"),
+                   help="select a backend explicitly")
+    p.add_argument("--status", action="store_true", help="show what is running")
+    p.add_argument("--new", action="store_true", help="start a fresh conversation")
+    p.add_argument("--json", action="store_true", help="print the raw reply")
+    args = p.parse_args()
+
+    if args.swap or args.backend:
+        r = request({"cmd": "backend", "value": args.backend or "toggle"})
+    elif args.status:
+        r = request({"cmd": "status"})
+    elif args.new:
+        r = request({"cmd": "new_session"})
+    else:
+        question = " ".join(args.words).strip()
+        if not question:
+            if sys.stdin.isatty():
+                p.print_help()
+                return 0
+            question = sys.stdin.read().strip()      # assistant < notes.txt
+        if not question:
+            die("nothing to ask")
+        r = request({"cmd": "ask", "text": question, "speak": args.speak})
+
+    if args.json:
+        print(json.dumps(r, indent=2))
+        return 0 if r.get("ok") else 1
+    if not r.get("ok"):
+        die(r.get("error", "unknown error"))
+
+    if "reply" in r:
+        print(r["reply"])
+    elif args.status:
+        voice = "listening" if r["voice_active"] else "off"
+        print(f"model      {r['label']}  (preference: {r['preference']})")
+        print(f"local llm  {r['local_llm']}")
+        print(f"voice      {voice}{'  (busy)' if r['busy'] else ''}")
+        print(f"session    {r['session']}")
+    else:
+        note = r.get("note") or ""
+        print(f"{r.get('label', r.get('message', 'done'))}{' ' + note if note else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

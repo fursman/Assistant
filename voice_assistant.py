@@ -452,6 +452,13 @@ LOCAL_VOICE_PROMPT = (
     + _SHARED_PROMPT_TAIL
 )
 
+# Where the `assistant` command reaches a running service. In the runtime
+# directory, not the state directory, because it must not outlive the boot.
+CONTROL_SOCKET = Path(os.getenv(
+    "VOICE_ASSISTANT_SOCKET",
+    str(Path(os.getenv("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        / "voice-assistant.sock")))
+
 SESSION_FILE = Path.home() / ".local/state/voice-assistant/session_id"
 LOCAL_HISTORY_FILE = Path.home() / ".local/state/voice-assistant/local_history.json"
 
@@ -3402,7 +3409,20 @@ class VoiceAssistant:
                      timeout_ms=4000, slot="progress")
         self._set_waybar_status("thinking", backend="claude")
 
-    def _query_and_speak(self, text, abort):
+    @staticmethod
+    def _discard_sentences(sentence_q):
+        """Stand-in for the TTS worker on a typed turn.
+
+        The rest of the pipeline is unchanged rather than made conditional:
+        sentences are still produced and still flushed, they just go nowhere.
+        Something has to drain the queue and answer the None sentinel, or
+        _end_tts would block forever waiting for a worker that was never
+        started.
+        """
+        while sentence_q.get() is not None:
+            pass
+
+    def _query_and_speak(self, text, abort, speak=True):
         """Send the query to a backend and stream thinking/tools/reply to TTS."""
         self._thinking_text = ""
         self._thinking_shown_len = 0
@@ -3422,7 +3442,11 @@ class VoiceAssistant:
         self._sentence_queue = sentence_q
 
         tts_thread = None
-        if self.tts_available and self.kokoro:
+        if not speak:
+            tts_thread = threading.Thread(
+                target=self._discard_sentences, args=(sentence_q,), daemon=True)
+            tts_thread.start()
+        elif self.tts_available and self.kokoro:
             if not self.player.running:
                 try:
                     self.player.start()
@@ -3850,6 +3874,119 @@ class VoiceAssistant:
     # Main listen loop
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Control socket
+    # ------------------------------------------------------------------
+    #
+    # One JSON object per line, one exchange per connection. This is what the
+    # `assistant` command talks to, so a typed question lands in the same
+    # conversation as a spoken one -- same history, same session, same tools --
+    # instead of being a second assistant that knows nothing about the first.
+
+    async def _serve_control(self):
+        path = CONTROL_SOCKET
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # A socket left behind by a killed process would make bind fail.
+            # Safe to remove: if a live instance owned it we would not be here,
+            # since only one service instance runs at a time.
+            if path.exists():
+                path.unlink()
+            server = await asyncio.start_unix_server(self._control_client, str(path))
+        except Exception as e:
+            self.logger.warning(f"Control socket unavailable at {path}: {e}")
+            return
+        os.chmod(path, 0o600)
+        self.logger.info(f"Control socket: {path}")
+        async with server:
+            await server.serve_forever()
+
+    async def _control_client(self, reader, writer):
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            try:
+                req = json.loads(line or b"{}")
+            except json.JSONDecodeError as e:
+                reply = {"ok": False, "error": f"bad request: {e}"}
+            else:
+                reply = await self._control_command(req)
+            writer.write((json.dumps(reply) + "\n").encode())
+            await writer.drain()
+        except (asyncio.TimeoutError, ConnectionError):
+            pass
+        except Exception as e:
+            self.logger.error(f"Control socket error: {e}", exc_info=True)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    async def _control_command(self, req: dict) -> dict:
+        cmd = str(req.get("cmd", "")).strip()
+        if cmd == "status":
+            return {"ok": True, "backend": self.backend,
+                    "preference": self.backend_pref,
+                    "label": self.BACKEND_LABEL.get(self.backend, self.backend),
+                    "local_llm": _local_llm_health(),
+                    "voice_active": self.is_active, "busy": self.is_processing,
+                    "session": self._session_id}
+        if cmd == "backend":
+            return self._switch_backend(str(req.get("value", "toggle")))
+        if cmd == "new_session":
+            self._new_session()
+            return {"ok": True, "message": "started a new conversation"}
+        if cmd == "ask":
+            return await self._control_ask(str(req.get("text", "")),
+                                           bool(req.get("speak", False)),
+                                           float(req.get("wait", 180)))
+        return {"ok": False, "error": f"unknown command {cmd!r}"}
+
+    async def _control_ask(self, text: str, speak: bool, wait: float) -> dict:
+        text = text.strip()
+        if not text:
+            return {"ok": False, "error": "empty question"}
+        loop = asyncio.get_running_loop()
+
+        # One turn at a time. The turn state (_assistant_text, the sentence
+        # queue, the tool loop) lives on self, so a typed question overlapping
+        # a spoken one would interleave two replies into one. Waiting is right
+        # rather than refusing: a voice turn is seconds, and the caller is a
+        # terminal that can hold.
+        deadline = time.monotonic() + max(0.0, wait)
+        while self.is_processing and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if self.is_processing:
+            return {"ok": False, "error": "the assistant is still busy with another turn"}
+
+        self.is_processing = True
+        muted = False
+        try:
+            # If voice mode is live, stop the microphone for the duration:
+            # otherwise a spoken reply is heard and answered, and the listen
+            # loop could start recording into the middle of this turn.
+            if self.is_active:
+                self.capture.mute(True)
+                muted = True
+            self._set_waybar_status("thinking")
+            self.logger.info(f"Typed query: {text[:80]}")
+            abort = threading.Event()
+            reply = await loop.run_in_executor(
+                None, self._query_and_speak, text, abort, speak)
+            return {"ok": True, "reply": reply or "", "backend": self.backend,
+                    "spoken": speak}
+        except Exception as e:
+            self.logger.error(f"Typed query failed: {e}", exc_info=True)
+            return {"ok": False, "error": str(e)}
+        finally:
+            if muted:
+                self.capture.flush()
+                self.capture.mute(False)
+                self.vad.reset()
+            self.is_processing = False
+            self._set_waybar_status("ready" if self.is_active else "off")
+
     async def _listen_loop(self):
         loop = asyncio.get_running_loop()
         for sig, handler in ((signal.SIGUSR1, self._toggle),
@@ -3858,6 +3995,11 @@ class VoiceAssistant:
             # loop between iterations rather than re-entrantly inside a C-level
             # handler, so a double SUPER press cannot interleave two toggles.
             loop.add_signal_handler(sig, handler)
+
+        # Runs for the life of the loop. Its own failures are logged and
+        # swallowed inside _serve_control: no control socket is a lost
+        # convenience, not a reason for the voice assistant to stop.
+        self._control_task = asyncio.create_task(self._serve_control())
 
         prev_chunk = None
         while True:
@@ -4030,6 +4172,7 @@ class VoiceAssistant:
         if hasattr(self, "audio"):
             self.audio.terminate()
         self.pid_file.unlink(missing_ok=True)
+        CONTROL_SOCKET.unlink(missing_ok=True)
         self._set_waybar_status("off")
         self.logger.info("Voice Assistant stopped")
 

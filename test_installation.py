@@ -129,6 +129,7 @@ def main():
         (here / "voices-v1.0.bin", "Kokoro voices (~28 MB)", True),
         (Path.home() / ".local/bin/voice-assistant", "Installed launcher", True),
         (Path.home() / ".local/bin/voice-llm", "Backend switcher", False),
+        (Path.home() / ".local/bin/assistant", "Terminal client", False),
         (Path.home() / ".cache/voice-assistant/smart-turn-v3.2-cpu.onnx",
          "smart-turn end-of-turn model", False),
     ]:
@@ -246,6 +247,15 @@ def main():
                  "systemctl --user start voice-assistant.service")
     except Exception as e:
         warn(f"Service check failed: {e}")
+
+    # The control socket is what `assistant` talks to. It only exists while the
+    # service is up, so a missing one is a warning, not a failure.
+    sock = Path(os.getenv("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "voice-assistant.sock"
+    if sock.is_socket():
+        ok(f"Control socket: {sock}")
+    else:
+        warn(f"No control socket at {sock}",
+             "`assistant` needs the service running")
 
     print("\n" + "=" * 44)
     print(f"📊 {results['pass']} passed, {results['warn']} warnings, "
