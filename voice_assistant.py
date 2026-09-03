@@ -261,6 +261,14 @@ LOCAL_LLM_HISTORY_TURNS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_TURNS", "
 # 32K context, after which llama-server 400s on every request and the
 # conversation is stuck until a new session.
 LOCAL_LLM_HISTORY_CHARS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_CHARS", "24000"))
+# What a tool result shrinks to once its turn is over. The model needs the full
+# output while it is reasoning, but afterwards its own spoken reply is the
+# summary, and the raw text is dead weight that evicts the conversation: five
+# 4000-character results is 20000 of the 24000-character budget, so ONE search
+# turn used to push every earlier exchange out. That is what produced "I don't
+# have the context for which three people we're discussing" one turn after the
+# names were given.
+LOCAL_TOOL_HISTORY_OUTPUT = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_HISTORY_OUTPUT", "600"))
 LOCAL_LLM_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_LOCAL_TIMEOUT", "120"))
 # Qwen3.8 reasons by default. For a voice assistant that is pure latency, so
 # thinking is OFF unless asked for. `/no_think` in the prompt does NOT work on
@@ -2549,6 +2557,22 @@ class VoiceAssistant:
             except Exception:
                 pass
 
+    @staticmethod
+    def _shrink_for_history(msg):
+        """Cut a finished turn's tool output down before it is remembered.
+
+        The model needed the whole thing while it was working; what survives is
+        for follow-up questions ("what did that say again?"), and the head of
+        the output answers those. Returns a copy -- the original is still the
+        live request payload.
+        """
+        if msg.get("role") != "tool":
+            return msg
+        content = str(msg.get("content") or "")
+        if len(content) <= LOCAL_TOOL_HISTORY_OUTPUT:
+            return msg
+        return dict(msg, content=content[:LOCAL_TOOL_HISTORY_OUTPUT] + "\n... (truncated)")
+
     def _trim_local_history(self):
         """Bound history by turns AND by size, cutting at a user boundary.
 
@@ -2562,18 +2586,25 @@ class VoiceAssistant:
         def size(msgs):
             return sum(len(str(m.get("content") or "")) for m in msgs)
 
-        keep = 2 * LOCAL_LLM_HISTORY_TURNS
-        while (len(self._local_history) > keep
+        def exchanges(msgs):
+            return sum(1 for m in msgs if m.get("role") == "user")
+
+        # Count exchanges, not messages. A turn that ran five commands is
+        # eleven messages, so a raw message cap of 2*turns threw away the
+        # conversation after two searches while claiming to keep twelve turns.
+        while (exchanges(self._local_history) > LOCAL_LLM_HISTORY_TURNS
                or size(self._local_history) > LOCAL_LLM_HISTORY_CHARS):
-            target = max(1, len(self._local_history) // 2)
-            cut = next((k for k in range(target, len(self._local_history))
+            # Drop whole exchanges from the front. Cuts land on a user message
+            # because a `tool` message orphaned from the assistant message
+            # carrying its tool_calls is a 400 on the next request.
+            cut = next((k for k in range(1, len(self._local_history))
                         if self._local_history[k].get("role") == "user"), None)
-            if cut is None or cut == 0:
-                self._local_history = []
+            if cut is None:
+                # One exchange left and it is still over budget. Keeping a
+                # single oversized turn beats dropping to nothing: the reply
+                # the user just heard stays referable.
                 return
             del self._local_history[:cut]
-            if len(self._local_history) <= 2:
-                return
 
     def _stream_local_llm(self, text, abort) -> bool:
         """Stream one reply from the local model, running tools as it asks.
@@ -2765,7 +2796,7 @@ class VoiceAssistant:
             # questions can refer back to what the commands returned. The nudge
             # is dropped: it came from us, not the user, and leaving it in makes
             # the next turn think the budget is already spent.
-            turn_msgs = [m for i, m in enumerate(messages)
+            turn_msgs = [self._shrink_for_history(m) for i, m in enumerate(messages)
                          if i >= turn_start and i != nudge_at]
             self._local_history.extend(turn_msgs)
             if reply:
