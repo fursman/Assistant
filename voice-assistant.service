@@ -1,5 +1,5 @@
 [Unit]
-Description=Hyprland Voice Assistant
+Description=Voice Assistant (Hyprland or GNOME on Wayland)
 Documentation=https://github.com/fursman/Assistant
 After=pipewire.service
 Wants=pipewire.service
@@ -22,9 +22,9 @@ Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 # %t is systemd's runtime directory (/run/user/$UID) -- do not hardcode 1000,
 # it is wrong for any user who is not the first one on the machine.
 Environment="XDG_RUNTIME_DIR=%t"
-# WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE are deliberately NOT set
-# here: both are named per session, so any fixed value is wrong somewhere.
-# voice_assistant.py discovers them at startup instead.
+# WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP and HYPRLAND_INSTANCE_SIGNATURE are
+# deliberately NOT set here: they are named per session, so any fixed value is
+# wrong somewhere. voice_assistant.py discovers them at startup instead.
 
 # Logging
 StandardOutput=journal

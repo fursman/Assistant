@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hyprland Voice Assistant
+Voice Assistant for the Linux desktop (Hyprland or GNOME on Wayland)
 
 Pipeline:
 
@@ -349,13 +349,72 @@ LOCAL_TOOL_BUDGET_PROMPT = (
 )
 
 
+# --- Desktop --------------------------------------------------------------
+# The model is told which desktop it is on, so it reaches for `hyprctl` on
+# Hyprland and `gsettings` on GNOME rather than guessing. The assistant runs
+# as a systemd user service, which inherits none of the session's variables,
+# so the user manager's environment is the fallback; on Hyprland the instance
+# socket is proof enough even when nothing was exported.
+def _detect_desktop():
+    """Return a short description like "Ubuntu, GNOME on Wayland"."""
+    override = os.getenv("VOICE_ASSISTANT_DESKTOP", "").strip()
+    if override:
+        return override
+    current = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    session = os.environ.get("XDG_SESSION_TYPE", "")
+    if not current or not session:
+        try:
+            out = subprocess.run(["systemctl", "--user", "show-environment"],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            out = ""
+        for line in out.splitlines():
+            key, _, value = line.partition("=")
+            if key == "XDG_CURRENT_DESKTOP" and not current:
+                current = value
+            elif key == "XDG_SESSION_TYPE" and not session:
+                session = value
+        # Subprocesses (the model's own commands included) get the same view.
+        if current:
+            os.environ.setdefault("XDG_CURRENT_DESKTOP", current)
+        if session:
+            os.environ.setdefault("XDG_SESSION_TYPE", session)
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    lowered = current.lower()
+    if "hyprland" in lowered or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") \
+            or any((Path(runtime) / "hypr").glob("*/.socket.sock")):
+        name = "Hyprland"
+    elif "gnome" in lowered:
+        name = "GNOME"
+    elif "kde" in lowered or "plasma" in lowered:
+        name = "KDE Plasma"
+    elif "sway" in lowered:
+        name = "Sway"
+    elif current:
+        name = current.split(":")[-1]
+    else:
+        name = "an unidentified desktop"
+    distro = "Linux"
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("NAME="):
+                distro = line.split("=", 1)[1].strip().strip('"')
+                break
+    except OSError:
+        pass
+    return f"{distro}, {name} on {(session or 'wayland').capitalize()}"
+
+
+DESKTOP = _detect_desktop()
+
+
 LOCAL_TOOLS = [{
     "type": "function",
     "function": {
         "name": "run_shell",
         "description": (
-            "Run a shell command on the user's Linux desktop (Ubuntu, Hyprland on "
-            "Wayland) and return its output. Use this whenever the answer depends "
+            "Run a shell command on the user's Linux desktop (" + DESKTOP + ") "
+            "and return its output. Use this whenever the answer depends "
             "on the state of this machine, or when the user asks you to change "
             "something. Prefer one short command. Output is truncated, so avoid "
             "commands that print huge amounts of text. Do NOT use this to search "
@@ -433,7 +492,7 @@ _SHARED_PROMPT_TAIL = (
 )
 
 CLAUDE_VOICE_PROMPT = (
-    "You are a voice assistant integrated into a Linux desktop (Hyprland on Wayland). "
+    "You are a voice assistant integrated into a Linux desktop (" + DESKTOP + "). "
     "The user speaks to you and hears your responses via text-to-speech. "
     "Keep responses concise and conversational — avoid code blocks, markdown formatting, "
     "and long lists unless specifically asked. Prefer natural spoken language. "
@@ -444,7 +503,7 @@ CLAUDE_VOICE_PROMPT = (
 )
 
 LOCAL_VOICE_PROMPT = (
-    "You are a voice assistant on a Linux desktop (Ubuntu, Hyprland on Wayland). "
+    "You are a voice assistant on a Linux desktop (" + DESKTOP + "). "
     "The user speaks to you and hears your replies through text-to-speech.\n\n"
     "Keep replies short and conversational -- usually one to three sentences. "
     "Never use markdown, code blocks, bullet lists, headings or emoji: every "
@@ -474,7 +533,7 @@ LOCAL_VOICE_PROMPT = (
 # rules as the native loop; the tools are the harness's own, so they are
 # named as the model will see them.
 DSH_VOICE_PROMPT = (
-    "You are a voice assistant on a Linux desktop (Ubuntu, Hyprland on Wayland). "
+    "You are a voice assistant on a Linux desktop (" + DESKTOP + "). "
     "The user speaks to you and hears your replies through text-to-speech.\n\n"
     "Keep replies short and conversational -- usually one to three sentences. "
     "Never use markdown, code blocks, bullet lists, headings or emoji: every "
@@ -1845,8 +1904,8 @@ class DshSession:
         checkout's and this interpreter's."""
         here = Path(__file__).resolve().parent
         bash_desc = (
-            "Run commands in a bash shell on the user's Linux desktop (Ubuntu, "
-            "Hyprland on Wayland).\n"
+            "Run commands in a bash shell on the user's Linux desktop "
+            "(" + DESKTOP + ").\n"
             "* State (working directory, variables) persists across calls.\n"
             "* This shell has internet access, but never search the web with curl: "
             "use mcp__web__web_search, which works.\n"
@@ -2061,11 +2120,13 @@ class VoiceAssistant:
 
         # Notifications we own, so closing ours does not wipe the desktop
         self._notif_ids = {}
-        self._waybar_state = "off"
+        self._notification_server = self._probe_notification_server()
+        self._status_state = "off"
 
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_status_alias()
         self.log_file = self.state_dir / "voice-assistant.log"
         self.pid_file = self.state_dir / "voice-assistant.pid"
         self.chimes_dir = self.state_dir / "chimes"
@@ -2082,7 +2143,7 @@ class VoiceAssistant:
         self._ensure_chimes()
 
         self.pid_file.write_text(str(os.getpid()))
-        self._set_waybar_status("off")
+        self._set_status("off")
 
     # ------------------------------------------------------------------
     # Preflight
@@ -2199,6 +2260,15 @@ class VoiceAssistant:
             if shutil.which(tool) is None:
                 self.logger.warning(
                     f"PREFLIGHT WARN: {tool} not found — install libnotify-bin / pipewire-bin")
+        self.logger.info(f"Desktop: {DESKTOP}")
+        if self._notification_server:
+            self.logger.info(f"Notification server: {self._notification_server}")
+        else:
+            self.logger.warning(
+                "PREFLIGHT WARN: nothing owns org.freedesktop.Notifications — the "
+                "assistant will speak, but nothing will be shown on screen "
+                "(GNOME/KDE serve this themselves; on Hyprland/Sway start swaync, "
+                "mako or dunst)")
 
     # ------------------------------------------------------------------
     # Session persistence
@@ -2774,15 +2844,42 @@ class VoiceAssistant:
     # Notifications
     # ------------------------------------------------------------------
 
+    def _probe_notification_server(self):
+        """Name of whatever answers org.freedesktop.Notifications.
+
+        GNOME Shell serves notifications itself and ignores the swaync-only
+        `suppress-popup` hint, so a "silent" update there would pop a banner
+        for every thinking fragment. Knowing the server lets `_notify` skip
+        those instead.
+        """
+        try:
+            out = subprocess.run(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.freedesktop.Notifications",
+                 "--object-path", "/org/freedesktop/Notifications",
+                 "--method", "org.freedesktop.Notifications.GetServerInformation"],
+                capture_output=True, text=True, check=False, timeout=5).stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return ""
+        m = re.match(r"\('([^']*)'", out.strip())
+        return m.group(1) if m else ""
+
     def _notify(self, message, title="Voice Assistant", timeout_ms=None,
                 silent=False, slot="main"):
         """Show a notification, replacing our previous one in the same slot.
 
         Slots exist so the assistant updates its own popup in place instead of
         stacking, and so dismissing our notifications does not take the rest of
-        the desktop's with it (which `swaync-client --close-all` did).
+        the desktop's with it (which `swaync-client --close-all` did). The
+        slots are `heard` (what you said, kept beside the reply), `progress`
+        (thinking and tool use, replaced in place and closed when the reply
+        arrives), `main` (the reply and state changes) and `backend`.
         """
-        cmd = ["notify-send", "--print-id", title, message]
+        if silent and self._notification_server == "gnome-shell":
+            # No popup-free update exists there; the slot is closed moments
+            # later anyway.
+            return
+        cmd = ["notify-send", "--print-id", "--app-name=Voice Assistant", title, message]
         if silent:
             cmd.extend(["-h", "string:suppress-popup:true", "-u", "low"])
         # -1 = never expire (freedesktop spec), overriding any server default.
@@ -2818,12 +2915,21 @@ class VoiceAssistant:
                 continue
 
     # ------------------------------------------------------------------
-    # Waybar
+    # Status file (waybar module, GNOME Shell indicator, voice-assistant-ctl)
     # ------------------------------------------------------------------
 
-    def _set_waybar_status(self, state, backend=None):
-        self._waybar_state = state
-        status_file = self.state_dir / "waybar-status"
+    def _set_status(self, state, backend=None):
+        """Publish the phase for whatever is drawing it.
+
+        One JSON file, in waybar's custom-module format because that is what
+        it started as: `text` is a glyph, `class` is `[state, backend]` so
+        both can be styled, `tooltip` is the sentence. The GNOME Shell
+        indicator (contrib/gnome) and `voice-assistant-ctl status` read the
+        same file. The write is atomic so a reader never sees a half-written
+        line, and the rename is what file monitors wake up on.
+        """
+        self._status_state = state
+        status_file = self.state_dir / "status"
         symbols = {"off": "◯", "ready": "●", "listening": "◉",
                    "thinking": "◈", "speaking": "◆"}
         payload = {
@@ -2832,7 +2938,25 @@ class VoiceAssistant:
             "tooltip": f"Voice Assistant — {state} ({backend or self.backend})",
         }
         try:
-            status_file.write_text(json.dumps(payload))
+            tmp = status_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, status_file)
+        except OSError:
+            pass
+
+    def _ensure_status_alias(self):
+        """`waybar-status` was the file's name until v2.1; keep it working.
+
+        A symlink rather than a second write: waybar configs that `cat` the
+        old name keep working with nothing to update.
+        """
+        alias = self.state_dir / "waybar-status"
+        try:
+            if alias.is_symlink():
+                return
+            if alias.exists():
+                alias.unlink()
+            alias.symlink_to("status")
         except OSError:
             pass
 
@@ -3705,7 +3829,7 @@ class VoiceAssistant:
         self.logger.info(f"Backend switched to {self.backend} ({why}){note}")
         self._notify(f"🔀 {label}{note}", title="Assistant model",
                      timeout_ms=3000, slot="backend")
-        self._set_waybar_status("ready" if self.is_active else "off")
+        self._set_status("ready" if self.is_active else "off")
         return {"ok": True, "backend": self.backend, "preference": self.backend_pref,
                 "label": label, "why": why, "note": note.strip()}
 
@@ -3717,7 +3841,7 @@ class VoiceAssistant:
         self._play_chime_async("fallback")
         self._notify(f"☁️ Local model {label} — asking Claude",
                      timeout_ms=4000, slot="progress")
-        self._set_waybar_status("thinking", backend="claude")
+        self._set_status("thinking", backend="claude")
 
     @staticmethod
     def _discard_sentences(sentence_q):
@@ -3882,7 +4006,7 @@ class VoiceAssistant:
             self.logger.info(
                 f"First audio at +{self._first_audio_at - self._turn_started_at:.2f}s")
         if self.is_active:
-            self._set_waybar_status("speaking")
+            self._set_status("speaking")
         return True
 
     def _end_tts(self, sentence_q, tts_thread, drain=True):
@@ -4014,7 +4138,7 @@ class VoiceAssistant:
             # into the new session.
             self._abort_event = threading.Event()
             self._notify("🎤 Voice Mode ON", timeout_ms=2000)
-            self._set_waybar_status("ready")
+            self._set_status("ready")
             self._play_chime_async("listening")
             # Spawn now, so a throttled CLI boot happens while the user is
             # still speaking rather than after their question. In a thread:
@@ -4023,7 +4147,7 @@ class VoiceAssistant:
         else:
             self.logger.info("Deactivated")
             self._notify("🎤 Voice Mode OFF", timeout_ms=2000)
-            self._set_waybar_status("off")
+            self._set_status("off")
             # Set the flag here so the recorder sees it within one chunk, but
             # do the teardown off the loop: waiting on a hung tool command or a
             # dying CLI can take seconds, and this callback runs ON the loop.
@@ -4087,7 +4211,7 @@ class VoiceAssistant:
                     else:
                         self.logger.info("Local LLM ready")
                     self._notify("🧠 Local model ready", timeout_ms=3000, slot="backend")
-                    self._set_waybar_status(self._waybar_state)
+                    self._set_status(self._status_state)
                 elif prev == "ready":
                     self.logger.warning(
                         f"Local LLM went {state} — queries use Claude until it is back")
@@ -4300,7 +4424,7 @@ class VoiceAssistant:
             if self.is_active:
                 self.capture.mute(True)
                 muted = True
-            self._set_waybar_status("thinking")
+            self._set_status("thinking")
             self.logger.info(f"Typed query: {text[:80]}")
             abort = threading.Event()
             reply = await loop.run_in_executor(
@@ -4316,7 +4440,7 @@ class VoiceAssistant:
                 self.capture.mute(False)
                 self.vad.reset()
             self.is_processing = False
-            self._set_waybar_status("ready" if self.is_active else "off")
+            self._set_status("ready" if self.is_active else "off")
 
     async def _listen_loop(self):
         loop = asyncio.get_running_loop()
@@ -4364,7 +4488,7 @@ class VoiceAssistant:
                 continue
 
             if self.vad.onset(chunk):
-                self._set_waybar_status("listening")
+                self._set_status("listening")
                 self.logger.info("Speech detected, recording...")
                 # The previous chunk carries the start of the word that
                 # triggered the detector.
@@ -4378,7 +4502,7 @@ class VoiceAssistant:
                     # the waybar state stays "off".
                     continue
                 self.is_processing = True
-                self._set_waybar_status("thinking")
+                self._set_status("thinking")
                 asyncio.create_task(self._process_audio(full_audio))
             else:
                 prev_chunk = chunk
@@ -4417,7 +4541,12 @@ class VoiceAssistant:
                 return
 
             self.logger.info(f"Transcription: {transcription}")
-            self._notify(f"🎤 {transcription}", title="You Said", slot="progress")
+            # Its own slot: sharing `progress` meant the first thinking or
+            # tool update replaced it within two seconds and the end of the
+            # turn closed it, so what you said was never on screen beside the
+            # answer. Now it stays until the next turn replaces it or voice
+            # mode goes off.
+            self._notify(f"🎤 {transcription}", title="You Said", slot="heard")
 
             response = await loop.run_in_executor(
                 None, self._query_and_speak, transcription, abort)
@@ -4427,7 +4556,7 @@ class VoiceAssistant:
 
             # espeak fallback when no TTS engine loaded
             if not self.tts_available and self.is_active:
-                self._set_waybar_status("speaking")
+                self._set_status("speaking")
                 await loop.run_in_executor(
                     None,
                     lambda: subprocess.run(
@@ -4452,7 +4581,7 @@ class VoiceAssistant:
             self.vad.reset()
             self.is_processing = False
             if self.is_active:
-                self._set_waybar_status("ready")
+                self._set_status("ready")
                 # A soft ding, not the rising triad that means "voice mode is
                 # on": this happens after every reply, and hearing the startup
                 # sound each time made an ordinary turn boundary sound like a
@@ -4470,7 +4599,7 @@ class VoiceAssistant:
         try:
             if not self.player.running:
                 self.player.start()
-            self._set_waybar_status("speaking")
+            self._set_status("speaking")
             samples, sr = self.kokoro.create(
                 _prepare_for_speech(text), voice=TTS_VOICE, speed=TTS_SPEED)
             self.player.write(_resample_to(samples, sr, self.player.rate))
@@ -4504,7 +4633,7 @@ class VoiceAssistant:
             self.audio.terminate()
         self.pid_file.unlink(missing_ok=True)
         CONTROL_SOCKET.unlink(missing_ok=True)
-        self._set_waybar_status("off")
+        self._set_status("off")
         self.logger.info("Voice Assistant stopped")
 
     def run(self):

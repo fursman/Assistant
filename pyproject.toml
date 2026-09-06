@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-assistant"
-version = "2.0.0"
-description = "Hyprland voice assistant: VAD, streaming STT, semantic end-of-turn, Claude or a local LLM, and streaming TTS"
+version = "2.1.0"
+description = "Linux desktop voice assistant (Hyprland or GNOME): VAD, streaming STT, semantic end-of-turn, Claude or a local LLM, and streaming TTS"
 authors = [{name = "fursman"}]
 license = {text = "MIT"}
 readme = "README.md"

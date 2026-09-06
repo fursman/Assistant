@@ -49,10 +49,10 @@ show_status() {
         echo -e "Process:  ${RED}NOT RUNNING${NC}"
     fi
 
-    # Whatever the assistant last wrote for waybar is its live state.
-    if [[ -f "$STATE_DIR/waybar-status" ]]; then
-        STATE=$(sed -n 's/.*"class": *\[ *"\([a-z]*\)".*/\1/p' "$STATE_DIR/waybar-status")
-        BACKEND=$(sed -n 's/.*"class": *\[ *"[a-z]*", *"\([a-z]*\)".*/\1/p' "$STATE_DIR/waybar-status")
+    # Whatever the assistant last published for the status bar is its live state.
+    if [[ -f "$STATE_DIR/status" ]]; then
+        STATE=$(sed -n 's/.*"class": *\[ *"\([a-z]*\)".*/\1/p' "$STATE_DIR/status")
+        BACKEND=$(sed -n 's/.*"class": *\[ *"[a-z]*", *"\([a-z]*\)".*/\1/p' "$STATE_DIR/status")
         echo -e "Voice:    ${GREEN}${STATE:-unknown}${NC}   Backend: ${GREEN}${BACKEND:-unknown}${NC}"
     fi
 
@@ -164,7 +164,7 @@ Commands:
   start        Start the service
   stop         Stop the service
   restart      Restart the service
-  toggle       Toggle voice mode on/off (same as tapping SUPER)
+  toggle       Toggle voice mode on/off (same as the toggle key)
   new-session  Start a new conversation
   logs [N]     Show the last N lines (default 50)
   logs -f      Follow the logs
