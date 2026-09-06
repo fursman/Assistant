@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Hyprland Voice Assistant setup.
+# Voice Assistant setup (Hyprland or GNOME on Wayland).
 #
 # Installs the CPU pipeline (VAD, STT, end-of-turn model, TTS) on any machine,
 # and additionally builds the local LLM stack when this machine has an NVIDIA
@@ -15,20 +15,23 @@ set -e
 #   ./setup.sh --rebuild-llama rebuild llama.cpp
 #   ./setup.sh --reinstall     recreate the Python venv from scratch
 #   ./setup.sh --sleep-units   only (re)install the suspend/resume units
+#   ./setup.sh --desktop       only (re)install the desktop integration: key
+#                              bindings and the status indicator for this desktop
 
-NO_LLM=0; REBUILD_LLAMA=0; REINSTALL=0; SLEEP_UNITS_ONLY=0
+NO_LLM=0; REBUILD_LLAMA=0; REINSTALL=0; SLEEP_UNITS_ONLY=0; DESKTOP_ONLY=0
 for a in "$@"; do
     case "$a" in
         --no-llm) NO_LLM=1 ;;
         --rebuild-llama) REBUILD_LLAMA=1 ;;
         --reinstall) REINSTALL=1 ;;
         --sleep-units) SLEEP_UNITS_ONLY=1 ;;
-        -h|--help) sed -n '3,20p' "$0"; exit 0 ;;
+        --desktop) DESKTOP_ONLY=1 ;;
+        -h|--help) sed -n '3,22p' "$0"; exit 0 ;;
         *) echo "unknown option: $a (try --help)"; exit 2 ;;
     esac
 done
 
-echo "🎤 Setting up Hyprland Voice Assistant..."
+echo "🎤 Setting up the Voice Assistant..."
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -79,6 +82,137 @@ if [[ "$SLEEP_UNITS_ONLY" == 1 ]]; then
     exit 0
 fi
 
+# ── Desktop integration ──────────────────────────────────────────────────
+#
+# The assistant itself is desktop-agnostic (notify-send, a status file, two
+# signals). What differs per desktop is how the key bindings are declared and
+# what draws the status: a waybar module on Hyprland, a Shell extension on
+# GNOME. Everything in this section is idempotent and re-runnable on its own
+# with `./setup.sh --desktop`.
+
+detect_desktop() {
+    local d="${XDG_CURRENT_DESKTOP:-}"
+    [[ -z "$d" ]] && d=$(systemctl --user show-environment 2>/dev/null \
+                          | sed -n 's/^XDG_CURRENT_DESKTOP=//p')
+    local runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" || "${d,,}" == *hyprland* ]] \
+        || compgen -G "$runtime/hypr/*/.socket.sock" >/dev/null; then
+        echo hyprland
+    elif [[ "${d,,}" == *gnome* ]]; then
+        echo gnome
+    else
+        echo "${d:-unknown}"
+    fi
+}
+
+# gsettings arrays are typed text; appending one element by hand is the only
+# way to do it without pulling in Python for a one-liner.
+gsettings_list_add() { # <schema> <key> <element>
+    local cur
+    cur=$(gsettings get "$1" "$2")
+    [[ "$cur" == *"'$3'"* ]] && return 0
+    if [[ "$cur" == "@as []" || "$cur" == "[]" ]]; then
+        gsettings set "$1" "$2" "['$3']"
+    else
+        gsettings set "$1" "$2" "${cur%]}, '$3']"
+    fi
+}
+
+gnome_keybinding() { # <slug> <name> <binding> <command>
+    local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/$1/"
+    local schema="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$path"
+    gsettings set "$schema" name "$2"
+    gsettings set "$schema" binding "$3"
+    gsettings set "$schema" command "$4"
+    gsettings_list_add org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$path"
+}
+
+install_gnome_integration() {
+    local uuid="voice-assistant-indicator@fursman.com"
+    local src="$SCRIPT_DIR/contrib/gnome/$uuid"
+    local dst="$HOME/.local/share/gnome-shell/extensions/$uuid"
+    local changed=0
+
+    log_info "Installing the GNOME Shell indicator ($uuid)..."
+    mkdir -p "$dst"
+    for f in "$src"/*; do
+        if ! cmp -s "$f" "$dst/$(basename "$f")"; then
+            install -m 0644 "$f" "$dst/"
+            changed=1
+        fi
+    done
+    # Enabled through the setting rather than `gnome-extensions enable`: the
+    # CLI refuses an extension the running Shell has not loaded yet, and on
+    # Wayland it will not load a new one until the next login.
+    gsettings_list_add org.gnome.shell enabled-extensions "$uuid"
+
+    log_info "Installing GNOME key bindings..."
+    # Bare SUPER is GNOME's activities key, so the toggle lives on SUPER+M and
+    # the model swap moves to SUPER+SHIFT+M. GNOME binds SUPER+M to the
+    # notification list by default; it keeps SUPER+V for that.
+    local tray
+    tray=$(gsettings get org.gnome.shell.keybindings toggle-message-tray)
+    if [[ "$tray" == *"<Super>m"* ]]; then
+        gsettings set org.gnome.shell.keybindings toggle-message-tray "['<Super>v']"
+        log_info "  freed SUPER+M from the notification list (still on SUPER+V)"
+    fi
+    gnome_keybinding voice-toggle "Voice assistant: toggle" "<Super>m" \
+        "$HOME/.local/bin/voice-assistant-ctl toggle"
+    gnome_keybinding voice-new-session "Voice assistant: new conversation" "<Shift><Super>v" \
+        "$HOME/.local/bin/voice-assistant-ctl new-session"
+    gnome_keybinding voice-swap-model "Voice assistant: swap model" "<Shift><Super>m" \
+        "$HOME/.local/bin/assistant --swap"
+
+    DESKTOP_NOTES=(
+        "Keys: SUPER+M toggles voice mode, SUPER+SHIFT+V starts a new"
+        "      conversation, SUPER+SHIFT+M swaps the model (all active now)."
+    )
+    if [[ "$changed" == 1 ]]; then
+        DESKTOP_NOTES+=(
+            "Top-bar indicator: installed. GNOME on Wayland only loads new or"
+            "      changed extensions at login, so log out and back in to see it."
+        )
+    else
+        DESKTOP_NOTES+=("Top-bar indicator: already installed and up to date.")
+    fi
+}
+
+install_hyprland_integration() {
+    local conf="$SCRIPT_DIR/contrib/hyprland/hyprland-voice-assistant.conf"
+    local hypr="$HOME/.config/hypr/hyprland.conf"
+    if [[ -f "$hypr" ]] && grep -q 'voice-assistant' "$hypr"; then
+        DESKTOP_NOTES=("Hyprland: hyprland.conf already references the assistant; nothing to do.")
+    else
+        DESKTOP_NOTES=(
+            "Hyprland: add the key bindings with ONE of"
+            "      echo 'source = $conf' >> $hypr"
+            "      cat $conf >> $hypr"
+            "      then reload Hyprland. Waybar module: see README.md."
+        )
+    fi
+}
+
+DESKTOP_NOTES=()
+DESKTOP_KIND=$(detect_desktop)
+case "$DESKTOP_KIND" in
+    gnome)    install_gnome_integration ;;
+    hyprland) install_hyprland_integration ;;
+    *)
+        DESKTOP_NOTES=(
+            "Desktop '$DESKTOP_KIND' has no integration here. Bind two commands:"
+            "      voice-assistant-ctl toggle        (voice mode on/off)"
+            "      voice-assistant-ctl new-session   (fresh conversation)"
+            "      and read ~/.local/state/voice-assistant/status for the phase."
+        )
+        ;;
+esac
+
+if [[ "$DESKTOP_ONLY" == 1 ]]; then
+    log_success "Desktop integration ($DESKTOP_KIND) done"
+    printf '   %s\n' "${DESKTOP_NOTES[@]}"
+    exit 0
+fi
+
 # ── System Requirements ──────────────────────────────────────────────────
 
 log_info "Checking system requirements..."
@@ -105,6 +239,7 @@ REQUIRED_PACKAGES=(
     "pipewire-bin"
     "pipewire-pulse"
     "libnotify-bin"
+    "libglib2.0-bin"
     "pkg-config"
     "build-essential"
     "curl"
@@ -121,12 +256,15 @@ if [ ${#MISSING_PACKAGES[@]} -ne 0 ]; then
     sudo apt-get install -y "${MISSING_PACKAGES[@]}"
 fi
 
-# A notification daemon has to be running for anything to be visible. Any
-# implementation will do; swaync is what the Hyprland setup uses.
-if ! command -v swaync-client &>/dev/null && ! command -v mako &>/dev/null \
-     && ! command -v dunst &>/dev/null; then
-    log_warning "No notification daemon found (swaync / mako / dunst) — the"
-    log_warning "  assistant will still speak, but nothing will be shown on screen."
+# Something has to own org.freedesktop.Notifications for anything to be
+# visible. GNOME Shell and KDE serve it themselves; on Hyprland or Sway that is
+# swaync, mako or dunst.
+if ! gdbus call --session --dest org.freedesktop.Notifications \
+        --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.GetServerInformation &>/dev/null; then
+    log_warning "No notification server is running — the assistant will still"
+    log_warning "  speak, but nothing will be shown on screen. On Hyprland/Sway"
+    log_warning "  start swaync, mako or dunst; GNOME and KDE provide their own."
 fi
 
 # ── Directories ──────────────────────────────────────────────────────────
@@ -190,7 +328,7 @@ else
     log_info "Writing $ENV_FILE (backend=auto)"
     cat > "$ENV_FILE" << 'ENVEOF'
 # Voice assistant runtime configuration (read by voice-assistant.service).
-# Switch backends with:  voice-llm auto | claude | qwen | dsh   (or SUPER+M)
+# Switch backends with:  voice-llm auto | claude | qwen | dsh   (or the swap key)
 #
 # auto   = local llama-server when this machine has a >= 16 GB NVIDIA GPU and
 #          qwen38.service is installed, else the Claude Code CLI
@@ -463,44 +601,16 @@ cp voice-assistant.service "$UNIT_DIR/"
 systemctl --user daemon-reload
 systemctl --user enable voice-assistant.service
 
-# ── Hyprland Configuration ───────────────────────────────────────────────
-
-log_info "Creating Hyprland configuration snippet..."
-cat > hyprland-voice-assistant.conf << 'EOF'
-# Hyprland Voice Assistant Configuration
-# Add these lines to your ~/.config/hypr/hyprland.conf
-
-# Auto-start voice assistant
-exec-once = systemctl --user start voice-assistant.service
-
-# SUPER alone toggles voice mode; SUPER+SHIFT+V starts a new conversation.
-# These signal the pid file rather than pkill'ing a name: the process is
-# `python3 voice_assistant.py`, so `pkill -USR1 voice-assistant` matches nothing.
-bindr = SUPER, SUPER_L, exec, kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)
-bind = SUPER SHIFT, V, exec, kill -USR2 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)
-
-# SUPER+M swaps which model answers -- the local Qwen3.8 or Claude -- and shows
-# which one you landed on. This goes through the control socket rather than a
-# signal, so the assistant can notify and start the model server if it is down.
-bind = SUPER, M, exec, ~/.local/bin/assistant --swap
-EOF
-
 # ── Summary ──────────────────────────────────────────────────────────────
 
 log_success "🎉 Voice Assistant setup complete!"
 echo
 echo "Backend: $(cd "$SCRIPT_DIR" && ./voice-llm status 2>/dev/null | grep -E '^Resolved' || echo 'run: voice-llm status')"
 echo
-echo "Next steps:"
-echo "1. Add the Hyprland configuration:"
-echo "   cat hyprland-voice-assistant.conf >> ~/.config/hypr/hyprland.conf"
+echo "Desktop ($DESKTOP_KIND):"
+printf '   %s\n' "${DESKTOP_NOTES[@]}"
 echo
-echo "2. Reload Hyprland config or restart Hyprland"
-echo
-echo "3. Start the service:"
-echo "   systemctl --user start voice-assistant.service"
-echo
-echo "4. Toggle voice mode by pressing the SUPER key alone"
+echo "Start it:  systemctl --user start voice-assistant.service"
 echo
 echo "Verify:  ./test_installation.py"
 echo "Backend: voice-llm status"

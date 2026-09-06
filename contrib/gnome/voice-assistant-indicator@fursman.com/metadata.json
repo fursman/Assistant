@@ -1,0 +1,8 @@
+{
+  "uuid": "voice-assistant-indicator@fursman.com",
+  "name": "Voice Assistant Indicator",
+  "description": "Shows the voice assistant's phase (off, ready, listening, thinking, speaking) in the top bar. Click to toggle voice mode; right-click for a new conversation or a model swap.",
+  "url": "https://github.com/fursman/Assistant",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}

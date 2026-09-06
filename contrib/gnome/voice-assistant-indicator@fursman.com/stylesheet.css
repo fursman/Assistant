@@ -1,0 +1,51 @@
+/* Mirrors GNOME's screen-recording indicator: a rounded pill that only gets
+   a colour while something is happening. Colours are Adwaita's. */
+.voice-pill {
+    border-radius: 99px;
+    padding: 0 8px;
+    margin: 4px 0;
+    spacing: 6px;
+}
+
+.voice-icon {
+    icon-size: 16px;
+}
+
+.voice-label {
+    font-weight: bold;
+    font-size: 0.9em;
+}
+
+/* Quiet states: no pill, just the icon. */
+.voice-off .voice-icon,
+.voice-down .voice-icon {
+    opacity: 0.45;
+}
+
+.voice-ready {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+/* Active states: a filled pill with white text, like "recording". */
+.voice-listening,
+.voice-thinking,
+.voice-speaking {
+    color: #ffffff;
+    padding: 0 10px;
+}
+.voice-listening .voice-icon,
+.voice-thinking .voice-icon,
+.voice-speaking .voice-icon,
+.voice-listening .voice-label,
+.voice-thinking .voice-label,
+.voice-speaking .voice-label {
+    color: #ffffff;
+}
+
+.voice-listening { background-color: #e01b24; }   /* red 4 */
+.voice-thinking  { background-color: #3584e4; }   /* blue 3 */
+.voice-speaking  { background-color: #26a269; }   /* green 5 */
+
+.voice-listening:hover { background-color: #c01c28; }
+.voice-thinking:hover  { background-color: #1c71d8; }
+.voice-speaking:hover  { background-color: #2ec27e; }

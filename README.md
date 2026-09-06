@@ -1,4 +1,4 @@
-# 🎤 Hyprland Voice Assistant
+# 🎤 Voice Assistant for the Linux desktop
 
 A voice assistant for Linux that listens, transcribes, thinks and speaks — with
 speech recognition, end-of-turn detection and synthesis all running on your own
@@ -18,9 +18,15 @@ mic ─▶ capture thread ─▶ Silero VAD ─▶ smart-turn v3 (has the user f
 Tap **SUPER** to start listening. Speak. It answers — out loud, and it can act
 on your machine.
 
+It runs on **Hyprland** and on **GNOME** (Wayland, either way), with key
+bindings and a status indicator for each, and the model is told which one it
+is on. Below, **SUPER** means the toggle key: bare SUPER on Hyprland, SUPER+M
+on GNOME — see [Desktop](#desktop).
+
 ## How it works
 
-1. **SUPER** toggles voice mode. Waybar shows the state; chimes mark the edges.
+1. **SUPER** toggles voice mode. The status bar shows the state (a waybar
+   module on Hyprland, a top-bar indicator on GNOME); chimes mark the edges.
    **SUPER+M** swaps between the local model and Claude; **SUPER+SHIFT+V**
    starts a new conversation. You can also just type: `assistant <question>`
    joins the same conversation from a terminal.
@@ -58,13 +64,17 @@ on your machine.
   the model is interrupted rather than killed.
 - **Audible turn-taking** — the same chime that arms voice mode plays again
   when the microphone goes live after a reply, so you know when it is your turn.
-- **Systemd user service**, **waybar module**, **desktop notifications** for
-  what it heard, what it is thinking and what it is doing.
+- **Systemd user service**, a **status indicator** (waybar module on Hyprland,
+  Shell extension on GNOME), **desktop notifications** for what it heard, what
+  it is thinking and what it is doing.
 
 ## Requirements
 
-- Linux with Wayland (Hyprland assumed for the key binding; any compositor works)
-- PipeWire, and a notification daemon (swaync, mako or dunst)
+- Linux with Wayland. Hyprland and GNOME get key bindings and a status
+  indicator from `setup.sh`; any other compositor works with two commands
+  bound by hand.
+- PipeWire, and a notification server: GNOME and KDE have one built in, on
+  Hyprland or Sway run swaync, mako or dunst.
 - Python 3.11+
 - **Either** the [`claude` CLI](https://claude.ai/install.sh) (installed for you
   by `setup.sh`) **or** an NVIDIA GPU with ≥ 16 GB of VRAM for the local model
@@ -78,16 +88,17 @@ on your machine.
 git clone https://github.com/fursman/Assistant.git ~/voice-assistant
 cd ~/voice-assistant
 ./setup.sh
-
-# Add the key bindings, then start it
-cat hyprland-voice-assistant.conf >> ~/.config/hypr/hyprland.conf
 systemctl --user start voice-assistant.service
 ```
 
 `setup.sh` installs the CPU pipeline on any machine and, if it finds an NVIDIA
 GPU with enough VRAM, additionally builds llama.cpp with CUDA, downloads the
-model and installs the model server. It is idempotent — re-run it whenever
-something is missing. `./setup.sh --no-llm` skips the local model.
+model and installs the model server. It also sets up the desktop it finds
+itself on: on GNOME the key bindings and the top-bar indicator are installed
+outright (log out and in once to load the indicator); on Hyprland it prints
+the one line to add to `hyprland.conf`. It is idempotent — re-run it whenever
+something is missing. `./setup.sh --no-llm` skips the local model,
+`./setup.sh --desktop` redoes only the desktop part.
 
 Verify with `./test_installation.py`.
 
@@ -372,14 +383,58 @@ between the model's first token and the first sound.
 | `VOICE_ASSISTANT_TTS_VOICE` | `af_heart` | Kokoro voice |
 | `VOICE_ASSISTANT_TTS_THREADS` | physical cores | ONNX threads for synthesis |
 
-## Waybar
+## Desktop
 
-The status file is JSON with a class array of `[state, backend]`, so both can
-be styled:
+The assistant does not care which desktop it is on: it talks to the screen
+through `notify-send`, takes SIGUSR1 (toggle) and SIGUSR2 (new conversation)
+on its pid file, and publishes its phase to a JSON status file. What differs is
+how the keys are bound and what draws the phase. The model is told which
+desktop it is on (`Ubuntu, GNOME on Wayland`, say), so it reaches for
+`hyprctl` or `gsettings` as appropriate; `VOICE_ASSISTANT_DESKTOP` overrides
+the detection.
+
+| | Hyprland | GNOME |
+|---|---|---|
+| Toggle voice mode | **SUPER** (tap alone) | **SUPER+M** |
+| New conversation | **SUPER+SHIFT+V** | **SUPER+SHIFT+V** |
+| Swap model | **SUPER+M** | **SUPER+SHIFT+M** |
+| Status | waybar module | top-bar indicator (Shell extension) |
+| Installed by | `contrib/hyprland/hyprland-voice-assistant.conf` | `setup.sh` (gsettings + `contrib/gnome/`) |
+
+Bare SUPER is GNOME's activities key, which is why the toggle moves to SUPER+M
+there; GNOME's own SUPER+M (the notification list) is moved off, and stays on
+SUPER+V. Any other desktop: bind `voice-assistant-ctl toggle` and
+`voice-assistant-ctl new-session` to whatever you like.
+
+### Status file
+
+`~/.local/state/voice-assistant/status` is rewritten atomically on every phase
+change, in waybar's custom-module format so that it can be used verbatim:
+
+```json
+{"text": "◉", "class": ["listening", "claude"], "tooltip": "Voice Assistant — listening (claude)"}
+```
+
+States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and
+the second class is `claude`, `local` or `dsh`. (`waybar-status` is a symlink
+to the same file, for configs written against the old name.)
+
+### GNOME indicator
+
+`contrib/gnome/voice-assistant-indicator@fursman.com` draws the state in the
+top bar in the style of GNOME's screen-recording indicator: a dimmed muted
+microphone when off, a microphone when ready, and a red / blue / green pill
+labelled *listening* / *thinking* / *speaking*. Left click toggles voice mode;
+right click shows the state and backend, starts a new conversation, or swaps
+the model. It watches the status file with inotify, so it changes the moment
+the assistant does. `setup.sh` installs and enables it; GNOME on Wayland loads
+new extensions only at login.
+
+### Waybar
 
 ```jsonc
 "custom/voice": {
-    "exec": "cat ~/.local/state/voice-assistant/waybar-status",
+    "exec": "cat ~/.local/state/voice-assistant/status",
     "return-type": "json",
     "interval": 1,
     "on-click": "kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)",
@@ -387,8 +442,7 @@ be styled:
 }
 ```
 
-States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and
-the second class is `claude`, `local` or `dsh`.
+Both classes can be styled, e.g. `#custom-voice.listening { color: #e01b24; }`.
 
 ## Suspend and resume
 

@@ -121,10 +121,25 @@ def main():
     check_command("notify-send", "Desktop notifications")
     check_command("espeak", "eSpeak (TTS fallback)", required=False)
     check_command("gdbus", "gdbus (closing our own notifications)", required=False)
-    if not any(shutil.which(d) for d in ("swaync-client", "mako", "dunst")):
-        warn("No notification daemon found (swaync / mako / dunst)")
+    # Whoever owns org.freedesktop.Notifications is the daemon: GNOME Shell and
+    # KDE serve it themselves, Hyprland/Sway setups run swaync, mako or dunst.
+    server = ""
+    try:
+        out = subprocess.run(
+            ["gdbus", "call", "--session",
+             "--dest", "org.freedesktop.Notifications",
+             "--object-path", "/org/freedesktop/Notifications",
+             "--method", "org.freedesktop.Notifications.GetServerInformation"],
+            capture_output=True, text=True, check=False, timeout=5).stdout
+        m = re.match(r"\('([^']*)'", out.strip())
+        server = m.group(1) if m else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    if server:
+        ok(f"Notification server present ({server})")
     else:
-        ok("Notification daemon present")
+        warn("Nothing owns org.freedesktop.Notifications",
+             "GNOME/KDE provide it themselves; on Hyprland/Sway start swaync, mako or dunst")
 
     print("\n📁 Files")
     here = Path(__file__).parent
@@ -276,7 +291,7 @@ def main():
     else:
         print("\n🎉 Everything checks out.")
     print("\nStart:  systemctl --user start voice-assistant.service")
-    print("Toggle: press SUPER alone")
+    print("Toggle: tap SUPER on Hyprland, SUPER+M on GNOME")
     return 0
 
 
