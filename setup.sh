@@ -147,25 +147,30 @@ install_gnome_integration() {
     gsettings_list_add org.gnome.shell enabled-extensions "$uuid"
 
     log_info "Installing GNOME key bindings..."
-    # Bare SUPER is GNOME's activities key, so the toggle lives on SUPER+M and
-    # the model swap moves to SUPER+SHIFT+M. GNOME binds SUPER+M to the
-    # notification list by default; it keeps SUPER+V for that.
+    # Bare SUPER is GNOME's activities key, so the toggle is the SUPER+ALT
+    # chord (Command+Option on a Mac keyboard). A modifier can be the key of a
+    # binding as long as it is named as a keysym, and the chord is bound in
+    # both orders so it does not matter which one goes down first. SUPER+M
+    # swaps the model, as on Hyprland; GNOME binds that to the notification
+    # list by default and keeps SUPER+V for it.
     local tray
     tray=$(gsettings get org.gnome.shell.keybindings toggle-message-tray)
     if [[ "$tray" == *"<Super>m"* ]]; then
         gsettings set org.gnome.shell.keybindings toggle-message-tray "['<Super>v']"
         log_info "  freed SUPER+M from the notification list (still on SUPER+V)"
     fi
-    gnome_keybinding voice-toggle "Voice assistant: toggle" "<Super>m" \
+    gnome_keybinding voice-toggle "Voice assistant: toggle" "<Super>Alt_L" \
+        "$HOME/.local/bin/voice-assistant-ctl toggle"
+    gnome_keybinding voice-toggle-alt "Voice assistant: toggle (Alt first)" "<Alt>Super_L" \
         "$HOME/.local/bin/voice-assistant-ctl toggle"
     gnome_keybinding voice-new-session "Voice assistant: new conversation" "<Shift><Super>v" \
         "$HOME/.local/bin/voice-assistant-ctl new-session"
-    gnome_keybinding voice-swap-model "Voice assistant: swap model" "<Shift><Super>m" \
+    gnome_keybinding voice-swap-model "Voice assistant: swap model" "<Super>m" \
         "$HOME/.local/bin/assistant --swap"
 
     DESKTOP_NOTES=(
-        "Keys: SUPER+M toggles voice mode, SUPER+SHIFT+V starts a new"
-        "      conversation, SUPER+SHIFT+M swaps the model (all active now)."
+        "Keys: SUPER+ALT toggles voice mode, SUPER+SHIFT+V starts a new"
+        "      conversation, SUPER+M swaps the model (all active now)."
     )
     if [[ "$changed" == 1 ]]; then
         DESKTOP_NOTES+=(

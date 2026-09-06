@@ -20,8 +20,8 @@ on your machine.
 
 It runs on **Hyprland** and on **GNOME** (Wayland, either way), with key
 bindings and a status indicator for each, and the model is told which one it
-is on. Below, **SUPER** means the toggle key: bare SUPER on Hyprland, SUPER+M
-on GNOME — see [Desktop](#desktop).
+is on. Below, **SUPER** means the toggle key: bare SUPER on Hyprland, the
+SUPER+ALT chord on GNOME — see [Desktop](#desktop).
 
 ## How it works
 
@@ -395,15 +395,16 @@ the detection.
 
 | | Hyprland | GNOME |
 |---|---|---|
-| Toggle voice mode | **SUPER** (tap alone) | **SUPER+M** |
+| Toggle voice mode | **SUPER** (tap alone) | **SUPER+ALT** (Command+Option on a Mac keyboard, either order) |
 | New conversation | **SUPER+SHIFT+V** | **SUPER+SHIFT+V** |
-| Swap model | **SUPER+M** | **SUPER+SHIFT+M** |
+| Swap model | **SUPER+M** | **SUPER+M** |
 | Status | waybar module | top-bar indicator (Shell extension) |
 | Installed by | `contrib/hyprland/hyprland-voice-assistant.conf` | `setup.sh` (gsettings + `contrib/gnome/`) |
 
-Bare SUPER is GNOME's activities key, which is why the toggle moves to SUPER+M
-there; GNOME's own SUPER+M (the notification list) is moved off, and stays on
-SUPER+V. Any other desktop: bind `voice-assistant-ctl toggle` and
+Bare SUPER is GNOME's activities key, which is why the toggle is a two-modifier
+chord there, bound in both orders as `<Super>Alt_L` and `<Alt>Super_L`;
+GNOME's own SUPER+M (the notification list) is moved off, and stays on SUPER+V.
+Any other desktop: bind `voice-assistant-ctl toggle` and
 `voice-assistant-ctl new-session` to whatever you like.
 
 ### Status file
