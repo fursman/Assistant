@@ -1246,15 +1246,7 @@ class AudioCapture:
     def stop(self):
         s, self._stream = self._stream, None
         if s is not None:
-            try:
-                s.stop_stream()
-            except OSError:
-                pass
-            finally:
-                try:
-                    s.close()
-                except OSError:
-                    pass
+            _close_stream(s, self.logger, "capture")
         self._drain_queue()
         self._residual = np.zeros(0, dtype=np.float32)
 
@@ -1399,6 +1391,36 @@ class SpeechDetector:
         return any(p >= VAD_STOP_THRESHOLD for p in self.probabilities(audio))
 
 
+def _close_stream(stream, logger, what, timeout=3.0):
+    """Stop and close a PortAudio stream without letting it hang the caller.
+
+    A stream whose device has silently died (see AudioCapture) blocks in
+    stop_stream() forever, because PortAudio waits for a callback thread
+    that is stuck in poll(). Waiting on that from the listen loop froze the
+    whole assistant once: voice mode toggled but nothing happened. So the
+    teardown runs on a scratch thread with a deadline; if it misses, the
+    stream object is abandoned (one leaked thread) and the caller moves on
+    to open a fresh one.
+    """
+    def _work():
+        try:
+            stream.stop_stream()
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    t = threading.Thread(target=_work, name=f"close-{what}", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        logger.warning(f"{what} stream would not close within {timeout:.0f}s — abandoned")
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Audio out
 # ---------------------------------------------------------------------------
@@ -1417,8 +1439,10 @@ class PcmPlayer:
     that returns ~10 ms after the last audible sample rather than before it.
     """
 
-    def __init__(self, pa, rate=24000, block=480, device_name="pipewire", fade_ms=5.0):
+    def __init__(self, pa, rate=24000, block=480, device_name="pipewire", fade_ms=5.0,
+                 logger=None):
         self.pa = pa
+        self.logger = logger or logging.getLogger("voice-assistant")
         self.rate = rate
         self.block = block
         self.device_name = device_name
@@ -1461,15 +1485,7 @@ class PcmPlayer:
     def close(self):
         s, self._stream = self._stream, None
         if s is not None:
-            try:
-                s.stop_stream()
-            except OSError:
-                pass
-            finally:
-                try:
-                    s.close()
-                except OSError:
-                    pass
+            _close_stream(s, self.logger, "playback")
 
     @property
     def running(self) -> bool:
@@ -2404,7 +2420,7 @@ class VoiceAssistant:
             f"Audio input: {self.input_device} ({default_info['name']}, "
             f"native rate: {int(default_info['defaultSampleRate'])})")
         self.capture = AudioCapture(self.audio, self.input_device, self.logger)
-        self.player = PcmPlayer(self.audio, rate=24000)
+        self.player = PcmPlayer(self.audio, rate=24000, logger=self.logger)
 
     def _pick_whisper_device(self):
         """CUDA or CPU for the Whisper fallback, honouring an explicit override.
@@ -4160,6 +4176,26 @@ class VoiceAssistant:
         if self._sentence_queue:
             self._sentence_queue.put(None)
 
+    def _keep_output_open(self):
+        """Hold the playback stream open for as long as the microphone is.
+
+        This is what stops the microphone dying. On the MacBook (CS8409
+        codec) the capture DMA freezes the moment the playback side of the
+        card is closed: PipeWire suspends an idle sink 5 s after the last
+        stream, so 5 s after the activation chime the callbacks stopped, on
+        the first turn, every time the turn outlasted the chime's grace. It
+        reproduced with a bare PortAudio stream and went away with a silent
+        output stream held open. The player's callback emits silence when
+        its queue is empty, so an open player is exactly that, and it also
+        removes the open latency from the first word of every reply.
+        """
+        if self.player.running:
+            return
+        try:
+            self.player.start()
+        except OSError as e:
+            self.logger.warning(f"Could not hold the playback stream open: {e}")
+
     def _toggle(self):
         """SIGUSR1: voice mode on/off. Runs on the event loop, not in a handler."""
         self.is_active = not self.is_active
@@ -4510,6 +4546,7 @@ class VoiceAssistant:
                     self.logger.error(f"Failed to open audio stream: {e}")
                     await asyncio.sleep(1)
                     continue
+            self._keep_output_open()
 
             if self.is_processing:
                 await asyncio.sleep(0.05)
@@ -4525,6 +4562,7 @@ class VoiceAssistant:
                         f"Audio stream stalled — reopening ({self.capture.describe()})")
                     try:
                         await loop.run_in_executor(None, self.capture.reopen)
+                        self._keep_output_open()
                         self.vad.reset()
                         prev_chunk = None
                     except OSError as e:
