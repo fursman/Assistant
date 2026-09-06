@@ -9,7 +9,7 @@ mic ─▶ capture thread ─▶ Silero VAD ─▶ smart-turn v3 (has the user f
                       └▶ Moonshine STT (transcribes while you talk)
                                     │
                                     ▼
-                      Claude Code CLI  ·or·  local Qwen3.8-27B
+         Claude Code CLI  ·or·  local Qwen3.8-27B (own loop ·or· DeepSeek Harness)
                                     │
                                     ▼
                       Kokoro TTS ─▶ one persistent PipeWire stream
@@ -44,6 +44,10 @@ on your machine.
   mid-sentence pause instead of cutting you off.
 - **Two backends, chosen automatically** — the local model when this machine
   can hold it, Claude otherwise, with a per-query fallback either way.
+- **Two harnesses for the local model** — the assistant's own tool loop, or the
+  [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DeepSeek's
+  open-source agent runtime) running locally against the same llama-server,
+  with the assistant's web tools plugged in over MCP.
 - **Speech recognition and synthesis on the CPU** — they keep working while the
   dGPU is passed through to a VM.
 - **Streaming everywhere** — transcription during speech, synthesis during
@@ -64,6 +68,7 @@ on your machine.
 - Python 3.11+
 - **Either** the [`claude` CLI](https://claude.ai/install.sh) (installed for you
   by `setup.sh`) **or** an NVIDIA GPU with ≥ 16 GB of VRAM for the local model
+  (optionally driven by the DeepSeek Harness, installed for you as a Python wheel)
 - ~1.5 GB for the Python venv and ~700 MB of speech models; a further ~14 GB if
   you install the local LLM
 
@@ -98,6 +103,7 @@ voice-assistant-ctl test         # installation checks
 voice-llm status                 # what backend is configured, and what it resolves to
 voice-llm auto                   # local model if this machine can run it, else Claude
 voice-llm qwen                   # force the local model (starts the server)
+voice-llm dsh                    # the local model, driven by the DeepSeek Harness
 voice-llm claude                 # force Claude and stop the server (frees the GPU)
 ```
 
@@ -122,12 +128,13 @@ assistant --new                            # start a fresh conversation
 
 ### Swapping models
 
-**SUPER+M** swaps which model answers -- the local Qwen3.8 or Claude -- and
-shows you which one you landed on. The same thing from a terminal:
+**SUPER+M** cycles which model answers -- the local Qwen3.8 in the assistant's
+own loop, the same model under the DeepSeek Harness, then Claude -- and shows
+you which one you landed on. The same thing from a terminal:
 
 ```bash
-assistant --swap                 # local <-> Claude
-assistant --backend local        # or claude, or auto
+assistant --swap                 # local -> dsh -> Claude -> local
+assistant --backend local        # or dsh, claude, auto
 ```
 
 The choice is written to `~/.config/voice-assistant/env`, so it survives a
@@ -148,18 +155,22 @@ The backend is `auto` by default:
    means **local**.
 3. Otherwise **Claude**.
 
+When `auto` lands on the local model it uses the assistant's own tool loop;
+set `VOICE_ASSISTANT_LOCAL_HARNESS=dsh` to have it use the DeepSeek Harness
+instead (see below).
+
 While the local server is loading — 5 s warm, ~35 s from cold, so most of one
 boot — individual questions go to Claude with a distinct chime and a
 notification saying so, and the assistant switches over on its own the moment
 the model is ready. No restart, and no dead assistant during boot.
 
-| | Claude Code CLI | local Qwen3.8-27B |
-|---|---|---|
-| first token | ~0.9 s (persistent process) | 0.45–0.71 s |
-| shell / filesystem | yes | yes (`run_shell`) |
-| web access | yes | no |
-| network required | yes | no |
-| VRAM while running | 0 | ~15.3 GB of 16 GB |
+| | Claude Code CLI | local Qwen3.8-27B | Qwen3.8-27B under the DeepSeek Harness |
+|---|---|---|---|
+| first token | ~0.9 s (persistent process) | 0.45–0.71 s | ~0.15 s warm, 3–4 s on a fresh runtime |
+| shell / filesystem | yes | yes (`run_shell`) | yes (persistent `bash`, `str_replace_editor`) |
+| web access | yes | `web_search` / `fetch_page` | the same two, over MCP |
+| network required | yes | no (search excepted) | no (search excepted) |
+| VRAM while running | 0 | ~15.3 GB of 16 GB | ~15.3 GB of 16 GB |
 
 **The local model has shell access too.** A `run_shell` tool gives it the same
 reach as the Claude backend, which already runs with
@@ -175,6 +186,41 @@ line.) Set `VOICE_ASSISTANT_LOCAL_TOOLS=0` for an answer-only assistant.
 
 Both backends are told that their input is an automatic transcript that can
 contain recognition errors, and to confirm before anything irreversible.
+
+### The DeepSeek Harness (`dsh`)
+
+`voice-llm dsh` (or `assistant --backend dsh`, or SUPER+M) drives the **same
+local llama-server** through the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness),
+DeepSeek's open-source agent runtime, instead of the assistant's own tool
+loop. Same model, different harness: its agent loop, a persistent `bash`, a
+file editor, and the assistant's `web_search` / `fetch_page` served to it as an
+MCP server (`dsh_web_mcp.py`). Nothing leaves the machine except the searches.
+
+`setup.sh` installs it with `pip install deepseek-harness-sdk`; the wheel
+bundles the `dsh` runtime (~260 MB unpacked), so no Node.js is needed. The
+assistant launches `dsh --profile sdk-minimal` as a subprocess speaking JSON-RPC
+on stdio, points the stock DeepSeek adapter at `http://127.0.0.1:8081` (it
+speaks OpenAI-style chat completions, which is what llama-server serves) and
+overlays a patch it writes into `~/.local/state/voice-assistant/dsh/` at every
+start. Measured here: the runtime boots in ~1 s; the first prompt on a fresh
+runtime (~2K tokens of tool schemas and persona, nothing cached) takes 3–4 s to
+first token; warm turns ~0.15 s.
+
+Two properties of the runtime shape how it is driven, and are worth knowing:
+
+- **No cancel in the SDK protocol.** The only way to stop a turn is to close
+  the runtime, so an abort (tap SUPER) costs a respawn on the next question.
+- **A new runtime does not resume its session.** The session log is written,
+  but a fresh process given the same id starts from nothing (measured). So the
+  assistant keeps the transcript itself (`dsh_transcript.json`) and seeds every
+  new runtime with a recap of the recent exchanges. That also covers the
+  minimal profile's lack of compaction: past `VOICE_ASSISTANT_DSH_ROTATE_TOKENS`
+  (24000) of prompt, the harness gets a fresh session with a recap rather than
+  running into the 32K context.
+
+Every command it runs is logged like the native loop's: `grep 'dsh tool'` in
+the log. The harness's minimal profile runs with full access, the same stance
+as the other two backends.
 
 ### Why this model and these flags
 
@@ -301,7 +347,8 @@ between the model's first token and the first sound.
 
 | variable | default | meaning |
 |---|---|---|
-| `VOICE_ASSISTANT_LLM_BACKEND` | `auto` | `auto`, `claude` or `local` |
+| `VOICE_ASSISTANT_LLM_BACKEND` | `auto` | `auto`, `claude`, `local` or `dsh` |
+| `VOICE_ASSISTANT_LOCAL_HARNESS` | `native` | what `auto` uses for the local model: `native` or `dsh` |
 | `VOICE_ASSISTANT_LLM_FALLBACK` | `1` | answer with Claude while the local model is down |
 | `VOICE_ASSISTANT_LOCAL_MIN_VRAM_MIB` | `15000` | VRAM needed to pick the local model |
 | `VOICE_ASSISTANT_LOCAL_URL` | `http://127.0.0.1:8081/v1` | any OpenAI-compatible endpoint |
@@ -309,6 +356,10 @@ between the model's first token and the first sound.
 | `VOICE_ASSISTANT_LOCAL_HISTORY_TURNS` | `12` | conversation turns kept |
 | `VOICE_ASSISTANT_LOCAL_THINK` | `0` | let the local model reason first |
 | `VOICE_ASSISTANT_LOCAL_TOOLS` | `1` | give the local model a shell |
+| `VOICE_ASSISTANT_DSH_MAX_TOKENS` | `1024` | reply cap under the DeepSeek Harness |
+| `VOICE_ASSISTANT_DSH_ROTATE_TOKENS` | `24000` | prompt size at which the harness gets a fresh, recapped session |
+| `VOICE_ASSISTANT_DSH_TOOL_TIMEOUT` | `45` | seconds one harness `bash` command may run |
+| `VOICE_ASSISTANT_DSH_HOME` | `~/.local/state/voice-assistant/dsh` | the harness's profile, patch and session logs |
 | `VOICE_ASSISTANT_MODEL` / `_EFFORT` | `opus` / `max` | Claude model and effort |
 | `VOICE_ASSISTANT_CLAUDE_PERSISTENT` | `1` | keep one `claude` process alive across turns |
 | `VOICE_ASSISTANT_MOONSHINE_MODEL` | `medium_streaming` | STT model |
@@ -337,7 +388,7 @@ be styled:
 ```
 
 States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and
-the second class is `claude` or `local`.
+the second class is `claude`, `local` or `dsh`.
 
 ## Suspend and resume
 
@@ -363,6 +414,8 @@ boot). The assistant keeps working either way.
 | File | Description |
 |------|-------------|
 | `voice_assistant.py` | The assistant |
+| `web_tools.py` | Keyless web search and page fetch, shared by the local backends |
+| `dsh_web_mcp.py` | The same two tools served to the DeepSeek Harness over MCP |
 | `setup.sh` | One-shot installer, including the local LLM stack |
 | `voice-assistant-ctl` | start / stop / status / toggle / logs / test |
 | `voice-llm` | Switch and inspect the LLM backend |

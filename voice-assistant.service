@@ -11,7 +11,7 @@ Wants=pipewire.service
 
 [Service]
 Type=simple
-# Backend selection (auto | claude | local) and the rest of the runtime
+# Backend selection (auto | claude | local | dsh) and the rest of the runtime
 # configuration. Optional: the leading "-" means the service still starts if
 # the file is absent, and the built-in defaults apply.
 EnvironmentFile=-%h/.config/voice-assistant/env

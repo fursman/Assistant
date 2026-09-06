@@ -2,7 +2,11 @@
 # Switch the voice assistant between the Claude Code CLI and the local
 # Qwen3.8-27B llama-server, and start/stop the model server to match.
 #
-#   voice-llm status | auto | claude | qwen | logs
+#   voice-llm status | auto | claude | qwen | dsh | logs
+#
+# `dsh` is the same local model driven by the DeepSeek Harness (DeepSeek's
+# open-source agent runtime, run locally through its Python SDK) instead of the
+# assistant's own tool loop.
 #
 # The default is `auto`: the assistant uses the local model when this machine
 # has a >= 16 GB NVIDIA GPU and qwen38.service is installed, and the claude CLI
@@ -15,6 +19,9 @@
 set -euo pipefail
 
 ENV_FILE="$HOME/.config/voice-assistant/env"
+# The repo this script was installed from (the venv with the harness SDK).
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+[[ -x "$REPO_DIR/.venv/bin/python" ]] || REPO_DIR="$HOME/voice-assistant"
 ASSISTANT="voice-assistant.service"
 SERVER="qwen38.service"
 HEALTH="http://127.0.0.1:8081/health"
@@ -65,7 +72,7 @@ gpu_vram() {   # "<name>|<total MiB>" for the largest card, or nothing
 # will actually do, not just what is configured.
 resolve_backend() {
     local cfg="$1" gpu total st
-    case "$cfg" in claude|local) echo "$cfg (forced)"; return;; esac
+    case "$cfg" in claude|local|dsh) echo "$cfg (forced)"; return;; esac
     st=$(server_state)
     [[ "$st" != down ]] && { echo "local (server $st)"; return; }
     gpu=$(gpu_vram) || { echo "claude (no NVIDIA GPU)"; return; }
@@ -153,6 +160,37 @@ case "${1:-status}" in
     ok "Voice assistant answers with the LOCAL Qwen3.8-27B (run_shell tool, offline)"
     ;;
 
+  dsh)
+    if ! systemctl --user cat "$SERVER" &>/dev/null; then
+        err "$SERVER is not installed on this machine — run ./setup.sh"
+        exit 1
+    fi
+    if ! "$REPO_DIR/.venv/bin/python" -c 'import deepseek_harness' &>/dev/null; then
+        err "deepseek-harness-sdk is not installed — run ./setup.sh (or: .venv/bin/pip install deepseek-harness-sdk)"
+        exit 1
+    fi
+    info "Starting $SERVER (loads ~15.3 GB onto the dGPU)"
+    systemctl --user enable --now "$SERVER" &>/dev/null || systemctl --user start "$SERVER"
+    info "Waiting for the model to load (~5 s warm, ~35 s cold)..."
+    if wait_ready 300; then
+        ok "Model server is serving"
+    else
+        err "Model server did not come up"
+        echo "  journalctl --user -u $SERVER -n 40 --no-pager"
+        exit 1
+    fi
+    # The running assistant switches without a restart when asked over its
+    # control socket; the env file is what a later restart reads.
+    if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/voice-assistant.sock" ]] \
+        && command -v assistant &>/dev/null && assistant --backend dsh &>/dev/null; then
+        :
+    else
+        set_backend dsh
+        restart_assistant
+    fi
+    ok "Voice assistant answers with the DEEPSEEK HARNESS on the local Qwen3.8-27B (bash, editor, web tools)"
+    ;;
+
   claude)
     set_backend claude
     restart_assistant
@@ -171,11 +209,12 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: voice-llm [status|auto|claude|qwen|logs]"
+    echo "usage: voice-llm [status|auto|claude|qwen|dsh|logs]"
     echo
     echo "  status   what is configured, what it resolves to, and why"
     echo "  auto     pick per machine: local model if it fits, Claude otherwise (default)"
-    echo "  qwen     start the model server and prefer it"
+    echo "  qwen     start the model server and prefer it (the assistant's own tool loop)"
+    echo "  dsh      start the model server and drive it with the DeepSeek Harness"
     echo "  claude   force Claude and stop the model server (frees the GPU)"
     echo "           add --disable to keep it from starting at boot"
     echo "  logs     follow the model server"

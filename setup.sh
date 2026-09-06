@@ -190,13 +190,18 @@ else
     log_info "Writing $ENV_FILE (backend=auto)"
     cat > "$ENV_FILE" << 'ENVEOF'
 # Voice assistant runtime configuration (read by voice-assistant.service).
-# Switch backends with:  voice-llm auto | voice-llm claude | voice-llm qwen
+# Switch backends with:  voice-llm auto | claude | qwen | dsh   (or SUPER+M)
 #
 # auto   = local llama-server when this machine has a >= 16 GB NVIDIA GPU and
 #          qwen38.service is installed, else the Claude Code CLI
 # claude = Claude Code CLI (tools, filesystem, web; needs network)
 # local  = llama-server on this machine (Qwen3.8-27B + run_shell tool, offline)
+# dsh    = the same llama-server, driven by the DeepSeek Harness (DeepSeek's
+#          open-source agent runtime, run locally): bash, editor, web tools
 VOICE_ASSISTANT_LLM_BACKEND=auto
+# Which harness `auto` uses for the local model: native (the assistant's own
+# tool loop) or dsh (the DeepSeek Harness).
+VOICE_ASSISTANT_LOCAL_HARNESS=native
 # Answer with Claude for a single query while the local model is loading or
 # down, instead of telling the user the model did not answer.
 VOICE_ASSISTANT_LLM_FALLBACK=1
@@ -215,6 +220,12 @@ VOICE_ASSISTANT_LOCAL_THINK=0
 VOICE_ASSISTANT_LOCAL_TOOLS=1
 VOICE_ASSISTANT_LOCAL_TOOL_TIMEOUT=30
 VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS=5
+
+# --- DeepSeek Harness (backend dsh) ---
+# Its minimal profile has no compaction: past this many prompt tokens the
+# harness gets a fresh session seeded with a recap of the recent exchanges.
+VOICE_ASSISTANT_DSH_ROTATE_TOKENS=24000
+VOICE_ASSISTANT_DSH_MAX_TOKENS=1024
 
 # --- speech recognition ---
 # medium_streaming, not small: on REAL speech (LibriSpeech) it cuts word error

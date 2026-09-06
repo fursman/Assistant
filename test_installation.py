@@ -82,6 +82,13 @@ def main():
     ]:
         check_import(module, desc)
     check_import("faster_whisper", "Faster Whisper (fallback STT)", required=False)
+    if check_import("deepseek_harness", "DeepSeek Harness SDK (dsh backend)", required=False):
+        try:
+            from deepseek_harness_runtime import resolve_bundled_launch_args
+            ok(f"DeepSeek Harness runtime: {Path(resolve_bundled_launch_args()[0]).name}")
+        except Exception as e:
+            warn(f"DeepSeek Harness runtime wheel is missing or broken: {e}",
+                 "pip install --force-reinstall deepseek-harness-runtime-bin")
 
     try:
         import torch

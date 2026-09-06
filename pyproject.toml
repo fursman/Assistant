@@ -40,6 +40,7 @@ dependencies = [
     "kokoro-onnx>=0.4.0",
     "onnxruntime>=1.16.0",
     "openai>=1.0.0",
+    "deepseek-harness-sdk>=0.1.2rc1",
     "huggingface_hub>=0.30.0",
 ]
 
@@ -56,4 +57,4 @@ alt-tts = ["pocket-tts", "supertonic"]
 voice-assistant = "voice_assistant:main"
 
 [tool.setuptools]
-py-modules = ["voice_assistant"]
+py-modules = ["voice_assistant", "web_tools", "dsh_web_mcp"]

@@ -3,8 +3,8 @@
 
     assistant what is using all my disk space
     assistant "remind me what we decided about the tomatoes"
-    assistant --swap                 # local model <-> Claude, with a notification
-    assistant --backend local        # or claude, or auto
+    assistant --swap                 # local -> DeepSeek Harness -> Claude, with a notification
+    assistant --backend local        # or dsh, claude, auto
     assistant --status
     assistant --new                  # start a fresh conversation
 
@@ -79,9 +79,9 @@ def main():
     p.add_argument("words", nargs="*", help="your question, quoted or not")
     p.add_argument("--speak", action="store_true", help="read the answer aloud too")
     p.add_argument("--swap", action="store_true",
-                   help="switch between the local model and Claude")
-    p.add_argument("--backend", choices=("local", "claude", "auto"),
-                   help="select a backend explicitly")
+                   help="cycle local model -> DeepSeek Harness -> Claude")
+    p.add_argument("--backend", choices=("local", "dsh", "claude", "auto"),
+                   help="select a backend explicitly (dsh = DeepSeek Harness on the local model)")
     p.add_argument("--status", action="store_true", help="show what is running")
     p.add_argument("--new", action="store_true", help="start a fresh conversation")
     p.add_argument("--json", action="store_true", help="print the raw reply")
@@ -116,6 +116,7 @@ def main():
         voice = "listening" if r["voice_active"] else "off"
         print(f"model      {r['label']}  (preference: {r['preference']})")
         print(f"local llm  {r['local_llm']}")
+        print(f"dsh        {r.get('dsh', 'unknown')}")
         print(f"voice      {voice}{'  (busy)' if r['busy'] else ''}")
         print(f"session    {r['session']}")
     else:
