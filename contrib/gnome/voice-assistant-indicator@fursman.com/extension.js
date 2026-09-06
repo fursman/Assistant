@@ -2,15 +2,17 @@
 //
 // The GNOME counterpart of the waybar module: it reads the same status file
 // the assistant writes on every phase change (~/.local/state/voice-assistant/
-// status, JSON with `class: [state, backend]`) and draws it as a pill, in the
-// style of GNOME's own screen-recording indicator.
+// status, JSON with `class: [state, backend]`) and draws it as a robot head.
+// A robot rather than a microphone because GNOME already puts a microphone
+// in the same corner whenever any app is recording, and two identical icons
+// side by side say nothing.
 //
-//   off        muted microphone, dimmed             (voice mode is off)
-//   ready      microphone                           (listening for speech)
-//   listening  red pill    "listening"              (recording your turn)
-//   thinking   blue pill   "thinking"               (model / tools working)
-//   speaking   green pill  "speaking"               (playing the reply)
-//   down       crossed-out microphone, dimmed       (service not running)
+//   down       robot asleep, dark grey        (service not running)
+//   off        robot, dark grey               (voice mode is off)
+//   ready      robot, white                   (listening for speech)
+//   listening  robot, red    + "listening"    (recording your turn)
+//   thinking   robot, blue   + "thinking"     (model / tools working)
+//   speaking   robot, green  + "speaking"     (playing the reply)
 //
 // Left click toggles voice mode (SIGUSR1 to the pid file, the same thing the
 // key binding does). Right click opens a menu with the state, a new
@@ -39,12 +41,12 @@ const ASSISTANT_BIN = GLib.build_filenamev([HOME, '.local', 'bin', 'assistant'])
 const POLL_SECONDS = 5;
 
 const STATES = {
-    off:       {icon: 'microphone-sensitivity-muted-symbolic', label: '',          title: 'Voice mode off'},
-    ready:     {icon: 'audio-input-microphone-symbolic',       label: '',          title: 'Ready — say something'},
-    listening: {icon: 'audio-input-microphone-symbolic',       label: 'listening', title: 'Listening'},
-    thinking:  {icon: 'content-loading-symbolic',              label: 'thinking',  title: 'Thinking'},
-    speaking:  {icon: 'audio-speakers-symbolic',               label: 'speaking',  title: 'Speaking'},
-    down:      {icon: 'microphone-disabled-symbolic',          label: '',          title: 'Assistant not running'},
+    off:       {icon: 'robot',        label: '',          title: 'Voice mode off'},
+    ready:     {icon: 'robot',        label: '',          title: 'Ready — say something'},
+    listening: {icon: 'robot',        label: 'listening', title: 'Listening'},
+    thinking:  {icon: 'robot',        label: 'thinking',  title: 'Thinking'},
+    speaking:  {icon: 'robot',        label: 'speaking',  title: 'Speaking'},
+    down:      {icon: 'robot-asleep', label: '',          title: 'Assistant not running'},
 };
 const STATE_CLASSES = Object.keys(STATES).map(s => `voice-${s}`);
 
@@ -106,24 +108,32 @@ function spawn(argv) {
 
 const VoiceIndicator = GObject.registerClass(
 class VoiceIndicator extends PanelMenu.Button {
-    _init() {
+    _init(iconDir) {
         super._init(0.5, 'voice-assistant', false);
 
-        this._pill = new St.BoxLayout({
-            style_class: 'voice-pill',
+        this._icons = {};
+        for (const name of ['robot', 'robot-asleep']) {
+            // The -symbolic suffix is what makes St recolour it from CSS.
+            this._icons[name] = Gio.icon_new_for_string(
+                GLib.build_filenamev([iconDir, `${name}-symbolic.svg`]));
+        }
+
+        this._box = new St.BoxLayout({
+            style_class: 'voice-indicator',
             y_align: Clutter.ActorAlign.CENTER,
         });
         this._icon = new St.Icon({
             style_class: 'voice-icon',
+            gicon: this._icons.robot,
             y_align: Clutter.ActorAlign.CENTER,
         });
         this._label = new St.Label({
             style_class: 'voice-label',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        this._pill.add_child(this._icon);
-        this._pill.add_child(this._label);
-        this.add_child(this._pill);
+        this._box.add_child(this._icon);
+        this._box.add_child(this._label);
+        this.add_child(this._box);
 
         this._header = new PopupMenu.PopupMenuItem('Voice Assistant', {reactive: false});
         this.menu.addMenuItem(this._header);
@@ -149,19 +159,49 @@ class VoiceIndicator extends PanelMenu.Button {
         this._startItem = start;
 
         this._current = null;
+        this._installClickHandling();
     }
 
-    // Left click toggles voice mode, like clicking the waybar module; anything
-    // else (right click, touch) opens the menu as a panel button normally does.
+    // Left click toggles voice mode, like clicking the waybar module; any
+    // other button opens the menu as a panel button normally does.
+    //
+    // GNOME 49+ panel buttons open their menu from a ClutterClickGesture
+    // (`_clickGesture`), which recognises on press and does not look at the
+    // button, so that gesture is switched off and replaced with one that
+    // does. Older shells route clicks through vfunc_event instead, handled
+    // below.
+    _installClickHandling() {
+        if (!this._clickGesture)
+            return;
+        this._clickGesture.set_enabled(false);
+        const gesture = new Clutter.ClickGesture();
+        gesture.set_recognize_on_press(true);
+        gesture.connect('recognize', () => this._onClick(Clutter.get_current_event()));
+        this.add_action(gesture);
+        this._ownGesture = gesture;
+    }
+
     vfunc_event(event) {
-        if (event.type() === Clutter.EventType.BUTTON_PRESS && event.get_button() === 1) {
-            if (this._current?.state === 'down')
-                this.menu.toggle();
-            else
-                this._signal('USR1');
+        if (this._ownGesture)
+            return Clutter.EVENT_PROPAGATE;
+        if (event.type() === Clutter.EventType.BUTTON_PRESS) {
+            this._onClick(event);
             return Clutter.EVENT_STOP;
         }
         return super.vfunc_event(event);
+    }
+
+    _onClick(event) {
+        let button = 1;
+        try {
+            button = event?.get_button?.() ?? 1;
+        } catch (e) {
+            button = 1;
+        }
+        if (button === 1 && this._current?.state !== 'down')
+            this._signal('USR1');
+        else
+            this.menu?.toggle();
     }
 
     _signal(sig) {
@@ -173,13 +213,13 @@ class VoiceIndicator extends PanelMenu.Button {
     update(status) {
         this._current = status;
         const spec = STATES[status.state];
-        this._icon.icon_name = spec.icon;
+        this._icon.gicon = this._icons[spec.icon];
         this._label.text = spec.label;
         this._label.visible = spec.label !== '';
 
         for (const cls of STATE_CLASSES)
-            this._pill.remove_style_class_name(cls);
-        this._pill.add_style_class_name(`voice-${status.state}`);
+            this._box.remove_style_class_name(cls);
+        this._box.add_style_class_name(`voice-${status.state}`);
 
         const backend = status.backend ? (BACKEND_LABEL[status.backend] ?? status.backend) : null;
         this._header.label.text = backend ? `${spec.title} · ${backend}` : spec.title;
@@ -192,7 +232,7 @@ class VoiceIndicator extends PanelMenu.Button {
 
 export default class VoiceAssistantIndicatorExtension extends Extension {
     enable() {
-        this._indicator = new VoiceIndicator();
+        this._indicator = new VoiceIndicator(GLib.build_filenamev([this.path, 'icons']));
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
 
         // The assistant creates the directory itself; creating it here too

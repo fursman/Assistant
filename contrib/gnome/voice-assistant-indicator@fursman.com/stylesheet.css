@@ -1,9 +1,9 @@
-/* Mirrors GNOME's screen-recording indicator: a rounded pill that only gets
-   a colour while something is happening. Colours are Adwaita's. */
-.voice-pill {
-    border-radius: 99px;
-    padding: 0 8px;
-    margin: 4px 0;
+/* The robot is recoloured per state; the word next to it takes the same
+   colour. No filled pill: GNOME's own red recording pill lives in the same
+   corner and this should not be mistaken for it. Colours are Adwaita's light
+   variants, which read on the dark top bar. */
+.voice-indicator {
+    padding: 0 4px;
     spacing: 6px;
 }
 
@@ -16,36 +16,17 @@
     font-size: 0.9em;
 }
 
-/* Quiet states: no pill, just the icon. */
-.voice-off .voice-icon,
-.voice-down .voice-icon {
-    opacity: 0.45;
-}
+/* Quiet: dark grey, darker still when the service is not running. */
+.voice-off .voice-icon   { color: #9a9996; }   /* light 5 */
+.voice-down .voice-icon  { color: #77767b; }   /* dark 1  */
 
-.voice-ready {
-    background-color: rgba(255, 255, 255, 0.12);
-}
+/* On and waiting: white. */
+.voice-ready .voice-icon { color: #ffffff; }
 
-/* Active states: a filled pill with white text, like "recording". */
-.voice-listening,
-.voice-thinking,
-.voice-speaking {
-    color: #ffffff;
-    padding: 0 10px;
-}
+/* Busy: one colour per phase. */
 .voice-listening .voice-icon,
+.voice-listening .voice-label { color: #f66151; }   /* red 2   */
 .voice-thinking .voice-icon,
+.voice-thinking .voice-label  { color: #62a0ea; }   /* blue 2  */
 .voice-speaking .voice-icon,
-.voice-listening .voice-label,
-.voice-thinking .voice-label,
-.voice-speaking .voice-label {
-    color: #ffffff;
-}
-
-.voice-listening { background-color: #e01b24; }   /* red 4 */
-.voice-thinking  { background-color: #3584e4; }   /* blue 3 */
-.voice-speaking  { background-color: #26a269; }   /* green 5 */
-
-.voice-listening:hover { background-color: #c01c28; }
-.voice-thinking:hover  { background-color: #1c71d8; }
-.voice-speaking:hover  { background-color: #2ec27e; }
+.voice-speaking .voice-label  { color: #57e389; }   /* green 2 */

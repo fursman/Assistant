@@ -135,12 +135,13 @@ install_gnome_integration() {
 
     log_info "Installing the GNOME Shell indicator ($uuid)..."
     mkdir -p "$dst"
-    for f in "$src"/*; do
-        if ! cmp -s "$f" "$dst/$(basename "$f")"; then
-            install -m 0644 "$f" "$dst/"
+    while IFS= read -r -d '' f; do
+        rel="${f#"$src"/}"
+        if ! cmp -s "$f" "$dst/$rel"; then
+            install -D -m 0644 "$f" "$dst/$rel"
             changed=1
         fi
-    done
+    done < <(find "$src" -type f -print0)
     # Enabled through the setting rather than `gnome-extensions enable`: the
     # CLI refuses an extension the running Shell has not loaded yet, and on
     # Wayland it will not load a new one until the next login.
