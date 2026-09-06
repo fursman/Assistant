@@ -1226,6 +1226,8 @@ class AudioCapture:
         self._muted = False
         self.overflows = 0
         self.dropped = 0
+        self.last_callback = 0.0
+        self.opened_at = 0.0
 
     # -- lifecycle --
     def start(self):
@@ -1238,6 +1240,7 @@ class AudioCapture:
             input_device_index=self.device_index, frames_per_buffer=CHUNK_SIZE,
             stream_callback=self._callback)
         self._stream.start_stream()
+        self.opened_at = self.last_callback = time.monotonic()
         self.logger.info("Audio stream opened (callback mode)")
 
     def stop(self):
@@ -1261,6 +1264,7 @@ class AudioCapture:
 
     # -- PortAudio thread --
     def _callback(self, in_data, frame_count, time_info, status):
+        self.last_callback = time.monotonic()
         if status:
             self.overflows += 1
         if not self._muted:
@@ -1269,6 +1273,34 @@ class AudioCapture:
             except queue.Full:
                 self.dropped += 1
         return (None, pyaudio.paContinue)
+
+    # -- health --
+    def stalled(self, grace=1.5) -> bool:
+        """True when the stream is open but the driver has gone silent.
+
+        Muting does not stop the callbacks (they discard instead), so a
+        silent callback is a dead stream whatever the consumer is doing.
+        """
+        return self._stream is not None and \
+            time.monotonic() - self.last_callback > grace
+
+    def describe(self) -> str:
+        """One line of diagnostics for the log when the stream misbehaves."""
+        s = self._stream
+        try:
+            active = s.is_active() if s is not None else None
+        except OSError:
+            active = "error"
+        now = time.monotonic()
+        return (f"open {now - self.opened_at:.1f}s, last callback "
+                f"{now - self.last_callback:.1f}s ago, active={active}, "
+                f"muted={self._muted}, overflow flags={self.overflows}, "
+                f"dropped={self.dropped}")
+
+    def reopen(self):
+        """Tear the stream down and open it again, same device."""
+        self.stop()
+        self.start()
 
     # -- consumer --
     def mute(self, muted: bool):
@@ -4251,7 +4283,11 @@ class VoiceAssistant:
                 break
             chunk = self.capture.read(RECORD_CHUNK_DURATION, timeout=2.0)
             if chunk is None:
-                self.logger.warning("Mic went quiet mid-recording — ending turn")
+                # Seen on the first long turn after the stream opens, with no
+                # overflow flag and no error: the callbacks simply stop. The
+                # listen loop reopens the stream once this turn is answered.
+                self.logger.warning(
+                    f"Mic went quiet mid-recording — ending turn ({self.capture.describe()})")
                 hit_cap = False
                 break
             frames.append(chunk)
@@ -4482,6 +4518,18 @@ class VoiceAssistant:
             chunk = await loop.run_in_executor(
                 None, self.capture.read, VAD_CHUNK_DURATION, 1.0)
             if chunk is None:
+                if self.is_active and self.capture.stalled():
+                    # Without this a dead stream meant voice mode looked on
+                    # and heard nothing until it was toggled off and on.
+                    self.logger.warning(
+                        f"Audio stream stalled — reopening ({self.capture.describe()})")
+                    try:
+                        await loop.run_in_executor(None, self.capture.reopen)
+                        self.vad.reset()
+                        prev_chunk = None
+                    except OSError as e:
+                        self.logger.error(f"Failed to reopen audio stream: {e}")
+                        await asyncio.sleep(1)
                 continue
             if not self.is_active:
                 prev_chunk = None
