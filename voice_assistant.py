@@ -1882,14 +1882,23 @@ class DshSession:
 
     PROFILE = "sdk-minimal"
 
+    # The transcript here is the conversation LEDGER for every backend, not
+    # just this one. Each exchange carries a sequence number; each backend
+    # keeps a cursor of the last exchange it has seen, and before its next
+    # turn is told what was said meanwhile (see unseen()). That is what lets
+    # SUPER+M swap between the local model and Claude mid-conversation
+    # without either one losing the thread.
+    BACKENDS = ("dsh", "claude", "local")
+
     def __init__(self, logger):
         self.logger = logger
         self.harness = None
         self.session_id = None
-        self.transcript = []        # [{"user": ..., "assistant": ...}], oldest first
+        self.transcript = []        # [{"seq", "backend", "user", "assistant"}], oldest first
+        self.cursors = {b: 0 for b in self.BACKENDS}   # last seq each backend has seen
+        self._seq = 0
         self.prompt_tokens = 0      # largest prompt the server saw on this runtime
         self.turns = 0
-        self._seeded = False
         self._load_transcript()
 
     @property
@@ -1935,7 +1944,9 @@ class DshSession:
         self.harness = harness
         self.turns = 0
         self.prompt_tokens = 0
-        self._seeded = not self.transcript
+        # A fresh runtime knows nothing: everything in the ledger is unseen,
+        # and the first prompt carries a recap of it.
+        self.cursors["dsh"] = 0
         self.logger.info(
             f"DeepSeek Harness up in {time.time() - t0:.2f}s (session {self.session_id}, "
             f"{len(self.transcript)} remembered exchanges)")
@@ -1954,8 +1965,9 @@ class DshSession:
     abort = stop
 
     def reset(self):
-        """Forget the conversation: transcript, file and runtime."""
+        """Forget the conversation: ledger, cursors, file and runtime."""
         self.transcript = []
+        self.cursors = {b: 0 for b in self.BACKENDS}
         self._save_transcript()
         self.stop()
 
@@ -1976,10 +1988,7 @@ class DshSession:
         as it arrives. Returns the SDK RunResult, or raises."""
         if self.harness is None:
             raise RuntimeError("DeepSeek Harness is not running")
-        prompt = text
-        if not self._seeded:
-            prompt = self._recap() + text
-            self._seeded = True
+        prompt = self.recap_for("dsh") + text
 
         def on_note(n):
             if n.method != "session.event":
@@ -1992,29 +2001,64 @@ class DshSession:
         self.turns += 1
         return result
 
-    def remember(self, user: str, assistant: str):
-        self.transcript.append({"user": user, "assistant": assistant})
+    def remember(self, user: str, assistant: str, backend: str = "dsh"):
+        """One finished exchange, on whichever backend answered it. That
+        backend has by definition seen it; the others catch up via unseen()."""
+        self._seq += 1
+        self.transcript.append({"seq": self._seq, "backend": backend,
+                                "user": user, "assistant": assistant})
+        self.cursors[backend] = self._seq
         # Bound the file as well as the recap: whole exchanges, oldest out first.
         while len(self.transcript) > 1 and self._size(self.transcript) > DSH_RECAP_CHARS * 2:
             del self.transcript[0]
         self._save_transcript()
 
+    def unseen(self, backend: str) -> list:
+        """Exchanges this backend was not part of, oldest first."""
+        cur = self.cursors.get(backend, 0)
+        return [x for x in self.transcript if x["seq"] > cur]
+
+    def caught_up(self, backend: str):
+        self.cursors[backend] = self._seq
+        self._save_transcript()
+
+    def recap_for(self, backend: str) -> str:
+        """The prompt prefix that brings `backend` up to date, or "".
+
+        Marks the backend caught up: the recap is about to be sent, and a
+        turn that then fails is retried with the same prefix by its caller
+        or answered by another backend, which gets its own recap.
+        """
+        missed = self.unseen(backend)
+        if not missed:
+            return ""
+        whole = len(missed) == len(self.transcript)
+        self.caught_up(backend)
+        return self._recap(missed, whole)
+
     @staticmethod
     def _size(exchanges) -> int:
         return sum(len(x["user"]) + len(x["assistant"]) for x in exchanges)
 
-    def _recap(self) -> str:
+    @staticmethod
+    def _recap(exchanges, whole: bool) -> str:
         kept, size = [], 0
-        for x in reversed(self.transcript):
+        for x in reversed(exchanges):
             block = f"User: {x['user']}\nAssistant: {x['assistant']}\n"
             if kept and size + len(block) > DSH_RECAP_CHARS:
                 break
             kept.append(block)
             size += len(block)
         kept.reverse()
-        return ("[The conversation so far, oldest first. This is context for you, not a "
-                "request: carry on from it naturally, and do not repeat or summarise it.]\n"
-                + "".join(kept) + "\n[Now the user says:]\n")
+        if whole:
+            head = ("[The conversation so far, oldest first. This is context for you, not a "
+                    "request: carry on from it naturally, and do not repeat or summarise it.]\n")
+        else:
+            head = ("[The user has been talking with another assistant since your last turn. "
+                    "What was said, oldest first -- context for you, not a request; the "
+                    "\"Assistant\" lines were not yours. Carry on from it naturally, and do "
+                    "not repeat or summarise it.]\n")
+        return head + "".join(kept) + "\n[Now the user says:]\n"
 
     # -- files -------------------------------------------------------------
 
@@ -2022,16 +2066,29 @@ class DshSession:
         try:
             if DSH_TRANSCRIPT_FILE.exists():
                 data = json.loads(DSH_TRANSCRIPT_FILE.read_text())
-                if isinstance(data, list):
+                cursors = {}
+                if isinstance(data, dict):          # current format
+                    cursors = data.get("cursors") or {}
+                    data = data.get("exchanges") or []
+                if isinstance(data, list):          # or the old bare list
                     self.transcript = [x for x in data if isinstance(x, dict)
                                        and "user" in x and "assistant" in x]
+                for i, x in enumerate(self.transcript, 1):
+                    x.setdefault("seq", i)
+                    x.setdefault("backend", "dsh")
+                self._seq = max((x["seq"] for x in self.transcript), default=0)
+                for b in self.BACKENDS:
+                    # Unknown cursor (older file, new backend): assume caught
+                    # up rather than replaying the whole ledger at it.
+                    self.cursors[b] = int(cursors.get(b, self._seq))
         except Exception:
             self.transcript = []
 
     def _save_transcript(self):
         try:
             DSH_TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
-            DSH_TRANSCRIPT_FILE.write_text(json.dumps(self.transcript))
+            DSH_TRANSCRIPT_FILE.write_text(json.dumps(
+                {"exchanges": self.transcript, "cursors": self.cursors}))
         except Exception:
             pass
 
@@ -3440,6 +3497,12 @@ class VoiceAssistant:
             self.logger.error(f"Local LLM client init failed: {e}")
             return False
 
+        # Exchanges the other backends answered since this one's last turn,
+        # as ordinary history turns: the natural form for a chat API.
+        for x in self._ledger().unseen("local"):
+            self._local_history.append({"role": "user", "content": x["user"]})
+            self._local_history.append({"role": "assistant", "content": x["assistant"]})
+        self._ledger().caught_up("local")
         messages = [{"role": "system", "content": LOCAL_VOICE_PROMPT}]
         messages.extend(self._local_history)
         messages.append({"role": "user", "content": text})
@@ -3631,6 +3694,8 @@ class VoiceAssistant:
                 self._local_history.append({"role": "assistant", "content": reply})
             self._trim_local_history()
             self._save_local_history()
+            if completed:
+                self._ledger().remember(text, reply or "(acted, said nothing)", backend="local")
         return completed
 
     # ------------------------------------------------------------------
@@ -3641,6 +3706,13 @@ class VoiceAssistant:
     _DSH_TOOL_LABELS = {"bash": "Bash", "str_replace_editor": "Edit",
                         "mcp__web__web_search": "WebSearch",
                         "mcp__web__fetch_page": "WebFetch"}
+
+    def _ledger(self) -> "DshSession":
+        """The shared conversation ledger (it lives on the DshSession object,
+        which is cheap to hold without ever starting the harness)."""
+        if self._dsh is None:
+            self._dsh = DshSession(self.logger)
+        return self._dsh
 
     def _ensure_dsh_session(self) -> bool:
         if self._dsh is None:
@@ -3792,7 +3864,7 @@ class VoiceAssistant:
                 self._assistant_text = reply
         # The transcript is ours (see DshSession): it is what a respawned or
         # rotated runtime learns the conversation from.
-        session.remember(text, reply or "(acted, said nothing)")
+        session.remember(text, reply or "(acted, said nothing)", backend="dsh")
         if session.needs_rotation():
             # Synchronous, here: the reply is already queued for speech, and a
             # rotation in a thread could race the next turn's spawn.
@@ -3857,15 +3929,17 @@ class VoiceAssistant:
         if not self._ensure_claude_session():
             return "eof"
         session = self._claude
+        # What the other backends answered since Claude's last turn.
+        prompt = self._ledger().recap_for("claude") + text
         # This turn's own queue, from the dispatcher: it holds nothing from
         # before this prompt, and after the reader leaves it gets nothing more.
-        events = session.begin_turn(text)
+        events = session.begin_turn(prompt)
         if events is None:
             self.logger.warning("Claude process would not take the prompt; respawning")
             session.stop()
             if not session.start(self._session_id):
                 return "eof"
-            events = session.begin_turn(text)
+            events = session.begin_turn(prompt)
             if events is None:
                 return "eof"
         finished = False
@@ -4172,7 +4246,11 @@ class VoiceAssistant:
                     detail = detail[:120].rsplit(" ", 1)[0] + "…"
                 msg = f"Sorry, {detail}." if detail else "Sorry, Claude did not answer."
                 return self._speak_error(sentence_q, tts_thread, msg)
-            return self._finish_turn(sentence_q, status == "ok", tts_thread)
+            result = self._finish_turn(sentence_q, status == "ok", tts_thread)
+            if status == "ok":
+                self._ledger().remember(
+                    text, self._assistant_text.strip() or "(acted, said nothing)", backend="claude")
+            return result
 
         return self._finish_turn(sentence_q, False, tts_thread)
 
