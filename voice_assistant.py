@@ -1623,10 +1623,21 @@ class ClaudeSession:
         self._readers = []
         self._lock = threading.Lock()
         self._req = 0
-        # Clear while an interrupt's leftovers are still being consumed; a new
-        # turn waits on it so it cannot read the aborted turn's events.
-        self.drain_complete = threading.Event()
-        self.drain_complete.set()
+        # One dispatcher thread reads everything the process says and routes
+        # it: to the registered turn's queue while a turn is in flight, else
+        # to `on_unsolicited`. Nothing else ever reads `events`, so a result
+        # cannot be picked up by the wrong turn.
+        self._turn_q = None
+        self._turn_lock = threading.Lock()
+        self.on_unsolicited = None
+        # Set while the process is mid-turn with nobody registered to read
+        # it: a turn it started on its own (a scheduled wake-up, a background
+        # task notification) or the tail of one of ours that was abandoned.
+        # begin_turn() waits on it, because a prompt written into a running
+        # turn is folded into that turn, whose result is then read as ours.
+        self._foreign_done = threading.Event()
+        self._foreign_done.set()
+        self._discard = False      # drop events up to the next result
 
     # -- lifecycle --
     def start(self, session_id=None) -> bool:
@@ -1666,10 +1677,14 @@ class ClaudeSession:
                 self.proc = None
                 return False
             self.events = queue.Queue()
-            self.drain_complete.set()
+            with self._turn_lock:
+                self._turn_q = None
+            self._discard = False
+            self._foreign_done.set()
             self._readers = [
                 threading.Thread(target=self._read_stdout, args=(self.proc,), daemon=True),
                 threading.Thread(target=self._read_stderr, args=(self.proc,), daemon=True),
+                threading.Thread(target=self._dispatch, args=(self.events,), daemon=True),
             ]
             for t in self._readers:
                 t.start()
@@ -1748,28 +1763,91 @@ class ClaudeSession:
                             "request_id": f"int{self._req}",
                             "request": {"subtype": "interrupt"}})
 
-    def drain_pending(self, seconds=30.0):
-        """Consume leftover events after an interrupt so the next turn is clean.
+    @staticmethod
+    def _is_turn_end(ev) -> bool:
+        # num_turns == 0 is a local command echo, not the end of a turn.
+        return ev.get("type") == "result" and ev.get("num_turns") != 0
 
-        Waits for the interrupted turn's own `result`, not for a fixed window:
-        a one-second cutoff left the tail of an aborted turn in the queue, and
-        the next question then heard the previous turn's answer.
-        """
-        events = self.events
-        deadline = time.monotonic() + seconds
-        try:
-            while time.monotonic() < deadline:
+    # Event types that mean the process is inside a turn. `system` and
+    # control traffic can arrive at idle without a result ever following.
+    _IN_TURN = ("assistant", "stream_event", "user", "tool_use", "tool_result")
+
+    def _dispatch(self, events):
+        """Route every event from this process, for the life of the process."""
+        while True:
+            ev = events.get()
+            with self._turn_lock:
+                q = self._turn_q
+            if ev is None:
+                if q is not None:
+                    q.put(None)
+                self._discard = False
+                self._foreign_done.set()
+                return
+            if q is not None:
+                q.put(ev)
+                continue
+            # Nobody asked for this: the tail of a turn we abandoned (being
+            # discarded), or a turn the process began on its own.
+            if self._is_turn_end(ev):
+                discarded, self._discard = self._discard, False
+                self._foreign_done.set()
+                if discarded:
+                    continue
+            elif self._discard:
+                continue
+            elif ev.get("type") in self._IN_TURN:
+                self._foreign_done.clear()
+            cb = self.on_unsolicited
+            if cb is not None:
                 try:
-                    ev = events.get(timeout=max(0.0, deadline - time.monotonic()))
+                    cb(ev)
+                except Exception as e:
+                    self.logger.warning(f"Unsolicited Claude event handler failed: {e}")
+
+    def begin_turn(self, text, wait=20.0):
+        """Send one prompt; return the queue its events arrive on, or None if
+        the process could not take it (the caller respawns).
+
+        Never sends into a running turn. A prompt written while the process
+        is mid-turn is folded into that turn, and that turn's result is then
+        read as the answer to this prompt -- after which every reply is one
+        turn behind. A scheduled wake-up firing inside the process did exactly
+        that and put the assistant out of step for a whole morning.
+        """
+        if not self._foreign_done.wait(timeout=wait):
+            self.logger.warning("Claude is mid-turn with nobody listening; interrupting it")
+            self.interrupt()
+            if not self._foreign_done.wait(timeout=10.0):
+                return None
+        q = queue.Queue()
+        with self._turn_lock:
+            self._turn_q = q
+        if not self.send_user(text):
+            with self._turn_lock:
+                self._turn_q = None
+            return None
+        return q
+
+    def end_turn(self, finished: bool):
+        """The reader is done with its queue. If it left before this turn's
+        result, whatever the process still says belongs to nobody: drop it up
+        to and including that result, and hold the next prompt until then."""
+        with self._turn_lock:
+            q, self._turn_q = self._turn_q, None
+            if finished or q is None:
+                return
+            # The result may already be in the queue the reader stopped
+            # reading (it aborted as the result landed); look before waiting.
+            while True:
+                try:
+                    ev = q.get_nowait()
                 except queue.Empty:
+                    break
+                if ev is not None and self._is_turn_end(ev):
                     return
-                if ev is None:
-                    return
-                # num_turns == 0 is a local command echo, not the end of a turn.
-                if ev.get("type") == "result" and ev.get("num_turns") != 0:
-                    return
-        finally:
-            self.drain_complete.set()
+            self._discard = True
+            self._foreign_done.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -3725,12 +3803,36 @@ class VoiceAssistant:
     # Claude Code backend
     # ------------------------------------------------------------------
 
+    def _claude_unsolicited(self, ev):
+        """An event from the claude process with no turn of ours in flight: a
+        scheduled wake-up firing, a background task finishing, a hook.
+
+        These used to sit in the queue until the next question, whose reader
+        took them for its answer within milliseconds -- and every reply after
+        that was one turn behind. Now the dispatcher hands them here: the
+        finished turn is announced on its own, and never mixed into a reply.
+        """
+        if not ClaudeSession._is_turn_end(ev):
+            return
+        if ev.get("is_error"):
+            self.logger.warning(f"Unsolicited Claude turn failed: {str(ev.get('result'))[:200]}")
+            return
+        text = str(ev.get("result") or "").strip()
+        self.logger.info(
+            f"Unsolicited Claude turn (turns={ev.get('num_turns')}): {text[:120]}")
+        if not text:
+            return
+        self._notify(f"🔔 {_strip_markdown(text)}", title="Assistant")
+        if self.is_active and not self.is_processing:
+            threading.Thread(target=self._say, args=(text,), daemon=True).start()
+
     def _ensure_claude_session(self) -> bool:
         if not CLAUDE_PERSISTENT:
             return False
         if self._claude is None:
             self._claude = ClaudeSession(
                 self.logger, str(Path(__file__).parent), self._session_id)
+            self._claude.on_unsolicited = self._claude_unsolicited
         if not self._claude.alive:
             return self._claude.start()
         return True
@@ -3755,61 +3857,57 @@ class VoiceAssistant:
         if not self._ensure_claude_session():
             return "eof"
         session = self._claude
-        # An interrupt's leftovers must be gone before a new turn starts, or
-        # the aborted turn's events get read as the answer to this question.
-        if not session.drain_complete.wait(timeout=30):
-            self.logger.warning("Previous turn's events never drained; respawning")
+        # This turn's own queue, from the dispatcher: it holds nothing from
+        # before this prompt, and after the reader leaves it gets nothing more.
+        events = session.begin_turn(text)
+        if events is None:
+            self.logger.warning("Claude process would not take the prompt; respawning")
             session.stop()
             if not session.start(self._session_id):
                 return "eof"
-        if not session.send_user(text):
-            self.logger.warning("Claude process not accepting input; respawning")
-            session.stop()
-            if not session.start(self._session_id):
+            events = session.begin_turn(text)
+            if events is None:
                 return "eof"
-            if not session.send_user(text):
-                return "eof"
-        # Bind the queue ONCE. A restart mid-turn (SIGUSR2 "new conversation",
-        # which the system prompt tells the model to send from inside its own
-        # turn) rebinds session.events, and re-reading it each iteration would
-        # silently switch to a new, empty queue that nobody will ever feed.
-        events = session.events
-
-        while True:
-            if abort.is_set():
-                return "aborted"
-            try:
-                event = events.get(timeout=0.25)
-            except queue.Empty:
-                self._flush_pending_tool_notice()
-                if not session.alive:
+        finished = False
+        try:
+            while True:
+                if abort.is_set():
+                    return "aborted"
+                try:
+                    event = events.get(timeout=0.25)
+                except queue.Empty:
+                    self._flush_pending_tool_notice()
+                    if not session.alive:
+                        return "eof"
+                    continue
+                if event is None:
                     return "eof"
-                continue
-            if event is None:
-                return "eof"
 
-            etype = event.get("type")
-            if etype == "system":
-                sid = event.get("session_id")
-                if sid and sid != self._session_id:
-                    self._session_id = sid
-                    self._save_session_id(sid)
-                    self.logger.info(f"Claude session: {sid}")
-            elif etype == "stream_event":
-                self._handle_stream_event(event.get("event", {}))
-            elif etype == "result":
-                if event.get("num_turns") == 0:
-                    continue      # local command echo, not the end of a turn
-                if event.get("is_error"):
-                    errs = event.get("errors") or [event.get("result")]
-                    msg = "; ".join(str(e) for e in errs if e) or "unknown error"
-                    self.logger.warning(f"Claude error: {msg}")
-                    self._claude_error = msg
-                    return "error"
-                self.logger.info(
-                    f"Claude done (cost=${event.get('total_cost_usd', 0):.4f} cumulative, "
-                    f"turns={event.get('num_turns', 1)})")
-                return "ok"
+                etype = event.get("type")
+                if etype == "system":
+                    sid = event.get("session_id")
+                    if sid and sid != self._session_id:
+                        self._session_id = sid
+                        self._save_session_id(sid)
+                        self.logger.info(f"Claude session: {sid}")
+                elif etype == "stream_event":
+                    self._handle_stream_event(event.get("event", {}))
+                elif etype == "result":
+                    if event.get("num_turns") == 0:
+                        continue      # local command echo, not the end of a turn
+                    finished = True
+                    if event.get("is_error"):
+                        errs = event.get("errors") or [event.get("result")]
+                        msg = "; ".join(str(e) for e in errs if e) or "unknown error"
+                        self.logger.warning(f"Claude error: {msg}")
+                        self._claude_error = msg
+                        return "error"
+                    self.logger.info(
+                        f"Claude done (cost=${event.get('total_cost_usd', 0):.4f} cumulative, "
+                        f"turns={event.get('num_turns', 1)})")
+                    return "ok"
+        finally:
+            session.end_turn(finished)
 
     def _build_claude_cmd(self, message: str) -> list:
         """One-shot CLI invocation, used when the persistent process is off."""
@@ -4214,9 +4312,9 @@ class VoiceAssistant:
             # Only when a turn is actually in flight -- otherwise the drain
             # below could swallow the next turn's own events.
             if self._claude.interrupt():
-                self._claude.drain_complete.clear()
-                threading.Thread(target=self._claude.drain_pending,
-                                 daemon=True).start()
+                # The reader returns "aborted" and end_turn() then discards
+                # the rest of this turn up to its result, so the next prompt
+                # cannot read the tail of this one as its answer.
                 self.logger.info("Interrupted Claude turn")
         if self._claude_process and self._claude_process.poll() is None:
             try:
