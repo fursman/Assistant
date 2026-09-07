@@ -37,6 +37,7 @@ dependencies = [
     "silero-vad>=4.0.1",
     "moonshine-voice>=0.1.3",
     "faster-whisper>=0.9.0",
+    "pocket-tts>=2.1.0",
     "kokoro-onnx>=0.4.0",
     "onnxruntime>=1.16.0",
     "openai>=1.0.0",
@@ -45,8 +46,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Alternative TTS engines (VOICE_ASSISTANT_TTS_ENGINE=pocket|supertonic)
-alt-tts = ["pocket-tts", "supertonic"]
+# Alternative TTS engine (VOICE_ASSISTANT_TTS_ENGINE=supertonic)
+alt-tts = ["supertonic"]
 
 [project.urls]
 "Homepage" = "https://github.com/fursman/Assistant"

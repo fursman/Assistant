@@ -211,17 +211,24 @@ WHISPER_DEVICE_OVERRIDE = os.getenv("VOICE_ASSISTANT_WHISPER_DEVICE", "auto")
 # --- TTS -------------------------------------------------------------------
 TTS_VOICE = os.getenv("VOICE_ASSISTANT_TTS_VOICE", "af_heart")
 TTS_SPEED = float(os.getenv("VOICE_ASSISTANT_TTS_SPEED", "1.0"))
-# TTS stays on the CPU unconditionally: Kokoro-82M is small and non-
-# autoregressive, so CPU synthesis is comfortably faster than realtime, and
-# pinning it here means speech keeps working while the GPU is passed through.
-# Engine: kokoro (default, vendored model files) | pocket | supertonic.
+# TTS stays on the CPU unconditionally, so speech keeps working while the GPU
+# is passed through. Engine: pocket (default) | kokoro | supertonic.
 #
-# Full precision, deliberately. The onnx-community quantized builds (q8f16
+# Pocket (kyutai, ~100M) is the default because it is the one engine that stays
+# comfortably faster than realtime on a thermally capped laptop CPU. Measured
+# 2026-09-06 on the same four sentences with the CPU held at ~1.4 GHz: Kokoro
+# RTF 1.23, Pocket RTF 0.48. Anything at or above 1.0 drains the playback
+# queue at every sentence boundary, and no amount of buffering or thread
+# splitting fixes a synthesiser that is slower than the speaker. (An earlier
+# pocket-tts release benchmarked slower than Kokoro here; 2.1.0 does not.)
+# Pocket has preset voices only and ignores VOICE_ASSISTANT_TTS_SPEED.
+#
+# Kokoro notes, for when it is selected: full precision, deliberately. The onnx-community quantized builds (q8f16
 # ~83MB, quantized ~89MB) load and run but benchmarked 4.6x SLOWER on this CPU
 # (3.4 s vs 0.74 s per utterance): int8 needs hardware acceleration to pay off,
 # and this chip has AVX2 but no VNNI. They also name their token input
 # "input_ids" where kokoro-onnx feeds "tokens", so they are not drop-in anyway.
-TTS_ENGINE = os.getenv("VOICE_ASSISTANT_TTS_ENGINE", "kokoro")
+TTS_ENGINE = os.getenv("VOICE_ASSISTANT_TTS_ENGINE", "pocket")
 TTS_MODEL = os.getenv("VOICE_ASSISTANT_TTS_MODEL", "kokoro-v1.0.onnx")
 TTS_VOICES = os.getenv("VOICE_ASSISTANT_TTS_VOICES", "voices-v1.0.bin")
 # Seconds of audio to have queued before the first word plays. Synthesis is
@@ -324,7 +331,9 @@ LOCAL_MAX_TOOL_ITERS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS", "5"
 # by hand (the patch is rewritten at every start).
 DSH_HOME = Path(os.getenv("VOICE_ASSISTANT_DSH_HOME",
                           str(Path.home() / ".local/state/voice-assistant/dsh")))
-DSH_MAX_TOKENS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_TOKENS", "1024"))
+# 1024 was not enough for one file-edit tool call: the harness cut the call
+# off mid-argument, nothing ran, and the turn ended with no prose to speak.
+DSH_MAX_TOKENS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_TOKENS", "2048"))
 DSH_CONTEXT_WINDOW = int(os.getenv("VOICE_ASSISTANT_DSH_CONTEXT_WINDOW", "32768"))
 # Persistent bash: one command may run this long before the harness kills it.
 DSH_TOOL_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_DSH_TOOL_TIMEOUT", "45"))
@@ -2754,7 +2763,7 @@ class VoiceAssistant:
         from pocket_tts import TTSModel
 
         model = TTSModel.load_model()
-        voice = os.getenv("VOICE_ASSISTANT_POCKET_VOICE", "alba")
+        voice = os.getenv("VOICE_ASSISTANT_POCKET_VOICE", "azelma")
         state = model.get_state_for_audio_prompt(voice)
         sample_rate = model.sample_rate
 

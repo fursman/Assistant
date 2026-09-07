@@ -39,8 +39,8 @@ SUPER+ALT chord on GNOME — see [Desktop](#desktop).
    off" and "turn the lights off and…".
 5. The transcript goes to **Claude Code** or a **local Qwen3.8-27B**, whichever
    this machine is set up for.
-6. **Kokoro** synthesises the reply clause by clause and plays it through a
-   single PipeWire stream, so speech starts as soon as the first few words
+6. **Pocket TTS** synthesises the reply clause by clause and plays it through
+   a single PipeWire stream, so speech starts as soon as the first few words
    exist and there are no gaps between sentences.
 
 ## Features
@@ -379,7 +379,8 @@ between the model's first token and the first sound.
 | `VOICE_ASSISTANT_SILENCE_TIMEOUT` | `2.5` | ends the turn regardless |
 | `VOICE_ASSISTANT_MOONSHINE_UPDATE_INTERVAL` | `0.25` | seconds of audio between decoding passes |
 | `VOICE_ASSISTANT_LISTEN_CHIME` | `1` | chime when the mic goes live again after a reply |
-| `VOICE_ASSISTANT_TTS_ENGINE` | `kokoro` | `kokoro`, `pocket` or `supertonic` |
+| `VOICE_ASSISTANT_TTS_ENGINE` | `pocket` | `pocket`, `kokoro` or `supertonic` |
+| `VOICE_ASSISTANT_POCKET_VOICE` | `azelma` | Pocket preset voice (`alba`, `azelma`, …) |
 | `VOICE_ASSISTANT_TTS_VOICE` | `af_heart` | Kokoro voice |
 | `VOICE_ASSISTANT_TTS_THREADS` | physical cores | ONNX threads for synthesis |
 
