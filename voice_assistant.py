@@ -3632,6 +3632,13 @@ class VoiceAssistant:
             return False
         if "max-tokens" in (stats["finish"], stats["end"]):
             self.logger.warning(f"dsh reply hit max_tokens ({DSH_MAX_TOKENS})")
+            if not reply:
+                # The whole budget went into a tool call that was cut off and
+                # never ran. Without this the end-of-turn fallback says "Done."
+                # for something that did not happen, turn after turn.
+                reply = ("I ran out of room before finishing that. Ask again and "
+                         "I will do it in smaller steps.")
+                self._assistant_text = reply
         # The transcript is ours (see DshSession): it is what a respawned or
         # rotated runtime learns the conversation from.
         session.remember(text, reply or "(acted, said nothing)")
