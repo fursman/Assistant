@@ -371,7 +371,7 @@ between the model's first token and the first sound.
 | `VOICE_ASSISTANT_DSH_ROTATE_TOKENS` | `24000` | prompt size at which the harness gets a fresh, recapped session |
 | `VOICE_ASSISTANT_DSH_TOOL_TIMEOUT` | `45` | seconds one harness `bash` command may run |
 | `VOICE_ASSISTANT_DSH_HOME` | `~/.local/state/voice-assistant/dsh` | the harness's profile, patch and session logs |
-| `VOICE_ASSISTANT_DSH_MAX_TOOL_CALLS` | `50` | tool calls allowed in one dsh turn before it is cut short |
+| `VOICE_ASSISTANT_DSH_MAX_TOOL_CALLS` | `500` | tool calls allowed in one dsh turn before it is cut short |
 | `VOICE_ASSISTANT_DSH_MAX_REPEATS` | `2` | times an identical tool call may run in one turn; one more ends the turn |
 | `VOICE_ASSISTANT_MODEL` / `_EFFORT` | `opus` / `max` | Claude model and effort |
 | `VOICE_ASSISTANT_CLAUDE_PERSISTENT` | `1` | keep one `claude` process alive across turns |

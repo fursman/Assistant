@@ -352,8 +352,9 @@ DSH_RECAP_CHARS = int(os.getenv("VOICE_ASSISTANT_DSH_RECAP_CHARS", "6000"))
 # transient failure is legitimate); one more and the turn is cut. The call
 # cap is only the backstop for loops that vary their wording, and it is set
 # high because real jobs (a code edit, a document) legitimately run dozens of
-# calls: the repeat limit is the guard that catches actual loops.
-DSH_MAX_TOOL_CALLS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_TOOL_CALLS", "50"))
+# calls -- one useful turn hit 50 -- so this only stops a turn that has
+# clearly gone wrong: the repeat limit is the guard that catches actual loops.
+DSH_MAX_TOOL_CALLS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_TOOL_CALLS", "500"))
 DSH_MAX_REPEATS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_REPEATS", "2"))
 
 # Sent on the last step, where the tool schema is withheld. Withholding it is
