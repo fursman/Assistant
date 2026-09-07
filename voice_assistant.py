@@ -343,6 +343,16 @@ DSH_TOOL_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_DSH_TOOL_TIMEOUT", "45"))
 DSH_ROTATE_TOKENS = int(os.getenv("VOICE_ASSISTANT_DSH_ROTATE_TOKENS", "24000"))
 # How much of the transcript a fresh runtime is told about, in characters.
 DSH_RECAP_CHARS = int(os.getenv("VOICE_ASSISTANT_DSH_RECAP_CHARS", "6000"))
+# Loop guards. The harness has no cap of its own and no cancel, and the
+# native loop's five-iteration limit does not apply to it. Two measured
+# runaways: the same Wikipedia URL fetched 25 times in a row until the prompt
+# outgrew the context, and the same Gutenberg search run 21 times for a book
+# that is not on Gutenberg (each pass repeating the previous one command for
+# command). An identical call may run DSH_MAX_REPEATS times (a retry after a
+# transient failure is legitimate); one more and the turn is cut. The call
+# cap is the backstop for loops that vary their wording.
+DSH_MAX_TOOL_CALLS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_TOOL_CALLS", "15"))
+DSH_MAX_REPEATS = int(os.getenv("VOICE_ASSISTANT_DSH_MAX_REPEATS", "2"))
 
 # Sent on the last step, where the tool schema is withheld. Withholding it is
 # not enough on its own: the model can still see its own tool calls in the
@@ -3599,6 +3609,22 @@ class VoiceAssistant:
             # Every command the model runs is in the log, as for the native loop.
             self.logger.warning(f"dsh tool {name}: {json.dumps(args)[:300]}")
             self._notify_tool_use(label, json.dumps(args))
+            # Loop guards (see DSH_MAX_TOOL_CALLS).
+            stats["tool_calls"] += 1
+            key = name + "\0" + str(data.get("arguments") or "")
+            seen = stats["calls"][key] = stats["calls"].get(key, 0) + 1
+            cut = None
+            if seen > DSH_MAX_REPEATS:
+                cut = f"it ran the same {label} call {seen} times"
+            elif stats["tool_calls"] > DSH_MAX_TOOL_CALLS:
+                cut = f"it made {DSH_MAX_TOOL_CALLS} tool calls in one turn"
+            if cut and not stats["cut"]:
+                stats["cut"] = cut
+                self.logger.warning(f"dsh loop guard: {cut} -- closing the runtime")
+                # No cancel in the protocol: closing the runtime is the abort.
+                # From another thread, because this callback runs on the SDK's
+                # reader thread and a close that joins it would deadlock.
+                threading.Thread(target=self._dsh.stop, daemon=True).start()
         elif kind == "turn/end":
             reason = data.get("reason") or {}
             stats["end"] = reason.get("kind")
@@ -3608,7 +3634,7 @@ class VoiceAssistant:
         elif kind in ("agent/error", "agent/request-error", "llm/retry-started"):
             self.logger.warning(f"dsh {kind}: {json.dumps(data)[:300]}")
 
-    def _stream_dsh(self, text, abort) -> bool:
+    def _stream_dsh(self, text, abort, _retry=False) -> bool:
         """One turn on the DeepSeek Harness. Same contract as _stream_local_llm:
         appends to _assistant_text, flushes sentences, surfaces tools and
         thinking as notifications, returns True if the turn completed."""
@@ -3616,12 +3642,27 @@ class VoiceAssistant:
             self._dsh_error = "the DeepSeek Harness would not start"
             return False
         session = self._dsh
-        stats = {"first": None, "prompt_tokens": 0, "finish": None, "end": None, "error": ""}
+        stats = {"first": None, "prompt_tokens": 0, "finish": None, "end": None, "error": "",
+                 "tool_calls": 0, "calls": {}, "cut": None}
         t0 = time.time()
         self._dsh_turn_active = True
+
+        def cut_short():
+            # The guard closed the runtime under the turn. Whatever the model
+            # had said stands; say why it stopped, and keep the exchange so
+            # the respawned runtime knows not to start over.
+            self.logger.warning(f"dsh turn cut short: {stats['cut']}")
+            notice = (f"I stopped because {stats['cut']} without getting anywhere. "
+                      "How do you want to proceed?")
+            self._assistant_text = (self._assistant_text.strip() + " " + notice).strip()
+            session.remember(text, self._assistant_text)
+            return True
+
         try:
             session.turn(text, lambda ev: self._dsh_event(ev, stats))
         except Exception as e:
+            if stats["cut"]:
+                return cut_short()
             if abort.is_set():
                 # Expected: _abort_inflight closed the runtime under the turn.
                 self.logger.info("DeepSeek Harness turn aborted")
@@ -3639,6 +3680,8 @@ class VoiceAssistant:
                     threading.Thread(target=session.start, daemon=True).start()
         if abort.is_set():
             return False
+        if stats["cut"]:
+            return cut_short()
 
         session.prompt_tokens = max(session.prompt_tokens, stats["prompt_tokens"])
         reply = self._assistant_text.strip()
@@ -3647,6 +3690,13 @@ class VoiceAssistant:
                 f"dsh: first token {stats['first'] - t0:.2f}s, total {time.time() - t0:.2f}s, "
                 f"prompt {stats['prompt_tokens']} tokens")
         if stats["end"] == "error" and not reply:
+            if "context size" in stats["error"] and not _retry:
+                # The prompt outgrew the window mid-turn. Rotation normally
+                # happens after a successful turn, so without this every later
+                # turn failed the same way until the service was restarted.
+                self.logger.warning("dsh: prompt outgrew the context -- rotating and retrying once")
+                session.rotate()
+                return self._stream_dsh(text, abort, _retry=True)
             self.logger.error(f"DeepSeek Harness turn ended in error: {stats['error']}")
             self._dsh_error = stats["error"][:160]
             return False
