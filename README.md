@@ -380,7 +380,7 @@ between the model's first token and the first sound.
 | `VOICE_ASSISTANT_MOONSHINE_UPDATE_INTERVAL` | `0.25` | seconds of audio between decoding passes |
 | `VOICE_ASSISTANT_LISTEN_CHIME` | `1` | chime when the mic goes live again after a reply |
 | `VOICE_ASSISTANT_TTS_ENGINE` | `pocket` | `pocket`, `kokoro` or `supertonic` |
-| `VOICE_ASSISTANT_POCKET_VOICE` | `azelma` | Pocket preset voice (`alba`, `azelma`, …) |
+| `VOICE_ASSISTANT_POCKET_VOICE` | `af_heart` | a saved voice in `voices/` (af_heart is Kokoro's voice cloned into Pocket), a Pocket preset (`alba`, `azelma`, …) or a path to a clip |
 | `VOICE_ASSISTANT_TTS_VOICE` | `af_heart` | Kokoro voice |
 | `VOICE_ASSISTANT_TTS_THREADS` | physical cores | ONNX threads for synthesis |
 

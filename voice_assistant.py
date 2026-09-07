@@ -2763,7 +2763,18 @@ class VoiceAssistant:
         from pocket_tts import TTSModel
 
         model = TTSModel.load_model()
-        voice = os.getenv("VOICE_ASSISTANT_POCKET_VOICE", "azelma")
+        # A preset name (alba, azelma, ...), a path, or a name that matches a
+        # saved voice in this repo's voices/ directory. The default is Kokoro's
+        # af_heart cloned into Pocket: 16.5 s of Kokoro speech run through
+        # Pocket's audio-prompt encoder, exported with export_model_state().
+        # A saved state loads in ~0 s and does NOT need the gated
+        # voice-cloning weights (only making a new one does), so it works on a
+        # machine that never logged in to Hugging Face. voices/af_heart_reference.wav
+        # is the clip it was made from, for regenerating it.
+        voice = os.getenv("VOICE_ASSISTANT_POCKET_VOICE", "af_heart")
+        saved = Path(__file__).resolve().parent / "voices" / f"{voice}.safetensors"
+        if saved.is_file():
+            voice = str(saved)
         state = model.get_state_for_audio_prompt(voice)
         sample_rate = model.sample_rate
 
@@ -2775,7 +2786,7 @@ class VoiceAssistant:
 
         self.kokoro = _PocketAdapter()
         self.tts_rate = sample_rate
-        self.logger.info(f"Pocket TTS voice: {voice}")
+        self.logger.info(f"Pocket TTS voice: {Path(voice).stem if os.sep in voice else voice}")
         return True
 
     def _load_supertonic(self) -> bool:
