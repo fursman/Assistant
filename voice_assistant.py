@@ -614,11 +614,15 @@ TURN_CONTEXT_FILE = Path.home() / ".local/state/voice-assistant/turn_context.jso
 # banner, and by the end of a four-tool turn the screen was three notifications
 # behind. Keeping the expiry at or under the throttle interval is what keeps
 # the newest thing the visible thing, so these two constants belong together.
-NOTIFY_THROTTLE_SECONDS = 2.0
+# Raised from 2 s after testing: at 2 s nothing backed up, but each banner was
+# gone before it could be read, and a turn's worth of tool use went by unseen.
+# Both numbers move together -- fewer notifications, each readable, still no
+# backlog. The message list is the real catch-up; banners are for glancing.
+NOTIFY_THROTTLE_SECONDS = 4.0
 NOTIFY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_EXPIRE",
                                  str(int(NOTIFY_THROTTLE_SECONDS * 1000))))
 # The reply is last in a turn, so nothing queues behind it; it can linger.
-NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE", "6000"))
+NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE", "8000"))
 # 0 restores the old behaviour: replace in place, never expire, close on exit.
 NOTIFY_HISTORY = os.getenv("VOICE_ASSISTANT_NOTIFY_HISTORY", "1").strip().lower() \
     not in ("0", "false", "no", "off")

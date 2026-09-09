@@ -769,8 +769,8 @@ optional.
 |---|---|---|
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
 | `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
-| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `2000` | ms a normal notification stays up; keep it at or under the 2 s throttle |
-| `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | `6000` | ms the reply stays up; nothing queues behind it |
+| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `4000` | ms a normal notification stays up; keep it at or under the 4 s throttle |
+| `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | `8000` | ms the reply stays up; nothing queues behind it |
 | `VOICE_ASSISTANT_CLIPBOARD` | `1` | copy code blocks in a reply to the clipboard, and say so |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 
