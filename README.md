@@ -593,6 +593,34 @@ own SUPER+M (the notification list) is moved off, and stays on SUPER+V.
 `voice-assistant-ctl new-session` to whatever you like. That is the whole
 integration.
 
+### Notifications
+
+GNOME shows **one banner at a time** and queues the rest, and it treats the two
+ways a notification ends very differently. One that times out stays in the
+message list. One the app closes is erased from it. Both measured here.
+
+That decides the design. Nothing is ever closed and no id is ever reused, so
+each notification gets its own banner and its own line in the list, and the
+whole turn is there to scroll back through afterwards.
+
+The queue is the catch, and it is pure arithmetic. A banner that outlives the
+gap between notifications backs the queue up, and what is on screen falls
+behind what is actually happening: `Working...` fired every 2 s with a 5 s
+banner, and by the end of a four-tool turn the screen was three notifications
+behind, still showing step two while the reply was being spoken. Keeping the
+expiry at or under the throttle interval is what keeps the newest thing the
+visible thing, so `VOICE_ASSISTANT_NOTIFY_EXPIRE` and the 2 s throttle are
+documented as a pair. The reply is exempt and lingers, because nothing queues
+behind it.
+
+`--replace-id` is not used, and this is why: it updates a notification *in
+place in the tray* without raising a banner again. Once GNOME had retired the
+first banner, a replacement was simply invisible.
+
+Stacked banners, several on screen at once, are not possible on GNOME at all.
+mako, dunst and swaync all do it, which is one thing the Hyprland side gets for
+free.
+
 ### Status file
 
 `~/.local/state/voice-assistant/status` is rewritten atomically on every phase
@@ -731,6 +759,9 @@ optional.
 | variable | default | meaning |
 |---|---|---|
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
+| `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
+| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `2000` | ms a normal notification stays up; keep it at or under the 2 s throttle |
+| `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | `6000` | ms the reply stays up; nothing queues behind it |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 
 ## Privacy and what leaves the machine

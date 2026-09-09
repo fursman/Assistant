@@ -600,6 +600,29 @@ LOCAL_HISTORY_FILE = Path.home() / ".local/state/voice-assistant/local_history.j
 DSH_TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/dsh_transcript.json"
 TURN_CONTEXT_FILE = Path.home() / ".local/state/voice-assistant/turn_context.json"
 
+# GNOME shows one banner at a time and queues the rest, and it treats the two
+# ways a notification ends very differently: one that times out stays in the
+# message list, one the app closes is erased from it. Both were measured here.
+#
+# So: never close, never reuse an id, and let every notification expire. Each
+# gets its own banner and its own line in the list, and the whole turn is there
+# to scroll back through afterwards.
+#
+# The queue is the catch. A banner that outlives the interval between
+# notifications backs the queue up, and the popup on screen falls behind what
+# is actually happening -- measured: "Working..." fired every 2 s with a 5 s
+# banner, and by the end of a four-tool turn the screen was three notifications
+# behind. Keeping the expiry at or under the throttle interval is what keeps
+# the newest thing the visible thing, so these two constants belong together.
+NOTIFY_THROTTLE_SECONDS = 2.0
+NOTIFY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_EXPIRE",
+                                 str(int(NOTIFY_THROTTLE_SECONDS * 1000))))
+# The reply is last in a turn, so nothing queues behind it; it can linger.
+NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE", "6000"))
+# 0 restores the old behaviour: replace in place, never expire, close on exit.
+NOTIFY_HISTORY = os.getenv("VOICE_ASSISTANT_NOTIFY_HISTORY", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+
 # A conversation resumes seamlessly across a restart, and across days: the
 # session id is reused, so the model sees an unbroken exchange and answers as
 # though the last turn were seconds ago. Measured here, a conversation ran
@@ -3152,11 +3175,21 @@ class VoiceAssistant:
         cmd = ["notify-send", "--print-id", "--app-name=Voice Assistant", title, message]
         if silent:
             cmd.extend(["-h", "string:suppress-popup:true", "-u", "low"])
-        # -1 = never expire (freedesktop spec), overriding any server default.
-        cmd.extend(["--expire-time=" + (str(timeout_ms) if timeout_ms is not None else "-1")])
-        prev = self._notif_ids.get(slot)
-        if prev:
-            cmd.extend(["--replace-id=" + str(prev)])
+        # A finite expiry is what puts the notification in the message list and
+        # frees the banner slot for the next one. -1 (never expire) parks it on
+        # screen and stalls everything behind it.
+        if timeout_ms is None:
+            timeout_ms = NOTIFY_EXPIRE_MS if NOTIFY_HISTORY else -1
+        cmd.extend(["--expire-time=" + str(timeout_ms)])
+        # --replace-id updates a notification in place in the tray and does not
+        # raise a banner again, so once GNOME has retired the first banner a
+        # replacement is invisible. In history mode nothing is reused and
+        # nothing is closed: every notification is new, so every one is seen
+        # and every one is kept.
+        if not NOTIFY_HISTORY:
+            prev = self._notif_ids.get(slot)
+            if prev:
+                cmd.extend(["--replace-id=" + str(prev)])
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
             nid = out.stdout.strip()
@@ -3272,7 +3305,7 @@ class VoiceAssistant:
         if len(text) <= prev_len:
             return
         now = time.time()
-        if now - self._last_thinking_notify < 2.0:
+        if now - self._last_thinking_notify < NOTIFY_THROTTLE_SECONDS:
             return
         new_text = text[prev_len:]
         last_boundary = -1
@@ -3284,7 +3317,7 @@ class VoiceAssistant:
                 self._last_thinking_notify = now
                 self._thinking_shown_len = prev_len + last_boundary
                 self._notify(f"🧠 {to_send}", title="Thinking...",
-                             timeout_ms=5000, slot="progress")
+                             slot="progress")
 
     def _notify_tool_use(self, tool_name, input_json_str):
         """Tool-use notification with a friendly label and details.
@@ -3322,18 +3355,18 @@ class VoiceAssistant:
 
         message = f"🔧 {label}{detail}"
         now = time.time()
-        if now - self._last_tool_notify >= 2.0:
+        if now - self._last_tool_notify >= NOTIFY_THROTTLE_SECONDS:
             self._last_tool_notify = now
             self._pending_tool_notice = None
-            self._notify(message, title="Working...", timeout_ms=5000, slot="progress")
+            self._notify(message, title="Working...", slot="progress")
         else:
             self._pending_tool_notice = message
 
     def _flush_pending_tool_notice(self):
-        if self._pending_tool_notice and time.time() - self._last_tool_notify >= 2.0:
+        if self._pending_tool_notice and time.time() - self._last_tool_notify >= NOTIFY_THROTTLE_SECONDS:
             self._last_tool_notify = time.time()
             self._notify(self._pending_tool_notice, title="Working...",
-                         timeout_ms=5000, slot="progress")
+                         slot="progress")
             self._pending_tool_notice = None
 
     # ------------------------------------------------------------------
@@ -4194,7 +4227,7 @@ class VoiceAssistant:
         self.logger.warning(f"Local LLM {why} — this query goes to claude")
         self._play_chime_async("fallback")
         self._notify(f"☁️ Local model {label} — asking Claude",
-                     timeout_ms=4000, slot="progress")
+                     slot="progress")
         self._set_status("thinking", backend="claude")
 
     @staticmethod
@@ -4453,12 +4486,16 @@ class VoiceAssistant:
             full_response = "Done."
             self._assistant_text = full_response
 
-        self._close_notifications(["progress"])
+        # Only in replace mode. In history mode the progress banners expire on
+        # their own, and closing them would delete the turn from the list.
+        if not NOTIFY_HISTORY:
+            self._close_notifications(["progress"])
 
         if full_response:
             preview = _strip_markdown(full_response)
             if preview:
-                self._notify(f"🧙 {preview}", title="Assistant")
+                self._notify(f"🧙 {preview}", title="Assistant",
+                             timeout_ms=NOTIFY_REPLY_EXPIRE_MS)
             self._flush_sentences(final=True)
         else:
             self.logger.info("Empty reply — skipping TTS")
@@ -4595,6 +4632,15 @@ class VoiceAssistant:
             self._ensure_claude_session()
 
     def _delayed_dismiss(self):
+        """Clear leftovers when voice mode goes off.
+
+        Only needed in replace mode, where notifications never expire and would
+        otherwise sit on screen indefinitely. In history mode they time out by
+        themselves and closing them would erase the conversation from the
+        message list, which is the thing worth keeping.
+        """
+        if NOTIFY_HISTORY:
+            return
         time.sleep(2)
         self._close_notifications()
 
