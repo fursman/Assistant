@@ -680,6 +680,24 @@ _CODE_BLOCK_RE = re.compile(r"```[A-Za-z0-9_+.-]*[ \t]*\n?(.*?)```", re.S)
 def _code_blocks(text: str):
     return [b.strip() for b in _CODE_BLOCK_RE.findall(text) if b.strip()]
 
+
+# Lines that set the command up rather than being the point of it.
+_SETUP_LINE = re.compile(r"^\s*(?:(?:cd|export|set|source|umask|shopt|unset)\b|#)|^\s*$")
+
+
+def _command_gist(cmd: str) -> str:
+    """The first line that says what a command actually does.
+
+    Naively taking line one showed "cd /home/user/voice-assistant" on nearly
+    every call, because that is how nearly every one starts, so the popup was
+    the same four words all day.
+    """
+    lines = [l.strip() for l in cmd.splitlines() if l.strip()]
+    for line in lines:
+        if not _SETUP_LINE.match(line):
+            return line
+    return lines[0] if lines else ""
+
 # A conversation resumes seamlessly across a restart, and across days: the
 # session id is reused, so the model sees an unbroken exchange and answers as
 # though the last turn were seconds ago. Measured here, a conversation ran
@@ -3401,9 +3419,14 @@ class VoiceAssistant:
         except json.JSONDecodeError:
             args = {}
         if tool_name == "Bash":
+            # The tool carries a human-written description of the call. Prefer
+            # it: it says why, where the command only says how.
+            desc = (args.get("description") or "").strip()
             cmd = args.get("command", "")
-            if cmd:
-                detail = f"\n{cmd.split(chr(10))[0].strip()[:120]}"
+            if desc:
+                detail = f"\n{desc[:120]}"
+            elif cmd:
+                detail = f"\n{_command_gist(cmd)[:120]}"
         elif tool_name in ("Read", "Edit", "Write"):
             if args.get("file_path"):
                 detail = f"\n{args['file_path']}"
