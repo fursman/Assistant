@@ -655,59 +655,6 @@ NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE",
 NOTIFY_HISTORY = os.getenv("VOICE_ASSISTANT_NOTIFY_HISTORY", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 
-# Anything fenced is unreadable and unhearable at the same time: the speech
-# layer replaces a code block with the words "code block" so it does not read
-# punctuation aloud, and the notification shows the same. So a command handed
-# to the user in a reply simply vanished. Put it on the clipboard instead, and
-# say so, which turns a dead end into a paste.
-CLIPBOARD_ENABLED = os.getenv("VOICE_ASSISTANT_CLIPBOARD", "1").strip().lower() \
-    not in ("0", "false", "no", "off")
-_CLIPBOARD_TOOL = ""        # only a hit is cached; see below
-
-
-def _clipboard_tool():
-    """Looked up lazily, and a miss is never cached.
-
-    The tool gets installed precisely when someone notices it is missing, so
-    resolving at import -- or caching the miss -- would mean the install only
-    took effect after a restart. Caching the hit is enough: the repeated
-    lookup only happens while there is nothing to find.
-    """
-    global _CLIPBOARD_TOOL
-    if not _CLIPBOARD_TOOL:
-        _CLIPBOARD_TOOL = shutil.which("wl-copy") or shutil.which("xclip") or ""
-    return _CLIPBOARD_TOOL
-
-
-def _clipboard_ready() -> bool:
-    return bool(CLIPBOARD_ENABLED and _clipboard_tool())
-
-
-def _copy_to_clipboard(text: str, logger=None) -> bool:
-    """Put text on the clipboard. wl-copy forks a server for the selection and
-    returns, so this does not block."""
-    if not _clipboard_ready():
-        return False
-    cmd = [_clipboard_tool()]
-    if cmd[0].endswith("xclip"):
-        cmd += ["-selection", "clipboard"]
-    try:
-        subprocess.run(cmd, input=text.encode(), timeout=5, check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except (OSError, subprocess.TimeoutExpired) as e:
-        if logger:
-            logger.debug(f"Clipboard copy failed: {e}")
-        return False
-
-
-# The language tag on the opening fence is optional and is not part of the code.
-_CODE_BLOCK_RE = re.compile(r"```[A-Za-z0-9_+.-]*[ \t]*\n?(.*?)```", re.S)
-
-
-def _code_blocks(text: str):
-    return [b.strip() for b in _CODE_BLOCK_RE.findall(text) if b.strip()]
-
 
 # Lines that set the command up rather than being the point of it.
 _SETUP_LINE = re.compile(r"^\s*(?:(?:cd|export|set|source|umask|shopt|unset)\b|#)|^\s*$")
@@ -979,12 +926,12 @@ def _prepare_for_speech(text: str) -> str:
     # Code blocks become a placeholder before anything else strips them. When
     # the clipboard is available the reply also lands there, so say so: "code
     # block" alone told the user something existed but not how to reach it.
-    # Ends with a full stop so the synthesiser draws breath before whatever
-    # follows, instead of running the announcement into the next sentence. Any
-    # full stop already there is swallowed rather than doubled.
-    text = re.sub(r"```[\s\S]*?```(?:\s*\.)?",
-                  "code block, copied to your clipboard." if _clipboard_ready()
-                  else "code block.", text)
+    # The block itself is unspeakable, and the indicator's transcript renders
+    # it as a row you can click to copy, so the spoken form only has to say
+    # that one is there. Ends with a full stop so the synthesiser draws breath
+    # before whatever follows; any full stop already there is swallowed rather
+    # than doubled.
+    text = re.sub(r"```[\s\S]*?```(?:\s*\.)?", "code block.", text)
 
     def _pick(m):
         for g in m.groups():
@@ -4708,16 +4655,6 @@ class VoiceAssistant:
             self._close_notifications(["progress"])
 
         if full_response:
-            # Anything fenced is neither readable nor audible, so put it where
-            # the user can paste it. Sent after the reply so it is the banner
-            # left on screen: it is the actionable half.
-            blocks = _code_blocks(full_response)
-            if blocks and _copy_to_clipboard("\n\n".join(blocks), self.logger):
-                first = blocks[0].splitlines()[0].strip()
-                more = f" (+{len(blocks) - 1} more)" if len(blocks) > 1 else ""
-                self._notify(f"📋 {first[:70]}{more}", title="Copied to clipboard", transient=True,
-                             timeout_ms=NOTIFY_REPLY_EXPIRE_MS)
-                self.logger.info(f"Clipboard: {len(blocks)} code block(s)")
             self._flush_sentences(final=True)
         else:
             self.logger.info("Empty reply — skipping TTS")

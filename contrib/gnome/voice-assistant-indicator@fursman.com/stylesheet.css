@@ -85,3 +85,21 @@
     font-size: 0.85em;
     font-family: monospace;
 }
+
+/* A fenced block from a reply, clickable to copy. Looks like something you can
+   press, because it is; the assistant only says "code block" aloud, so this is
+   the only way to get at the text. */
+.voice-turn-code {
+    width: 380px;
+    color: #ffffff;
+    font-family: monospace;
+    font-size: 0.85em;
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 8px;
+}
+
+.voice-turn-code:hover {
+    background-color: rgba(255, 255, 255, 0.14);
+}

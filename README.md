@@ -657,6 +657,14 @@ re-renders only when the content actually changed, so it never fights your
 scrolling. This is a surface the project owns, which is the whole point: no
 queue, no expiry policy, no history semantics to work around, so it can simply
 show the newest thing.
+
+**Code blocks are rows you can click.** A fenced block cannot be spoken -- the
+speech layer says only "code block" -- so in the transcript it renders as a
+boxed, monospaced row that copies itself when clicked. It uses `St.Clipboard`,
+the Shell's own, which matters: a Wayland clipboard is served by the process that
+set it, and anything the assistant spawns dies with the command, which is why an
+earlier attempt at copying from the assistant kept losing the selection. The
+Shell outlives everything.
 `setup.sh` installs and enables it; **GNOME on Wayland loads new extensions only
 at login**, so log out and back in once.
 
@@ -777,7 +785,6 @@ optional.
 | `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
 | `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` | ms a notification stays up. This is also the lag before the next one can show, so raising it puts the banner behind reality |
 | `VOICE_ASSISTANT_TRANSCRIPT_TURNS` | `40` | turns kept in the indicator's transcript |
-| `VOICE_ASSISTANT_CLIPBOARD` | `1` | copy code blocks in a reply to the clipboard, and say so |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 
 ## Privacy and what leaves the machine

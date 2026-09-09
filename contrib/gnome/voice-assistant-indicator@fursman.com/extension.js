@@ -49,6 +49,9 @@ const TRANSCRIPT_SHOWN = 12;
 
 // Three kinds of line: what you said, what the assistant said, and what it did.
 // Tool lines are quieter than speech because they are context, not content.
+// A fenced block in a reply. The language tag is optional and is not code.
+const CODE_FENCE = /```[A-Za-z0-9_+.-]*[ \t]*\n?([\s\S]*?)```/g;
+
 const ROLE_CLASS = {
     you: 'voice-turn-you',
     assistant: 'voice-turn-assistant',
@@ -329,6 +332,49 @@ class VoiceIndicator extends PanelMenu.Button {
         this._transcriptScroll.style = `max-height: ${h}px;`;
     }
 
+    // Wrapping has to be configured AFTER the label is parented: St.Label
+    // rebuilds its ClutterText when the stylesheet applies, which puts
+    // ellipsize back. Width comes from the stylesheet and is what the text
+    // wraps against; without all three the line either runs off the side of
+    // the screen or is cut with an ellipsis.
+    _wrap(label) {
+        const ct = label.clutter_text;
+        ct.single_line_mode = false;
+        ct.ellipsize = Pango.EllipsizeMode.NONE;
+        ct.line_wrap = true;
+        ct.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+    }
+
+    _addProse(text, styleClass) {
+        if (!text.trim())
+            return;
+        const label = new St.Label({style_class: styleClass, text: text.trim()});
+        label.x_expand = true;
+        this._transcriptBox.add_child(label);
+        this._wrap(label);
+    }
+
+    _addCode(code) {
+        if (!code)
+            return;
+        const button = new St.Button({
+            style_class: 'voice-turn-code',
+            x_expand: true,
+            can_focus: true,
+        });
+        const label = new St.Label({text: code});
+        button.set_child(label);
+        this._transcriptBox.add_child(button);
+        this._wrap(label);
+        // St.Clipboard, not an external tool: the Shell owns the selection and
+        // outlives any process, which is exactly what a clipboard needs.
+        button.connect('clicked', () => {
+            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, code);
+            Main.notify('Copied to clipboard', code.split('\n')[0]);
+            this.menu?.close();
+        });
+    }
+
     updateTranscript(turns) {
         const shown = turns.slice(-TRANSCRIPT_SHOWN);
         // Rebuilding on every poll would fight the user's scrolling, so only
@@ -348,22 +394,23 @@ class VoiceIndicator extends PanelMenu.Button {
         }
 
         for (const turn of shown) {
-            const label = new St.Label({
-                style_class: ROLE_CLASS[turn.role] ?? 'voice-turn-assistant',
-                text: turn.text,
-            });
-            label.x_expand = true;
-            this._transcriptBox.add_child(label);
-            // Set AFTER parenting: St.Label restyles its ClutterText when it
-            // gets a style, which puts ellipsize back. Width comes from the
-            // stylesheet and is what the text wraps against; without all three
-            // of these the line either runs off the screen or is cut with an
-            // ellipsis.
-            const ct = label.clutter_text;
-            ct.single_line_mode = false;
-            ct.ellipsize = Pango.EllipsizeMode.NONE;
-            ct.line_wrap = true;
-            ct.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+            const cls = ROLE_CLASS[turn.role] ?? 'voice-turn-assistant';
+            // A reply may contain fenced blocks. Those become their own
+            // clickable rows, because the assistant only says "code block"
+            // aloud and the text is no use unless you can get at it.
+            if (turn.role === 'assistant' && turn.text.includes('```')) {
+                let last = 0;
+                CODE_FENCE.lastIndex = 0;
+                let m;
+                while ((m = CODE_FENCE.exec(turn.text)) !== null) {
+                    this._addProse(turn.text.slice(last, m.index), cls);
+                    this._addCode(m[1].trim());
+                    last = m.index + m[0].length;
+                }
+                this._addProse(turn.text.slice(last), cls);
+            } else {
+                this._addProse(turn.text, cls);
+            }
         }
 
         // Scroll to the newest, once the labels have been laid out.
