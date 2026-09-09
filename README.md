@@ -49,7 +49,7 @@ network in each mode.
 - [Quick start](#quick-start) · [Requirements](#requirements) · [How it works](#how-it-works) · [Features](#features)
 - [Control](#control) · [LLM backends](#llm-backends-claude-or-a-local-qwen38-27b)
 - [Speech recognition](#speech-recognition) · [End of turn](#end-of-turn) · [Speech synthesis](#speech-synthesis) · [Making text speakable](#making-text-speakable)
-- [Web search](#web-search) · [Desktop](#desktop) · [Configuration](#configuration)
+- [Knowing that time passed](#knowing-that-time-passed) · [Web search](#web-search) · [Desktop](#desktop) · [Configuration](#configuration)
 - [Privacy](#privacy-and-what-leaves-the-machine) · [Power and GPU passthrough](#power-suspend-and-gpu-passthrough) · [Troubleshooting](#troubleshooting)
 
 ## Quick start
@@ -513,6 +513,45 @@ pipeline out loud, one sentence at a time. Deltas are a few characters wide, so
 anything that could still grow into a tool-call opener is held back until the
 next delta settles it, and released untouched if it does not.
 
+## Knowing that time passed
+
+A conversation resumes seamlessly across a restart, and across days. The session
+id is reused, so the model sees an unbroken exchange and answers as though the
+last turn were seconds ago. Measured here: one conversation ran through two
+service restarts and a thirteen-hour overnight shutdown with nothing in the
+prompt saying so, and the assistant kept describing browser windows it had
+opened the night before as though they were still on screen.
+
+So the joins get marked, and only the joins:
+
+```
+[context: 13h 18m since the last exchange, now Wed 09 Sep 12:29 PDT; the machine rebooted since then]
+```
+
+A timestamp on *every* turn would be worse than none. Anything sitting next to
+the user's words invites acknowledgement, and you would get "good evening" and
+"still at it, I see" on turns where nothing had changed. A marker that appears
+only on a change has nothing to acknowledge on an ordinary turn, and means
+something when it does appear.
+
+Three things can put one there:
+
+| trigger | why it matters |
+|---|---|
+| more than `VOICE_ASSISTANT_CONTEXT_GAP` since the last turn | what the model called current may be stale |
+| the assistant restarted, or the machine rebooted | windows it opened are gone, background work died, the mic was reopened |
+| the timezone changed | the user travelled |
+
+The reboot and the restart are told apart by `/proc/sys/kernel/random/boot_id`,
+and the restart is the more useful of the two: the clock only says time passed,
+a restart says what stopped being true.
+
+The system prompt tells every backend that the line is generated rather than
+spoken, and not to greet the user about it. State lives in
+`~/.local/state/voice-assistant/turn_context.json`; a missing or corrupt file
+means no marker rather than a wrong one, and the first turn after an install is
+always silent.
+
 ## Web search
 
 The local backends get two tools, `web_search` and `fetch_page`, shared by the
@@ -608,6 +647,8 @@ optional.
 | `VOICE_ASSISTANT_MODEL` / `_EFFORT` | `opus` / `max` | Claude model and effort |
 | `VOICE_ASSISTANT_CLAUDE_PERSISTENT` | `1` | keep one `claude` process alive across turns |
 | `VOICE_ASSISTANT_CLI_TIMEOUT` | | seconds a `claude` turn may take |
+| `VOICE_ASSISTANT_CONTEXT_MARKERS` | `1` | tell the model when time passed or the machine restarted |
+| `VOICE_ASSISTANT_CONTEXT_GAP` | `900` | seconds of silence before a gap is worth mentioning |
 
 ### Local model
 
