@@ -245,6 +245,7 @@ REQUIRED_PACKAGES=(
     "pipewire-bin"
     "pipewire-pulse"
     "libnotify-bin"
+    "wl-clipboard"
     "libglib2.0-bin"
     "pkg-config"
     "build-essential"

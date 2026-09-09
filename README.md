@@ -613,6 +613,15 @@ visible thing, so `VOICE_ASSISTANT_NOTIFY_EXPIRE` and the 2 s throttle are
 documented as a pair. The reply is exempt and lingers, because nothing queues
 behind it.
 
+**Code blocks go to the clipboard.** Anything fenced is unreadable and
+unhearable at the same time: the speech layer replaces a code block with the
+words "code block" so it does not read punctuation aloud, and the notification
+shows the same. A command handed to the user in a reply simply vanished. Now the
+blocks are copied (`wl-copy`, or `xclip` on X11), a popup shows the first line,
+and the spoken placeholder becomes "code block, copied to your clipboard". With
+neither tool installed nothing is copied and the old wording is used, so the
+assistant never claims a paste that is not there.
+
 `--replace-id` is not used, and this is why: it updates a notification *in
 place in the tray* without raising a banner again. Once GNOME had retired the
 first banner, a replacement was simply invisible.
@@ -762,6 +771,7 @@ optional.
 | `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
 | `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `2000` | ms a normal notification stays up; keep it at or under the 2 s throttle |
 | `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | `6000` | ms the reply stays up; nothing queues behind it |
+| `VOICE_ASSISTANT_CLIPBOARD` | `1` | copy code blocks in a reply to the clipboard, and say so |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 
 ## Privacy and what leaves the machine
