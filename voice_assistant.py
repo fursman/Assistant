@@ -603,6 +603,16 @@ TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/transcript.json"
 # Turns kept for the indicator's transcript view. Enough to scroll back through
 # the current thread, not so many that the menu becomes a document.
 TRANSCRIPT_TURNS = int(os.getenv("VOICE_ASSISTANT_TRANSCRIPT_TURNS", "40"))
+# A notification is transient when what it says is recorded somewhere better.
+# Since the transcript took over the conversation *and* the tool calls, that is
+# now almost everything: voice mode is on the indicator, tool calls and replies
+# are in the transcript. Those get closed after a few seconds, which does delete
+# them from the message list, and that is the point -- GNOME never dismisses
+# them on its own, so without this they pile up on screen forever.
+#
+# Errors are the exception. Nothing else records them and they are worth
+# reading, so they stay until dismissed.
+NOTIFY_TRANSIENT_SECONDS = float(os.getenv("VOICE_ASSISTANT_NOTIFY_TRANSIENT", "4"))
 
 # GNOME shows one banner at a time and queues the rest, and it treats the two
 # ways a notification ends very differently: one that times out stays in the
@@ -2504,6 +2514,8 @@ class VoiceAssistant:
         self._notif_ids = {}
         self._notification_server = self._probe_notification_server()
         self._status_state = "off"
+        # True while a reply is being streamed into the transcript's last entry.
+        self._transcript_open = False
 
         # Paths
         self.state_dir = Path.home() / ".local/state/voice-assistant"
@@ -3259,7 +3271,7 @@ class VoiceAssistant:
         return m.group(1) if m else ""
 
     def _notify(self, message, title="Voice Assistant", timeout_ms=None,
-                silent=False, slot="main"):
+                silent=False, slot="main", transient=False):
         """Show a notification, replacing our previous one in the same slot.
 
         Slots exist so the assistant updates its own popup in place instead of
@@ -3296,8 +3308,30 @@ class VoiceAssistant:
             nid = out.stdout.strip()
             if nid.isdigit():
                 self._notif_ids[slot] = int(nid)
+                # Closed by id, not by slot: a later notification may own the
+                # slot by the time this fires, and closing that one instead
+                # would take the wrong thing off the screen.
+                if transient:
+                    threading.Timer(NOTIFY_TRANSIENT_SECONDS,
+                                    self._close_notification_id,
+                                    args=(int(nid), slot)).start()
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
             self.logger.debug(f"notify-send unavailable: {e}")
+
+    def _close_notification_id(self, nid, slot=None):
+        """Close one notification by id, for state that lives elsewhere."""
+        try:
+            subprocess.run(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.freedesktop.Notifications",
+                 "--object-path", "/org/freedesktop/Notifications",
+                 "--method", "org.freedesktop.Notifications.CloseNotification",
+                 str(nid)],
+                capture_output=True, check=False, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return
+        if slot and self._notif_ids.get(slot) == nid:
+            self._notif_ids.pop(slot, None)
 
     def _close_notifications(self, slots=None):
         """Close only the notifications this assistant opened."""
@@ -3322,24 +3356,13 @@ class VoiceAssistant:
     # Status file (waybar module, GNOME Shell indicator, voice-assistant-ctl)
     # ------------------------------------------------------------------
 
-    def _append_transcript(self, role, text):
-        """Append a turn to the file the top-bar indicator reads.
-
-        Notifications are a poor display -- GNOME queues them, ignores the
-        expiry an app asks for, and the only way to clear one early also
-        deletes it from the message list. The indicator has none of those
-        problems: it is a surface we own, so it can just show the newest thing.
-        The conversation lives there; notifications keep the status events.
-        """
-        text = (text or "").strip()
-        if not text:
-            return
-        turns = []
+    def _read_transcript(self):
         try:
-            turns = json.loads(TRANSCRIPT_FILE.read_text()).get("turns", [])
+            return json.loads(TRANSCRIPT_FILE.read_text()).get("turns", [])
         except (OSError, ValueError, AttributeError):
-            pass
-        turns.append({"role": role, "text": text[:2000], "at": time.time()})
+            return []
+
+    def _write_transcript(self, turns):
         del turns[:-TRANSCRIPT_TURNS]
         tmp = TRANSCRIPT_FILE.with_suffix(".tmp")
         try:
@@ -3348,7 +3371,45 @@ class VoiceAssistant:
         except OSError as e:
             self.logger.debug(f"Could not write {TRANSCRIPT_FILE}: {e}")
 
+    def _append_transcript(self, role, text):
+        """Add a finished entry, and close whatever was being streamed.
+
+        Notifications are a poor display -- GNOME queues them, ignores the
+        expiry an app asks for, and the only way to clear one early also
+        deletes it from the message list. The indicator has none of those
+        problems, so the conversation lives there and notifications keep the
+        status events.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        turns = self._read_transcript()
+        turns.append({"role": role, "text": text[:4000], "at": time.time()})
+        self._transcript_open = False
+        self._write_transcript(turns)
+
+    def _stream_transcript(self, text):
+        """Extend the reply being written, or start one.
+
+        Called per finished clause rather than once at the end of the turn, so
+        the indicator reads along as the answer arrives instead of receiving a
+        record of it afterwards. A tool call closes the entry, so a turn shows
+        as text, the tool that interrupted it, then more text.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        turns = self._read_transcript()
+        if self._transcript_open and turns and turns[-1].get("role") == "assistant":
+            turns[-1]["text"] = f"{turns[-1]['text']} {text}"[:4000]
+            turns[-1]["at"] = time.time()
+        else:
+            turns.append({"role": "assistant", "text": text[:4000], "at": time.time()})
+            self._transcript_open = True
+        self._write_transcript(turns)
+
     def _clear_transcript(self):
+        self._transcript_open = False
         try:
             TRANSCRIPT_FILE.write_text(json.dumps({"turns": []}))
         except OSError:
@@ -3449,7 +3510,7 @@ class VoiceAssistant:
             if len(to_send) >= 20:
                 self._last_thinking_notify = now
                 self._thinking_shown_len = prev_len + last_boundary
-                self._notify(f"🧠 {to_send}", title="Thinking...",
+                self._notify(f"🧠 {to_send}", title="Thinking...", transient=True,
                              slot="progress")
 
     def _notify_tool_use(self, tool_name, input_json_str):
@@ -3467,43 +3528,55 @@ class VoiceAssistant:
             "Task": "Running agent", "NotebookEdit": "Editing notebook",
         }
         label = labels.get(tool_name, f"Using {tool_name}")
+        # Two audiences. The popup is glanced at, so it gets a short summary.
+        # The transcript is a record, so it gets the command verbatim: the
+        # point of reading back is seeing exactly what ran.
         detail = ""
+        exact = ""
         try:
             args = json.loads(input_json_str) if input_json_str else {}
         except json.JSONDecodeError:
             args = {}
         if tool_name == "Bash":
-            # The tool carries a human-written description of the call. Prefer
-            # it: it says why, where the command only says how.
             desc = (args.get("description") or "").strip()
             cmd = args.get("command", "")
+            exact = cmd
             if desc:
                 detail = f"\n{desc[:120]}"
             elif cmd:
                 detail = f"\n{_command_gist(cmd)[:120]}"
         elif tool_name in ("Read", "Edit", "Write"):
-            if args.get("file_path"):
-                detail = f"\n{args['file_path']}"
+            exact = args.get("file_path", "")
+            if exact:
+                detail = f"\n{exact}"
         elif tool_name == "WebSearch":
-            if args.get("query"):
-                detail = f"\n{args['query']}"
+            exact = args.get("query", "")
+            if exact:
+                detail = f"\n{exact}"
         elif tool_name == "WebFetch":
-            if args.get("url"):
-                detail = f"\n{args['url'][:120]}"
+            exact = args.get("url", "")
+            if exact:
+                detail = f"\n{exact[:120]}"
+        else:
+            exact = input_json_str or ""
 
         message = f"🔧 {label}{detail}"
+        # Into the transcript as well, so the reply reads text, tool, text in
+        # the order it happened. Not throttled like the popup: the transcript
+        # is a record and skipping entries would misrepresent the turn.
+        self._append_transcript("tool", f"{label}\n{exact}" if exact else label)
         now = time.time()
         if now - self._last_tool_notify >= NOTIFY_THROTTLE_SECONDS:
             self._last_tool_notify = now
             self._pending_tool_notice = None
-            self._notify(message, title="Working...", slot="progress")
+            self._notify(message, title="Working...", slot="progress", transient=True)
         else:
             self._pending_tool_notice = message
 
     def _flush_pending_tool_notice(self):
         if self._pending_tool_notice and time.time() - self._last_tool_notify >= NOTIFY_THROTTLE_SECONDS:
             self._last_tool_notify = time.time()
-            self._notify(self._pending_tool_notice, title="Working...",
+            self._notify(self._pending_tool_notice, title="Working...", transient=True,
                          slot="progress")
             self._pending_tool_notice = None
 
@@ -3559,6 +3632,7 @@ class VoiceAssistant:
                 spoken = _prepare_for_speech(unit)
                 if spoken:
                     self._sentence_queue.put(spoken)
+                    self._stream_transcript(unit)
                     self.logger.info(f"→ TTS: {unit[:80]}")
 
         if final:
@@ -3568,6 +3642,7 @@ class VoiceAssistant:
                 spoken = _prepare_for_speech(remaining)
                 if spoken:
                     self._sentence_queue.put(spoken)
+                    self._stream_transcript(remaining)
                     self.logger.info(f"→ TTS (final): {remaining[:80]}")
 
     # ------------------------------------------------------------------
@@ -4119,7 +4194,10 @@ class VoiceAssistant:
             f"Unsolicited Claude turn (turns={ev.get('num_turns')}): {text[:120]}")
         if not text:
             return
-        self._notify(f"🔔 {_strip_markdown(text)}", title="Assistant")
+        # Speech, so it belongs in the transcript; the popup is only the nudge
+        # that something arrived unprompted.
+        self._append_transcript("assistant", _strip_markdown(text))
+        self._notify(f"🔔 {_strip_markdown(text)}", title="Assistant", transient=True)
         if self.is_active and not self.is_processing:
             threading.Thread(target=self._say, args=(text,), daemon=True).start()
 
@@ -4352,7 +4430,7 @@ class VoiceAssistant:
                 threading.Thread(target=self._ensure_dsh_session, daemon=True).start()
         label = self.BACKEND_LABEL.get(self.backend, self.backend)
         self.logger.info(f"Backend switched to {self.backend} ({why}){note}")
-        self._notify(f"🔀 {label}{note}", title="Assistant model",
+        self._notify(f"🔀 {label}{note}", title="Assistant model", transient=True,
                      timeout_ms=3000, slot="backend")
         self._set_status("ready" if self.is_active else "off")
         return {"ok": True, "backend": self.backend, "preference": self.backend_pref,
@@ -4364,7 +4442,7 @@ class VoiceAssistant:
                  "failed": "failed mid-answer"}.get(why, str(why))
         self.logger.warning(f"Local LLM {why} — this query goes to claude")
         self._play_chime_async("fallback")
-        self._notify(f"☁️ Local model {label} — asking Claude",
+        self._notify(f"☁️ Local model {label} — asking Claude", transient=True,
                      slot="progress")
         self._set_status("thinking", backend="claude")
 
@@ -4615,7 +4693,7 @@ class VoiceAssistant:
         if self._thinking_text:
             remaining = self._thinking_text[self._thinking_shown_len:].strip()
             if remaining:
-                self._notify(f"🧠 {remaining}", title="Thinking...",
+                self._notify(f"🧠 {remaining}", title="Thinking...", transient=True,
                              silent=True, slot="progress")
 
         full_response = self._assistant_text.strip()
@@ -4630,7 +4708,6 @@ class VoiceAssistant:
             self._close_notifications(["progress"])
 
         if full_response:
-            self._append_transcript("assistant", _strip_markdown(full_response))
             # Anything fenced is neither readable nor audible, so put it where
             # the user can paste it. Sent after the reply so it is the banner
             # left on screen: it is the actionable half.
@@ -4638,7 +4715,7 @@ class VoiceAssistant:
             if blocks and _copy_to_clipboard("\n\n".join(blocks), self.logger):
                 first = blocks[0].splitlines()[0].strip()
                 more = f" (+{len(blocks) - 1} more)" if len(blocks) > 1 else ""
-                self._notify(f"📋 {first[:70]}{more}", title="Copied to clipboard",
+                self._notify(f"📋 {first[:70]}{more}", title="Copied to clipboard", transient=True,
                              timeout_ms=NOTIFY_REPLY_EXPIRE_MS)
                 self.logger.info(f"Clipboard: {len(blocks)} code block(s)")
             self._flush_sentences(final=True)
@@ -4742,7 +4819,7 @@ class VoiceAssistant:
             # un-abort a turn that was still winding down, which then spoke
             # into the new session.
             self._abort_event = threading.Event()
-            self._notify("🎤 Voice Mode ON", timeout_ms=2000)
+            self._notify("🎤 Voice Mode ON", timeout_ms=2000, transient=True)
             self._set_status("ready")
             self._play_chime_async("listening")
             # Spawn now, so a throttled CLI boot happens while the user is
@@ -4751,7 +4828,7 @@ class VoiceAssistant:
             threading.Thread(target=self._maybe_prespawn, daemon=True).start()
         else:
             self.logger.info("Deactivated")
-            self._notify("🎤 Voice Mode OFF", timeout_ms=2000)
+            self._notify("🎤 Voice Mode OFF", timeout_ms=2000, transient=True)
             self._set_status("off")
             # Set the flag here so the recorder sees it within one chunk, but
             # do the teardown off the loop: waiting on a hung tool command or a
@@ -4797,7 +4874,8 @@ class VoiceAssistant:
         """
         self._clear_transcript()
         threading.Thread(target=self._clear_session, daemon=True).start()
-        self._notify("🔄 New conversation ready", title="Voice Assistant", timeout_ms=3000)
+        self._notify("🔄 New conversation ready", title="Voice Assistant",
+                     timeout_ms=3000, transient=True)
         self._play_chime_async("deactivate")
 
     # ------------------------------------------------------------------
@@ -4825,7 +4903,7 @@ class VoiceAssistant:
                         threading.Thread(target=self._ensure_dsh_session, daemon=True).start()
                     else:
                         self.logger.info("Local LLM ready")
-                    self._notify("🧠 Local model ready", timeout_ms=3000, slot="backend")
+                    self._notify("🧠 Local model ready", timeout_ms=3000, slot="backend", transient=True)
                     self._set_status(self._status_state)
                 elif prev == "ready":
                     self.logger.warning(
@@ -5160,7 +5238,7 @@ class VoiceAssistant:
                 self.logger.info(f"Voice command: new session ({transcription})")
                 await loop.run_in_executor(None, self._clear_session)
                 self._notify("🔄 New conversation started", title="Voice Assistant",
-                             timeout_ms=4000)
+                             timeout_ms=4000, transient=True)
                 await loop.run_in_executor(None, self._say, "Starting a new conversation.")
                 spoke = True     # so the "your turn" chime plays on the way out
                 return
