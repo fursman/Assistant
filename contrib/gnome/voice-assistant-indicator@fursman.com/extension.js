@@ -14,9 +14,14 @@
 //   thinking   robot, blue   + "thinking"     (model / tools working)
 //   speaking   robot, green  + "speaking"     (playing the reply)
 //
-// Left click toggles voice mode (SIGUSR1 to the pid file, the same thing the
-// key binding does). Right click opens a menu with the state, a new
-// conversation, and the model swap.
+// Left click opens the conversation: the transcript, and the controls under
+// it. Right click opens the controls alone, as a quick menu. Both are the same
+// PopupMenu with the transcript shown or hidden, because a panel button has
+// one menu.
+//
+// Left click used to toggle voice mode. It no longer does: the transcript is
+// what you reach for most, and muting has a key binding (SUPER+ALT on GNOME)
+// plus its own item in both menus.
 //
 // The state directory is watched with a file monitor, so updates land within
 // milliseconds of the assistant writing them; a slow poll reconciles anything
@@ -27,6 +32,7 @@ import St from 'gi://St';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
+import Pango from 'gi://Pango';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -40,6 +46,14 @@ const PID_FILE = GLib.build_filenamev([STATE_DIR, 'voice-assistant.pid']);
 const TRANSCRIPT_FILE = GLib.build_filenamev([STATE_DIR, 'transcript.json']);
 // Turns rendered in the menu. The file keeps more; this is what fits.
 const TRANSCRIPT_SHOWN = 12;
+
+// Three kinds of line: what you said, what the assistant said, and what it did.
+// Tool lines are quieter than speech because they are context, not content.
+const ROLE_CLASS = {
+    you: 'voice-turn-you',
+    assistant: 'voice-turn-assistant',
+    tool: 'voice-turn-tool',
+};
 const ASSISTANT_BIN = GLib.build_filenamev([HOME, '.local', 'bin', 'assistant']);
 const POLL_SECONDS = 5;
 
@@ -178,8 +192,11 @@ class VoiceIndicator extends PanelMenu.Button {
         });
         transcriptItem.add_child(this._transcriptScroll);
         this.menu.addMenuItem(transcriptItem);
+        this._transcriptItem = transcriptItem;
         this._transcriptSig = null;
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._showingTranscript = true;
+        this._transcriptSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._transcriptSeparator);
 
         this._toggleItem = new PopupMenu.PopupMenuItem('Turn voice mode on');
         this._toggleItem.connect('activate', () => this._signal('USR1'));
@@ -202,6 +219,26 @@ class VoiceIndicator extends PanelMenu.Button {
 
         this._current = null;
         this._installClickHandling();
+
+        // An open PopupMenu takes a keyboard grab, so the desktop shortcut for
+        // muting never reaches GNOME while the transcript is up. The menu's own
+        // actor does see the keys, so catch the chord here and act on it. It is
+        // a modifier-only binding (<Super>Alt_L and <Alt>Super_L), which
+        // arrives as whichever of the two was pressed second.
+        this.menu.actor.connect('key-press-event', (_a, event) => {
+            const sym = event.get_key_symbol();
+            const mods = event.get_state();
+            const superHeld = (mods & Clutter.ModifierType.SUPER_MASK) !== 0;
+            const altHeld = (mods & Clutter.ModifierType.MOD1_MASK) !== 0;
+            const isAlt = sym === Clutter.KEY_Alt_L || sym === Clutter.KEY_Alt_R;
+            const isSuper = sym === Clutter.KEY_Super_L || sym === Clutter.KEY_Super_R;
+            if ((isAlt && superHeld) || (isSuper && altHeld)) {
+                this.menu.close();
+                this._signal('USR1');
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
     }
 
     // Left click toggles voice mode, like clicking the waybar module; any
@@ -240,10 +277,19 @@ class VoiceIndicator extends PanelMenu.Button {
         } catch (e) {
             button = 1;
         }
-        if (button === 1 && this._current?.state !== 'down')
-            this._signal('USR1');
-        else
-            this.menu?.toggle();
+        // One menu, two shapes. Left shows the conversation, right is the
+        // quick menu: toggle, new conversation, swap.
+        const wantTranscript = button === 1;
+        if (this.menu?.isOpen && this._showingTranscript === wantTranscript) {
+            this.menu.close();
+            return;
+        }
+        this._showingTranscript = wantTranscript;
+        this._transcriptItem.visible = wantTranscript;
+        this._transcriptSeparator.visible = wantTranscript;
+        if (wantTranscript)
+            this._sizeTranscript();
+        this.menu?.open();
     }
 
     _signal(sig) {
@@ -271,6 +317,18 @@ class VoiceIndicator extends PanelMenu.Button {
         this._startItem.visible = status.state === 'down';
     }
 
+    // Sized against the monitor rather than a fixed number of pixels, so it
+    // fills the screen on this display and still fits on a smaller one. The
+    // reserve covers the panel plus the controls below the transcript.
+    _sizeTranscript() {
+        const mon = Main.layoutManager?.primaryMonitor;
+        if (!mon)
+            return;
+        const reserve = (Main.panel?.height ?? 32) + 220;
+        const h = Math.max(200, mon.height - reserve);
+        this._transcriptScroll.style = `max-height: ${h}px;`;
+    }
+
     updateTranscript(turns) {
         const shown = turns.slice(-TRANSCRIPT_SHOWN);
         // Rebuilding on every poll would fight the user's scrolling, so only
@@ -291,11 +349,21 @@ class VoiceIndicator extends PanelMenu.Button {
 
         for (const turn of shown) {
             const label = new St.Label({
-                style_class: turn.role === 'you' ? 'voice-turn-you' : 'voice-turn-assistant',
+                style_class: ROLE_CLASS[turn.role] ?? 'voice-turn-assistant',
                 text: turn.text,
             });
-            label.clutter_text.line_wrap = true;
+            label.x_expand = true;
             this._transcriptBox.add_child(label);
+            // Set AFTER parenting: St.Label restyles its ClutterText when it
+            // gets a style, which puts ellipsize back. Width comes from the
+            // stylesheet and is what the text wraps against; without all three
+            // of these the line either runs off the screen or is cut with an
+            // ellipsis.
+            const ct = label.clutter_text;
+            ct.single_line_mode = false;
+            ct.ellipsize = Pango.EllipsizeMode.NONE;
+            ct.line_wrap = true;
+            ct.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
         }
 
         // Scroll to the newest, once the labels have been laid out.

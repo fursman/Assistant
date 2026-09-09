@@ -2,9 +2,15 @@
    colour. No filled pill: GNOME's own red recording pill lives in the same
    corner and this should not be mistaken for it. Colours are Adwaita's light
    variants, which read on the dark top bar. */
+/* Fixed width, so the button never resizes. The label goes from empty to
+   "listening" to "thinking" and back, and letting the box follow that made the
+   whole indicator jump left and right on every phase change. Wide enough for
+   the longest word; the icon stays put and the text appears in space that was
+   already reserved. */
 .voice-indicator {
     padding: 0 4px;
     spacing: 6px;
+    width: 96px;
 }
 
 .voice-icon {
@@ -35,9 +41,19 @@
    notifications: GNOME queues banners, ignores the expiry an app asks for, and
    the only way to clear one early also deletes it from the message list. This
    is a surface we own, so it can simply show the newest thing. */
+/* Overridden at open time with a height computed from the monitor; this is
+   only the fallback if that lookup fails. */
 .voice-transcript {
-    max-height: 320px;
-    min-width: 420px;
+    max-height: 340px;
+}
+
+/* A fixed width is what the labels wrap against. Without it they size to
+   their longest line and the menu runs off the screen. */
+.voice-turn-you,
+.voice-turn-assistant,
+.voice-turn-tool,
+.voice-turn-empty {
+    width: 380px;
 }
 
 .voice-transcript-box {
@@ -45,10 +61,11 @@
     spacing: 10px;
 }
 
-/* Same colours the indicator uses for listening and speaking, so the two
-   surfaces agree about who is who. */
+/* A light tint rather than the indicator's alert red: in the panel that red
+   means "recording now" and needs to grab you, but a whole column of it in a
+   transcript reads as shouting. Adwaita blue 1. */
 .voice-turn-you {
-    color: #f66151;
+    color: #99c1f1;
     font-weight: bold;
 }
 
@@ -59,4 +76,12 @@
 .voice-turn-empty {
     color: #9a9996;
     font-style: italic;
+}
+
+/* What it did, rather than what was said: quieter, so the conversation reads
+   past it. Same grey as the idle robot. */
+.voice-turn-tool {
+    color: #9a9996;
+    font-size: 0.85em;
+    font-family: monospace;
 }
