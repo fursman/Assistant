@@ -37,6 +37,9 @@ const HOME = GLib.get_home_dir();
 const STATE_DIR = GLib.build_filenamev([HOME, '.local', 'state', 'voice-assistant']);
 const STATUS_FILE = GLib.build_filenamev([STATE_DIR, 'status']);
 const PID_FILE = GLib.build_filenamev([STATE_DIR, 'voice-assistant.pid']);
+const TRANSCRIPT_FILE = GLib.build_filenamev([STATE_DIR, 'transcript.json']);
+// Turns rendered in the menu. The file keeps more; this is what fits.
+const TRANSCRIPT_SHOWN = 12;
 const ASSISTANT_BIN = GLib.build_filenamev([HOME, '.local', 'bin', 'assistant']);
 const POLL_SECONDS = 5;
 
@@ -97,6 +100,21 @@ function readStatus() {
     return {state, backend, pid};
 }
 
+function readTranscript() {
+    // The conversation lives here rather than in notifications: GNOME queues
+    // banners, ignores the expiry an app asks for, and clearing one early also
+    // deletes it from the message list. A surface we own has none of that.
+    const text = readFile(TRANSCRIPT_FILE);
+    if (!text)
+        return [];
+    try {
+        const data = JSON.parse(text);
+        return Array.isArray(data.turns) ? data.turns : [];
+    } catch (e) {
+        return [];   // written atomically, so this is an old or foreign file
+    }
+}
+
 function spawn(argv) {
     try {
         Gio.Subprocess.new(argv,
@@ -137,6 +155,30 @@ class VoiceIndicator extends PanelMenu.Button {
 
         this._header = new PopupMenu.PopupMenuItem('Voice Assistant', {reactive: false});
         this.menu.addMenuItem(this._header);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        // The transcript, oldest at the top so it reads downwards.
+        this._transcriptBox = new St.BoxLayout({
+            vertical: true,
+            style_class: 'voice-transcript-box',
+        });
+        this._transcriptScroll = new St.ScrollView({
+            style_class: 'voice-transcript',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        });
+        // St.ScrollView took a single child from GNOME 46; add_actor before it.
+        if (this._transcriptScroll.set_child)
+            this._transcriptScroll.set_child(this._transcriptBox);
+        else
+            this._transcriptScroll.add_actor(this._transcriptBox);
+        const transcriptItem = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            can_focus: false,
+        });
+        transcriptItem.add_child(this._transcriptScroll);
+        this.menu.addMenuItem(transcriptItem);
+        this._transcriptSig = null;
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._toggleItem = new PopupMenu.PopupMenuItem('Turn voice mode on');
@@ -228,6 +270,43 @@ class VoiceIndicator extends PanelMenu.Button {
         this._toggleItem.sensitive = status.state !== 'down';
         this._startItem.visible = status.state === 'down';
     }
+
+    updateTranscript(turns) {
+        const shown = turns.slice(-TRANSCRIPT_SHOWN);
+        // Rebuilding on every poll would fight the user's scrolling, so only
+        // touch it when the content actually changed.
+        const sig = shown.map(t => `${t.role}\u0000${t.at}\u0000${t.text.length}`).join('|');
+        if (sig === this._transcriptSig)
+            return;
+        this._transcriptSig = sig;
+        this._transcriptBox.destroy_all_children();
+
+        if (!shown.length) {
+            this._transcriptBox.add_child(new St.Label({
+                style_class: 'voice-turn-empty',
+                text: 'Nothing said yet',
+            }));
+            return;
+        }
+
+        for (const turn of shown) {
+            const label = new St.Label({
+                style_class: turn.role === 'you' ? 'voice-turn-you' : 'voice-turn-assistant',
+                text: turn.text,
+            });
+            label.clutter_text.line_wrap = true;
+            this._transcriptBox.add_child(label);
+        }
+
+        // Scroll to the newest, once the labels have been laid out.
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            const adj = this._transcriptScroll.vadjustment
+                ?? this._transcriptScroll.vscroll?.adjustment;
+            if (adj)
+                adj.value = Math.max(0, adj.upper - adj.page_size);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
 });
 
 export default class VoiceAssistantIndicatorExtension extends Extension {
@@ -258,6 +337,7 @@ export default class VoiceAssistantIndicatorExtension extends Extension {
         if (!this._indicator)
             return;
         this._indicator.update(readStatus());
+        this._indicator.updateTranscript(readTranscript());
     }
 
     disable() {

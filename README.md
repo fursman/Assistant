@@ -603,26 +603,22 @@ That decides the design. Nothing is ever closed and no id is ever reused, so
 each notification gets its own banner and its own line in the list, and the
 whole turn is there to scroll back through afterwards.
 
-GNOME **strictly queues**. Measured: three notifications sent 3 s apart with a
-30 s expiry played out one after another, each sitting for its full 30 s. A new
-one never pushes the current one aside.
+GNOME is a poor display and a good log, so it is used as a log. **The
+conversation is not in the notifications at all** -- it lives in the indicator
+(see below). Notifications carry only status: tool calls, voice mode on and off,
+model swaps, errors.
 
-That puts two desirable things in direct conflict. The only way to clear a
-banner early is `CloseNotification`, and closing is exactly what deletes it from
-the message list. There is no way to add a list entry without a banner either,
-since GNOME ignores the `suppress-popup` hint.
+Three findings forced that split, all measured on GNOME 50:
 
-So the expiry does two jobs at once: it is the dwell time, *and* it is the lag
-before the next thing can appear. Short is the only way to track reality. At
-~1 s the queue drains about as fast as events arrive, so the banner reads as a
-live ticker of the newest event, while nothing is ever closed, so the whole turn
-is still in the message list to read at leisure. Earlier tunings got this wrong
-in both directions: 5 s banners on a 2 s throttle left the screen three
-notifications behind by the end of a turn, and 2 s was too brief to read but
-still too slow to track.
+| finding | consequence |
+|---|---|
+| banners are **strictly queued**; a new one never preempts | the screen falls behind during a busy turn |
+| GNOME largely **ignores the expiry** an app asks for | the one lever for pacing them does not exist |
+| an expired notification stays in the message list, a **closed one is erased** | the only way to clear a banner early also deletes the history |
 
-Raise `VOICE_ASSISTANT_NOTIFY_EXPIRE` if you would rather read the banners than
-glance at them. The cost is paid in lag, one for one.
+Together those make "always show the newest thing" and "keep everything"
+mutually exclusive on that surface. Tuning cannot reconcile them; attempts at
+5 s, 4 s, 2 s and 1 s each failed from a different direction.
 
 `--replace-id` is not used, and this is why: it updates a notification *in
 place in the tray* without raising a banner again. Once GNOME had retired the
@@ -652,7 +648,15 @@ bar in the style of GNOME's screen-recording indicator: a dimmed robot when off,
 a robot when ready, and a red / blue / green pill labelled *listening* /
 *thinking* / *speaking*. Left click toggles voice mode; right click shows the
 state and backend, starts a new conversation, or swaps the model. It watches the
-status file with inotify, so it changes the moment the assistant does.
+state directory with a file monitor, so it changes the moment the assistant does.
+
+**The conversation lives here.** The menu holds a scrolling transcript, oldest
+at the top so it reads downwards, scrolled to the newest automatically. The
+assistant writes `transcript.json` atomically on every turn, and the extension
+re-renders only when the content actually changed, so it never fights your
+scrolling. This is a surface the project owns, which is the whole point: no
+queue, no expiry policy, no history semantics to work around, so it can simply
+show the newest thing.
 `setup.sh` installs and enables it; **GNOME on Wayland loads new extensions only
 at login**, so log out and back in once.
 
@@ -772,7 +776,7 @@ optional.
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
 | `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
 | `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` | ms a notification stays up. This is also the lag before the next one can show, so raising it puts the banner behind reality |
-| `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | same as above | ms the reply stays up; longer delays the user's own transcript appearing |
+| `VOICE_ASSISTANT_TRANSCRIPT_TURNS` | `40` | turns kept in the indicator's transcript |
 | `VOICE_ASSISTANT_CLIPBOARD` | `1` | copy code blocks in a reply to the clipboard, and say so |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 

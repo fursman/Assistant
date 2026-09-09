@@ -599,6 +599,10 @@ SESSION_FILE = Path.home() / ".local/state/voice-assistant/session_id"
 LOCAL_HISTORY_FILE = Path.home() / ".local/state/voice-assistant/local_history.json"
 DSH_TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/dsh_transcript.json"
 TURN_CONTEXT_FILE = Path.home() / ".local/state/voice-assistant/turn_context.json"
+TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/transcript.json"
+# Turns kept for the indicator's transcript view. Enough to scroll back through
+# the current thread, not so many that the menu becomes a document.
+TRANSCRIPT_TURNS = int(os.getenv("VOICE_ASSISTANT_TRANSCRIPT_TURNS", "40"))
 
 # GNOME shows one banner at a time and queues the rest, and it treats the two
 # ways a notification ends very differently: one that times out stays in the
@@ -2691,6 +2695,7 @@ class VoiceAssistant:
 
     def _clear_session(self):
         """Start a fresh conversation on whichever backend is active."""
+        self._clear_transcript()
         self._session_id = None
         self._local_history = []
         for f in (SESSION_FILE, LOCAL_HISTORY_FILE, DSH_TRANSCRIPT_FILE):
@@ -3316,6 +3321,38 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
     # Status file (waybar module, GNOME Shell indicator, voice-assistant-ctl)
     # ------------------------------------------------------------------
+
+    def _append_transcript(self, role, text):
+        """Append a turn to the file the top-bar indicator reads.
+
+        Notifications are a poor display -- GNOME queues them, ignores the
+        expiry an app asks for, and the only way to clear one early also
+        deletes it from the message list. The indicator has none of those
+        problems: it is a surface we own, so it can just show the newest thing.
+        The conversation lives there; notifications keep the status events.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        turns = []
+        try:
+            turns = json.loads(TRANSCRIPT_FILE.read_text()).get("turns", [])
+        except (OSError, ValueError, AttributeError):
+            pass
+        turns.append({"role": role, "text": text[:2000], "at": time.time()})
+        del turns[:-TRANSCRIPT_TURNS]
+        tmp = TRANSCRIPT_FILE.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps({"turns": turns}))
+            os.replace(tmp, TRANSCRIPT_FILE)     # atomic: no partial reads
+        except OSError as e:
+            self.logger.debug(f"Could not write {TRANSCRIPT_FILE}: {e}")
+
+    def _clear_transcript(self):
+        try:
+            TRANSCRIPT_FILE.write_text(json.dumps({"turns": []}))
+        except OSError:
+            pass
 
     def _set_status(self, state, backend=None):
         """Publish the phase for whatever is drawing it.
@@ -4593,10 +4630,7 @@ class VoiceAssistant:
             self._close_notifications(["progress"])
 
         if full_response:
-            preview = _strip_markdown(full_response)
-            if preview:
-                self._notify(f"🧙 {preview}", title="Assistant",
-                             timeout_ms=NOTIFY_REPLY_EXPIRE_MS)
+            self._append_transcript("assistant", _strip_markdown(full_response))
             # Anything fenced is neither readable nor audible, so put it where
             # the user can paste it. Sent after the reply so it is the banner
             # left on screen: it is the actionable half.
@@ -4761,6 +4795,7 @@ class VoiceAssistant:
         Runs on the event loop, so the blocking part (stopping and respawning
         the CLI, up to a few seconds) is dispatched to a thread.
         """
+        self._clear_transcript()
         threading.Thread(target=self._clear_session, daemon=True).start()
         self._notify("🔄 New conversation ready", title="Voice Assistant", timeout_ms=3000)
         self._play_chime_async("deactivate")
@@ -5139,12 +5174,9 @@ class VoiceAssistant:
                 return
 
             self.logger.info(f"Transcription: {transcription}")
-            # Its own slot: sharing `progress` meant the first thinking or
-            # tool update replaced it within two seconds and the end of the
-            # turn closed it, so what you said was never on screen beside the
-            # answer. Now it stays until the next turn replaces it or voice
-            # mode goes off.
-            self._notify(f"🎤 {transcription}", title="You Said", slot="heard")
+            # Goes to the indicator, not to a notification: the conversation is
+            # a live view, and GNOME notifications cannot be one.
+            self._append_transcript("you", transcription)
 
             response = await loop.run_in_executor(
                 None, self._query_and_speak, transcription, abort)

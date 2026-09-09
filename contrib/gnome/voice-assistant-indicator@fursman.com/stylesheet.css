@@ -30,3 +30,33 @@
 .voice-thinking .voice-label  { color: #62a0ea; }   /* blue 2  */
 .voice-speaking .voice-icon,
 .voice-speaking .voice-label  { color: #57e389; }   /* green 2 */
+
+/* Transcript in the menu. The conversation goes here rather than into
+   notifications: GNOME queues banners, ignores the expiry an app asks for, and
+   the only way to clear one early also deletes it from the message list. This
+   is a surface we own, so it can simply show the newest thing. */
+.voice-transcript {
+    max-height: 320px;
+    min-width: 420px;
+}
+
+.voice-transcript-box {
+    padding: 4px 12px;
+    spacing: 10px;
+}
+
+/* Same colours the indicator uses for listening and speaking, so the two
+   surfaces agree about who is who. */
+.voice-turn-you {
+    color: #f66151;
+    font-weight: bold;
+}
+
+.voice-turn-assistant {
+    color: #ffffff;
+}
+
+.voice-turn-empty {
+    color: #9a9996;
+    font-style: italic;
+}
