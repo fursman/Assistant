@@ -603,24 +603,26 @@ That decides the design. Nothing is ever closed and no id is ever reused, so
 each notification gets its own banner and its own line in the list, and the
 whole turn is there to scroll back through afterwards.
 
-The queue is the catch, and it is pure arithmetic. A banner that outlives the
-gap between notifications backs the queue up, and what is on screen falls
-behind what is actually happening: `Working...` fired every 2 s with a 5 s
-banner, and by the end of a four-tool turn the screen was three notifications
-behind, still showing step two while the reply was being spoken. Keeping the
-expiry at or under the throttle interval is what keeps the newest thing the
-visible thing, so `VOICE_ASSISTANT_NOTIFY_EXPIRE` and the 2 s throttle are
-documented as a pair. The reply is exempt and lingers, because nothing queues
-behind it.
+GNOME **strictly queues**. Measured: three notifications sent 3 s apart with a
+30 s expiry played out one after another, each sitting for its full 30 s. A new
+one never pushes the current one aside.
 
-**Code blocks go to the clipboard.** Anything fenced is unreadable and
-unhearable at the same time: the speech layer replaces a code block with the
-words "code block" so it does not read punctuation aloud, and the notification
-shows the same. A command handed to the user in a reply simply vanished. Now the
-blocks are copied (`wl-copy`, or `xclip` on X11), a popup shows the first line,
-and the spoken placeholder becomes "code block, copied to your clipboard". With
-neither tool installed nothing is copied and the old wording is used, so the
-assistant never claims a paste that is not there.
+That puts two desirable things in direct conflict. The only way to clear a
+banner early is `CloseNotification`, and closing is exactly what deletes it from
+the message list. There is no way to add a list entry without a banner either,
+since GNOME ignores the `suppress-popup` hint.
+
+So the expiry does two jobs at once: it is the dwell time, *and* it is the lag
+before the next thing can appear. Short is the only way to track reality. At
+~1 s the queue drains about as fast as events arrive, so the banner reads as a
+live ticker of the newest event, while nothing is ever closed, so the whole turn
+is still in the message list to read at leisure. Earlier tunings got this wrong
+in both directions: 5 s banners on a 2 s throttle left the screen three
+notifications behind by the end of a turn, and 2 s was too brief to read but
+still too slow to track.
+
+Raise `VOICE_ASSISTANT_NOTIFY_EXPIRE` if you would rather read the banners than
+glance at them. The cost is paid in lag, one for one.
 
 `--replace-id` is not used, and this is why: it updates a notification *in
 place in the tray* without raising a banner again. Once GNOME had retired the
@@ -769,8 +771,8 @@ optional.
 |---|---|---|
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
 | `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
-| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `4000` | ms a normal notification stays up; keep it at or under the 4 s throttle |
-| `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | `8000` | ms the reply stays up; nothing queues behind it |
+| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` | ms a notification stays up. This is also the lag before the next one can show, so raising it puts the banner behind reality |
+| `VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE` | same as above | ms the reply stays up; longer delays the user's own transcript appearing |
 | `VOICE_ASSISTANT_CLIPBOARD` | `1` | copy code blocks in a reply to the clipboard, and say so |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 

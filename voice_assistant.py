@@ -614,15 +614,29 @@ TURN_CONTEXT_FILE = Path.home() / ".local/state/voice-assistant/turn_context.jso
 # banner, and by the end of a four-tool turn the screen was three notifications
 # behind. Keeping the expiry at or under the throttle interval is what keeps
 # the newest thing the visible thing, so these two constants belong together.
-# Raised from 2 s after testing: at 2 s nothing backed up, but each banner was
-# gone before it could be read, and a turn's worth of tool use went by unseen.
-# Both numbers move together -- fewer notifications, each readable, still no
-# backlog. The message list is the real catch-up; banners are for glancing.
-NOTIFY_THROTTLE_SECONDS = 4.0
+# GNOME strictly queues banners. Measured: three notifications sent 3 s apart
+# with a 30 s expiry played out one after another, each sitting for its full
+# 30 s. A new one never pushes the current one aside.
+#
+# That makes "the banner always shows the newest thing" and "the message list
+# keeps everything" pull against each other, because the only way to clear a
+# banner early is CloseNotification, and closing is exactly what deletes it
+# from the list. There is no way to add a list entry without a banner either:
+# GNOME ignores the suppress-popup hint.
+#
+# So the expiry is doing two jobs at once -- it is the dwell time AND it is the
+# lag before the next thing can appear. Short is the only way to track reality:
+# at ~1 s the queue drains about as fast as events arrive, so the banner reads
+# as a live ticker of the newest event, and nothing is ever closed, so the full
+# turn is still in the list to read at leisure. Raise these if you would rather
+# read the banners than glance at them; the cost is measured in lag.
+NOTIFY_THROTTLE_SECONDS = 1.0
 NOTIFY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_EXPIRE",
                                  str(int(NOTIFY_THROTTLE_SECONDS * 1000))))
-# The reply is last in a turn, so nothing queues behind it; it can linger.
-NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE", "8000"))
+# Same default as the rest: after a reply the next event is the user speaking,
+# and a lingering reply would delay their own transcript appearing.
+NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE",
+                                                 str(NOTIFY_EXPIRE_MS)))
 # 0 restores the old behaviour: replace in place, never expire, close on exit.
 NOTIFY_HISTORY = os.getenv("VOICE_ASSISTANT_NOTIFY_HISTORY", "1").strip().lower() \
     not in ("0", "false", "no", "off")
