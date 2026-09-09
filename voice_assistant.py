@@ -951,9 +951,12 @@ def _prepare_for_speech(text: str) -> str:
     # Code blocks become a placeholder before anything else strips them. When
     # the clipboard is available the reply also lands there, so say so: "code
     # block" alone told the user something existed but not how to reach it.
-    text = re.sub(r"```[\s\S]*?```",
-                  "code block, copied to your clipboard" if _clipboard_ready()
-                  else "code block", text)
+    # Ends with a full stop so the synthesiser draws breath before whatever
+    # follows, instead of running the announcement into the next sentence. Any
+    # full stop already there is swallowed rather than doubled.
+    text = re.sub(r"```[\s\S]*?```(?:\s*\.)?",
+                  "code block, copied to your clipboard." if _clipboard_ready()
+                  else "code block.", text)
 
     def _pick(m):
         for g in m.groups():
