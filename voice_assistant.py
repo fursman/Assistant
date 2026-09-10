@@ -916,6 +916,17 @@ _ABBREVS = [
 ]
 
 
+def _open_fence(text: str):
+    """Index of a ``` that has not been closed yet, else None."""
+    i = text.find("```")
+    while i != -1:
+        j = text.find("```", i + 3)
+        if j == -1:
+            return i
+        i = text.find("```", j + 3)
+    return None
+
+
 def _prepare_for_speech(text: str) -> str:
     """Strip markdown and normalize text for natural TTS pronunciation.
 
@@ -3570,9 +3581,24 @@ class VoiceAssistant:
             if not remaining.strip():
                 break
             first_unit = self._assistant_spoken_pos == 0
-            end = self._next_boundary(remaining, first_unit)
-            if end is None:
-                break
+            # A fenced block has to stay whole. Sentence boundaries do not
+            # respect it -- "/var/crash/*.crash" ends a sentence as far as the
+            # splitter is concerned -- and each half would then fail the
+            # code-block pattern in _prepare_for_speech and be read out
+            # verbatim, punctuation and all.
+            fence = remaining.find("```")
+            if fence != -1 and not remaining[:fence].strip():
+                close = remaining.find("```", fence + 3)
+                if close == -1:
+                    break                       # still arriving; wait for it
+                end = close + 3
+            else:
+                limit = fence if fence != -1 else len(remaining)
+                end = self._next_boundary(remaining[:limit], first_unit)
+                if end is None:
+                    if fence == -1:
+                        break
+                    end = limit                 # the fence is itself a boundary
             unit = remaining[:end].strip()
             self._assistant_spoken_pos += end
             if unit:
