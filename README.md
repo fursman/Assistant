@@ -677,6 +677,12 @@ scrolling. This is a surface the project owns, which is the whole point: no
 queue, no expiry policy, no history semantics to work around, so it can simply
 show the newest thing.
 
+**Tool entries lead with the reason.** The popup for a command shows the
+human-written description of why it is being run; the transcript entry is
+headed by that same description, with the exact command beneath it. So the
+phrase you glimpse in a bubble is the line you scroll to, and what actually
+ran is directly under it.
+
 **Thinking is in there too.** When the model is one that reasons first, its
 reasoning streams into the transcript at the same sentence boundaries the
 popup uses, in the tool lines' grey but the normal typeface, since it is prose.

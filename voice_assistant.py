@@ -3512,6 +3512,7 @@ class VoiceAssistant:
         # point of reading back is seeing exactly what ran.
         detail = ""
         exact = ""
+        desc = ""       # the human-written reason, when the tool carries one
         try:
             args = json.loads(input_json_str) if input_json_str else {}
         except json.JSONDecodeError:
@@ -3543,7 +3544,12 @@ class VoiceAssistant:
         # Into the transcript as well, so the reply reads text, tool, text in
         # the order it happened. Not throttled like the popup: the transcript
         # is a record and skipping entries would misrepresent the turn.
-        self._append_transcript("tool", f"{label}\n{exact}" if exact else label)
+        # The popup shows the description and the transcript shows the command,
+        # which left them with no phrase in common to match on. Head the entry
+        # with the same description, so the reason seen in the bubble is the
+        # line you scroll to, with the exact command directly beneath it.
+        head = f"{label}: {desc}" if desc else label
+        self._append_transcript("tool", f"{head}\n{exact}" if exact else head)
         now = time.time()
         if now - self._last_tool_notify >= NOTIFY_THROTTLE_SECONDS:
             self._last_tool_notify = now
