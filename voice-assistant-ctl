@@ -54,6 +54,11 @@ show_status() {
         STATE=$(sed -n 's/.*"class": *\[ *"\([a-z]*\)".*/\1/p' "$STATE_DIR/status")
         BACKEND=$(sed -n 's/.*"class": *\[ *"[a-z]*", *"\([a-z]*\)".*/\1/p' "$STATE_DIR/status")
         echo -e "Voice:    ${GREEN}${STATE:-unknown}${NC}   Backend: ${GREEN}${BACKEND:-unknown}${NC}"
+        # The assistant publishes these for the indicator's menu; show them here
+        # too, or "which model is answering" needs a right click to find out.
+        MODEL=$(sed -n 's/.*"model": *"\([a-z]*\)".*/\1/p' "$STATE_DIR/status")
+        EFFORT=$(sed -n 's/.*"effort": *"\([a-z]*\)".*/\1/p' "$STATE_DIR/status")
+        [[ -n "$MODEL" ]] && echo -e "Claude:   ${GREEN}${MODEL}${NC} at ${GREEN}${EFFORT:-?}${NC} effort"
     fi
 
     if [[ -s "$SESSION_FILE" ]]; then

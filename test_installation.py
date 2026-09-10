@@ -279,6 +279,41 @@ def main():
         warn(f"No control socket at {sock}",
              "`assistant` needs the service running")
 
+    # Three of the commands and the GNOME extension are installed as copies, so
+    # editing the checkout changes nothing until they are copied again. That
+    # bit three times in one afternoon: a menu item that did nothing, a reboot
+    # that could not have helped, a flag the installed command had never heard
+    # of. Deep comparison, because `cp` does not preserve mtimes and a shallow
+    # one would call every fresh copy stale.
+    print("\n📋 Installed copies")
+    import filecmp
+    repo = Path(__file__).resolve().parent
+    bin_dir = Path.home() / ".local/bin"
+    for name in ("assistant", "voice-llm", "voice-assistant-ctl"):
+        src, dst = repo / name, bin_dir / name
+        if not dst.exists():
+            warn(f"{name} is not installed", "./setup.sh")
+        elif filecmp.cmp(src, dst, shallow=False):
+            ok(f"{name} matches the checkout")
+        else:
+            warn(f"{name} in ~/.local/bin is not the checkout's version",
+                 f"install -m 0755 {name} ~/.local/bin/{name}")
+    uuid = "voice-assistant-indicator@fursman.com"
+    ext_src = repo / "contrib/gnome" / uuid
+    ext_dst = Path.home() / ".local/share/gnome-shell/extensions" / uuid
+    if ext_dst.is_dir():
+        stale = []
+        for f in ext_src.rglob("*"):
+            if f.is_file():
+                other = ext_dst / f.relative_to(ext_src)
+                if not other.exists() or not filecmp.cmp(f, other, shallow=False):
+                    stale.append(str(f.relative_to(ext_src)))
+        if stale:
+            warn(f"GNOME extension is not the checkout's version ({', '.join(sorted(stale))})",
+                 "./setup.sh --desktop, then log out and back in")
+        else:
+            ok("GNOME extension matches the checkout")
+
     print("\n" + "=" * 44)
     print(f"📊 {results['pass']} passed, {results['warn']} warnings, "
           f"{results['fail']} failures")
@@ -291,7 +326,7 @@ def main():
     else:
         print("\n🎉 Everything checks out.")
     print("\nStart:  systemctl --user start voice-assistant.service")
-    print("Toggle: tap SUPER on Hyprland, SUPER+M on GNOME")
+    print("Toggle: tap SUPER on Hyprland, SUPER+ALT on GNOME")
     return 0
 
 

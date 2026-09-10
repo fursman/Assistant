@@ -603,9 +603,11 @@ LOCAL_HISTORY_FILE = Path.home() / ".local/state/voice-assistant/local_history.j
 DSH_TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/dsh_transcript.json"
 TURN_CONTEXT_FILE = Path.home() / ".local/state/voice-assistant/turn_context.json"
 TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/transcript.json"
-# Turns kept for the indicator's transcript view. Enough to scroll back through
-# the current thread, not so many that the menu becomes a document.
-TRANSCRIPT_TURNS = int(os.getenv("VOICE_ASSISTANT_TRANSCRIPT_TURNS", "40"))
+# Entries kept in the transcript file. The indicator renders only the last
+# dozen, so this is about not losing the conversation: every tool call is an
+# entry too, and a tool-heavy turn on the harness runs to hundreds, which at 40
+# evicted the very speech those tools were serving.
+TRANSCRIPT_TURNS = int(os.getenv("VOICE_ASSISTANT_TRANSCRIPT_TURNS", "200"))
 # A notification is transient when what it says is recorded somewhere better.
 # Since the transcript took over the conversation *and* the tool calls, that is
 # now almost everything: voice mode is on the indicator, tool calls and replies
@@ -650,13 +652,6 @@ NOTIFY_TRANSIENT_SECONDS = float(os.getenv("VOICE_ASSISTANT_NOTIFY_TRANSIENT", "
 NOTIFY_THROTTLE_SECONDS = 1.0
 NOTIFY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_EXPIRE",
                                  str(int(NOTIFY_THROTTLE_SECONDS * 1000))))
-# Same default as the rest: after a reply the next event is the user speaking,
-# and a lingering reply would delay their own transcript appearing.
-NOTIFY_REPLY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_REPLY_EXPIRE",
-                                                 str(NOTIFY_EXPIRE_MS)))
-# 0 restores the old behaviour: replace in place, never expire, close on exit.
-NOTIFY_HISTORY = os.getenv("VOICE_ASSISTANT_NOTIFY_HISTORY", "1").strip().lower() \
-    not in ("0", "false", "no", "off")
 
 
 # Lines that set the command up rather than being the point of it.
@@ -3266,18 +3261,21 @@ class VoiceAssistant:
 
     def _notify(self, message, title="Voice Assistant", timeout_ms=None,
                 silent=False, slot="main", transient=False):
-        """Show a notification, replacing our previous one in the same slot.
+        """Show a status notification.
 
-        Slots exist so the assistant updates its own popup in place instead of
-        stacking, and so dismissing our notifications does not take the rest of
-        the desktop's with it (which `swaync-client --close-all` did). The
-        slots are `heard` (what you said, kept beside the reply), `progress`
-        (thinking and tool use, replaced in place and closed when the reply
-        arrives), `main` (the reply and state changes) and `backend`.
+        Only status goes through here -- tool calls, thinking, voice mode, model
+        changes, errors. The conversation itself is in the indicator's
+        transcript, because GNOME notifications cannot be a live view: they
+        queue, they ignore the expiry an app asks for, and the only way to
+        clear one early also erases it from the message list.
+
+        `transient` closes it after a few seconds, for anything recorded
+        somewhere better. `slot` names what kind of notification it is; ids
+        are kept per slot so a transient close never takes a newer one.
         """
         if silent and self._notification_server == "gnome-shell":
-            # No popup-free update exists there; the slot is closed moments
-            # later anyway.
+            # No popup-free update exists there, and the thinking popups that
+            # ask for one are transient anyway.
             return
         cmd = ["notify-send", "--print-id", "--app-name=Voice Assistant", title, message]
         if silent:
@@ -3286,17 +3284,11 @@ class VoiceAssistant:
         # frees the banner slot for the next one. -1 (never expire) parks it on
         # screen and stalls everything behind it.
         if timeout_ms is None:
-            timeout_ms = NOTIFY_EXPIRE_MS if NOTIFY_HISTORY else -1
+            timeout_ms = NOTIFY_EXPIRE_MS
         cmd.extend(["--expire-time=" + str(timeout_ms)])
-        # --replace-id updates a notification in place in the tray and does not
-        # raise a banner again, so once GNOME has retired the first banner a
-        # replacement is invisible. In history mode nothing is reused and
-        # nothing is closed: every notification is new, so every one is seen
-        # and every one is kept.
-        if not NOTIFY_HISTORY:
-            prev = self._notif_ids.get(slot)
-            if prev:
-                cmd.extend(["--replace-id=" + str(prev)])
+        # Never --replace-id: it edits the tray entry in place without raising
+        # a banner again, so once the first banner has gone a replacement is
+        # invisible. Every notification is new, so every one is seen.
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
             nid = out.stdout.strip()
@@ -3326,25 +3318,6 @@ class VoiceAssistant:
             return
         if slot and self._notif_ids.get(slot) == nid:
             self._notif_ids.pop(slot, None)
-
-    def _close_notifications(self, slots=None):
-        """Close only the notifications this assistant opened."""
-        for slot in list(slots or self._notif_ids.keys()):
-            nid = self._notif_ids.pop(slot, None)
-            if not nid:
-                continue
-            try:
-                subprocess.run(
-                    ["gdbus", "call", "--session",
-                     "--dest", "org.freedesktop.Notifications",
-                     "--object-path", "/org/freedesktop/Notifications",
-                     "--method", "org.freedesktop.Notifications.CloseNotification",
-                     str(nid)],
-                    capture_output=True, check=False, timeout=5)
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                # Keep going: the ids have already been popped, so returning
-                # here would strand the remaining popups with no id to close.
-                continue
 
     # ------------------------------------------------------------------
     # Status file (waybar module, GNOME Shell indicator, voice-assistant-ctl)
@@ -4225,6 +4198,10 @@ class VoiceAssistant:
         picks up the conversation where the old one left off.
         """
         global CLAUDE_MODEL, CLAUDE_EFFORT
+        # Replacing the process mid-answer would cut the answer off. The voice
+        # path cannot get here mid-turn, but the submenu and the CLI can.
+        if self.is_processing:
+            return {"ok": False, "error": "busy answering, try again in a moment"}
         changed = []
         if model:
             model = model.strip().lower()
@@ -4766,11 +4743,6 @@ class VoiceAssistant:
             full_response = "Done."
             self._assistant_text = full_response
 
-        # Only in replace mode. In history mode the progress banners expire on
-        # their own, and closing them would delete the turn from the list.
-        if not NOTIFY_HISTORY:
-            self._close_notifications(["progress"])
-
         if full_response:
             self._flush_sentences(final=True)
         else:
@@ -4890,7 +4862,6 @@ class VoiceAssistant:
             self._abort_event.set()
             threading.Thread(target=self._abort_inflight, daemon=True).start()
             self._play_chime_async("deactivate")
-            threading.Thread(target=self._delayed_dismiss, daemon=True).start()
 
     def _maybe_prespawn(self):
         """Boot the agent runtime at activation, so its start hides under the
@@ -4906,19 +4877,6 @@ class VoiceAssistant:
             return
         if self._claude_available and (self.backend == "claude" or health != "ready"):
             self._ensure_claude_session()
-
-    def _delayed_dismiss(self):
-        """Clear leftovers when voice mode goes off.
-
-        Only needed in replace mode, where notifications never expire and would
-        otherwise sit on screen indefinitely. In history mode they time out by
-        themselves and closing them would erase the conversation from the
-        message list, which is the thing worth keeping.
-        """
-        if NOTIFY_HISTORY:
-            return
-        time.sleep(2)
-        self._close_notifications()
 
     def _new_session(self):
         """SIGUSR2: start a fresh conversation.

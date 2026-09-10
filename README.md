@@ -590,7 +590,7 @@ is on, so it reaches for `hyprctl` or `gsettings` as appropriate;
 |---|---|---|
 | Toggle voice mode | **SUPER** (tap alone) | **SUPER+ALT** (either order) |
 | New conversation | **SUPER+SHIFT+V** | **SUPER+SHIFT+V** |
-| Swap model | **SUPER+M** | **SUPER+M** |
+| Swap backend | **SUPER+M** | **SUPER+M** |
 | Status | waybar module | top-bar indicator (Shell extension) |
 | Installed by | `contrib/hyprland/hyprland-voice-assistant.conf` | `setup.sh` (gsettings + `contrib/gnome/`) |
 
@@ -652,12 +652,18 @@ same file, for configs written against the old name.)
 
 ### GNOME indicator
 
-`contrib/gnome/voice-assistant-indicator@fursman.com` draws the state in the top
-bar in the style of GNOME's screen-recording indicator: a dimmed robot when off,
-a robot when ready, and a red / blue / green pill labelled *listening* /
-*thinking* / *speaking*. Left click toggles voice mode; right click shows the
-state and backend, starts a new conversation, or swaps the model. It watches the
-state directory with a file monitor, so it changes the moment the assistant does.
+`contrib/gnome/voice-assistant-indicator@fursman.com` puts a robot in the top
+bar: dimmed when off, white when ready, and recoloured red, blue or green with
+the word *listening*, *thinking* or *speaking* beside it. The button is a fixed
+width, so the word appearing and disappearing never nudges it sideways.
+
+**Left click opens the conversation**, the transcript described below with the
+controls under it. **Right click is the quick menu**: toggle voice mode, new
+conversation, swap backend, and on the Claude backend two submenus, Model and
+Effort, with the current choice marked. The mute chord works while either is
+open, even though an open menu holds the keyboard grab, because the menu itself
+watches for it. It watches the state directory with a file monitor, so it
+changes the moment the assistant does.
 
 **The conversation lives here.** The menu holds a scrolling transcript, oldest
 at the top so it reads downwards, scrolled to the newest automatically. The
@@ -792,9 +798,8 @@ optional.
 | variable | default | meaning |
 |---|---|---|
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
-| `VOICE_ASSISTANT_NOTIFY_HISTORY` | `1` | let notifications expire and accumulate in the message list, instead of replacing and closing them |
 | `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` | ms a notification stays up. This is also the lag before the next one can show, so raising it puts the banner behind reality |
-| `VOICE_ASSISTANT_TRANSCRIPT_TURNS` | `40` | turns kept in the indicator's transcript |
+| `VOICE_ASSISTANT_TRANSCRIPT_TURNS` | `200` | entries kept in the transcript file; every tool call is one, so a tool-heavy turn must not evict the speech around it |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 
 ## Privacy and what leaves the machine
