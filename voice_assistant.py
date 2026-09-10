@@ -2470,6 +2470,8 @@ class VoiceAssistant:
         self._claude_process = None      # one-shot fallback process
         self._claude_turn_active = False
         self._claude_restart_pending = False
+        self._claude_pending_model = None
+        self._claude_pending_effort = None
         self._session_id: Optional[str] = None
         self._local_client = None
         self._local_stream = None
@@ -4201,36 +4203,48 @@ class VoiceAssistant:
         if self.is_active and not self.is_processing:
             threading.Thread(target=self._say, args=(text,), daemon=True).start()
 
-    def set_claude_setting(self, model=None, effort=None) -> dict:
+    def set_claude_setting(self, model=None, effort=None, force=False) -> dict:
         """Change the Claude model or effort level, mid-conversation.
 
         Both are handed to the CLI at spawn, so the persistent process has to be
         replaced for a change to take. Its session id is kept and passed back to
         `--resume`, so switching model costs nothing in context: the new one
         picks up the conversation where the old one left off.
+
+        Replacing the process mid-answer would cut the reply off, so a request
+        that lands while a turn is in flight is remembered and applied when the
+        turn ends (see _stream_claude_persistent). `force` is that later apply.
         """
         global CLAUDE_MODEL, CLAUDE_EFFORT
-        # Replacing the process mid-answer would cut the answer off. The voice
-        # path cannot get here mid-turn, but the submenu and the CLI can.
-        if self.is_processing:
-            return {"ok": False, "error": "busy answering, try again in a moment"}
-        changed = []
         if model:
             model = model.strip().lower()
             if model not in CLAUDE_MODELS:
                 return {"ok": False, "error": f"unknown model {model!r}"}
-            if model != CLAUDE_MODEL:
-                CLAUDE_MODEL = model
-                _write_env_setting("VOICE_ASSISTANT_MODEL", model)
-                changed.append(model)
         if effort:
             effort = effort.strip().lower()
             if effort not in CLAUDE_EFFORTS:
                 return {"ok": False, "error": f"unknown effort {effort!r}"}
-            if effort != CLAUDE_EFFORT:
-                CLAUDE_EFFORT = effort
-                _write_env_setting("VOICE_ASSISTANT_EFFORT", effort)
-                changed.append(f"{effort} effort")
+        if self.is_processing and not force:
+            # Mid-answer: remember it and apply at the turn's end instead of
+            # dropping it. The submenu, the waybar menu and the CLI land here.
+            if model:  self._claude_pending_model = model
+            if effort: self._claude_pending_effort = effort
+            pending = " and ".join(x for x in
+                                   (model, f"{effort} effort" if effort else None) if x)
+            self.logger.info(f"Claude setting deferred to end of turn: {pending}")
+            self._append_transcript("system", f"Claude: {pending} (after this reply)")
+            return {"ok": True, "deferred": True, "changed": [],
+                    "model": self._claude_pending_model or CLAUDE_MODEL,
+                    "effort": self._claude_pending_effort or CLAUDE_EFFORT}
+        changed = []
+        if model and model != CLAUDE_MODEL:
+            CLAUDE_MODEL = model
+            _write_env_setting("VOICE_ASSISTANT_MODEL", model)
+            changed.append(model)
+        if effort and effort != CLAUDE_EFFORT:
+            CLAUDE_EFFORT = effort
+            _write_env_setting("VOICE_ASSISTANT_EFFORT", effort)
+            changed.append(f"{effort} effort")
         result = {"ok": True, "changed": changed,
                   "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT}
         if not changed:
@@ -4274,6 +4288,13 @@ class VoiceAssistant:
                 if self.is_active:
                     self._claude.start()
                 self.logger.info("Deferred new conversation applied")
+            if self._claude_pending_model or self._claude_pending_effort:
+                # A model/effort change arrived mid-answer; apply it now the
+                # turn is done, so the reply was never cut off. force=True: it
+                # was deferred precisely because is_processing is still set.
+                m, e = self._claude_pending_model, self._claude_pending_effort
+                self._claude_pending_model = self._claude_pending_effort = None
+                self.set_claude_setting(m, e, force=True)
 
     def _claude_turn(self, text, abort) -> str:
         if not self._ensure_claude_session():

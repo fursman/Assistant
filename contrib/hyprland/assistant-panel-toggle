@@ -1,0 +1,8 @@
+#!/bin/bash
+# Toggle the assistant panel as a normal tiled window.
+addr=$(hyprctl clients -j 2>/dev/null | jq -r '.[] | select(.class=="assistant-panel") | .address' | head -1)
+if [ -n "$addr" ]; then
+    hyprctl dispatch closewindow "address:$addr"
+else
+    kitty --class assistant-panel -e ~/.local/bin/assistant-panel
+fi

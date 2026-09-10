@@ -1,0 +1,57 @@
+#!/bin/bash
+# Right-click options for the voice-assistant waybar indicator.
+# Mirrors the GNOME indicator: toggle voice, new conversation, swap backend,
+# and pick Claude model / effort. Driven by rofi + the control socket.
+set -u
+STATE="$HOME/.local/state/voice-assistant"
+SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voice-assistant.sock"
+PID="$(cat "$STATE/voice-assistant.pid" 2>/dev/null)"
+
+THEME=(-theme spotlight-dark)
+rofi -dump-theme "${THEME[@]}" >/dev/null 2>&1 || THEME=()
+rofi_menu() { rofi -dmenu -i "${THEME[@]}" -p "$1"; }
+
+send() {
+  python3 - "$SOCK" "$1" <<'PY'
+import socket,sys
+try:
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(3)
+    s.connect(sys.argv[1]); s.sendall((sys.argv[2]+"\n").encode())
+    sys.stdout.write(s.recv(65536).decode())
+except Exception:
+    pass
+PY
+}
+
+eval "$(python3 - "$STATE/status" <<'PY'
+import json,sys,shlex
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+cls=d.get("class") or []
+print("BACKEND="+shlex.quote(cls[1] if len(cls)>1 else ""))
+print("MODEL="+shlex.quote(str(d.get("model",""))))
+print("EFFORT="+shlex.quote(str(d.get("effort",""))))
+print("MODELS=("+" ".join(shlex.quote(x) for x in d.get("models",[]))+")")
+print("EFFORTS=("+" ".join(shlex.quote(x) for x in d.get("efforts",[]))+")")
+PY
+)"
+
+ACTIVE="$(send '{"cmd":"status"}' | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("voice_active"))
+except Exception: print("")')"
+vlabel="Turn voice mode on"; [ "$ACTIVE" = "True" ] && vlabel="Turn voice mode off"
+
+choice="$(printf '%s\n' \
+  "$vlabel" \
+  "New conversation" \
+  "Swap backend  (now: ${BACKEND:-?})" \
+  "Model   (${MODEL:-?})" \
+  "Effort  (${EFFORT:-?})" | rofi_menu Assistant)"
+
+case "$choice" in
+  "Turn voice mode"*) [ -n "$PID" ] && kill -USR1 "$PID" ;;
+  "New conversation") send '{"cmd":"new_session"}' >/dev/null ;;
+  "Swap backend"*)    send '{"cmd":"backend","value":"toggle"}' >/dev/null ;;
+  "Model"*)  sel="$(printf '%s\n' "${MODELS[@]}" | rofi_menu Model)";   [ -n "${sel:-}" ] && send "{\"cmd\":\"claude\",\"model\":\"$sel\"}" >/dev/null ;;
+  "Effort"*) sel="$(printf '%s\n' "${EFFORTS[@]}" | rofi_menu Effort)"; [ -n "${sel:-}" ] && send "{\"cmd\":\"claude\",\"effort\":\"$sel\"}" >/dev/null ;;
+esac

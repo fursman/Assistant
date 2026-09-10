@@ -599,6 +599,9 @@ chmod +x ~/.local/bin/voice-assistant
 install -m 0755 voice-llm ~/.local/bin/voice-llm
 install -m 0755 voice-assistant-ctl ~/.local/bin/voice-assistant-ctl
 install -m 0755 assistant ~/.local/bin/assistant
+install -m 0755 contrib/hyprland/assistant-panel.py     ~/.local/bin/assistant-panel
+install -m 0755 contrib/hyprland/assistant-panel-toggle ~/.local/bin/assistant-panel-toggle
+install -m 0755 contrib/hyprland/assistant-menu         ~/.local/bin/assistant-menu
 
 # ── Systemd Service ──────────────────────────────────────────────────────
 

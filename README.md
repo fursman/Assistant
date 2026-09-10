@@ -736,12 +736,32 @@ at login**, so log out and back in once.
     "exec": "cat ~/.local/state/voice-assistant/status",
     "return-type": "json",
     "interval": 1,
-    "on-click": "kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)",
-    "on-click-right": "kill -USR2 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)"
+    "on-click": "~/.local/bin/assistant-panel-toggle",
+    "on-click-middle": "kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)",
+    "on-click-right": "~/.local/bin/assistant-menu"
 }
 ```
 
 Both classes can be styled, e.g. `#custom-voice.listening { color: #e01b24; }`.
+
+### Hyprland panel
+
+Hyprland has no Shell extension, so the conversation lives in a small terminal
+app instead: `contrib/hyprland/assistant-panel.py`, installed as
+`~/.local/bin/assistant-panel`. **SUPER+A**, or a left click on the waybar
+module, opens it as a normal tiled window that snaps in beside whatever you have
+open and closes on the next press. It reads the same `transcript.json` and
+`status` files the GNOME pane does and redraws the instant either changes: a
+justified header -- `Assistant · listening` on the left, `Claude Opus · max` on
+the right -- then the conversation, with your words, the replies, thinking in
+grey and tool calls beneath.
+
+**Right click the module** for the options menu (`assistant-menu`, a rofi
+front-end to the control socket): toggle voice, new conversation, swap backend,
+and pick the Claude model or effort -- the same set the GNOME menu offers.
+**Middle click** mutes the microphone. All three are pure shell over rofi and
+kitty; `setup.sh` installs them, and the SUPER+A binding ships in
+`contrib/hyprland/hyprland-voice-assistant.conf`.
 
 ## Configuration
 
