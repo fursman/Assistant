@@ -122,3 +122,28 @@
     font-size: 0.85em;
     font-style: italic;
 }
+
+/* The transcript view's header: state and model on the left, three buttons
+   on the right. Buttons look pressable, since in this view they are the only
+   controls there are. */
+.voice-header {
+    spacing: 4px;
+}
+
+.voice-header-label {
+    font-weight: bold;
+}
+
+.voice-header-button {
+    padding: 4px;
+    border-radius: 6px;
+}
+
+.voice-header-button:hover,
+.voice-header-button:focus {
+    background-color: rgba(255, 255, 255, 0.14);
+}
+
+.voice-header-icon {
+    icon-size: 16px;
+}

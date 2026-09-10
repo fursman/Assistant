@@ -657,10 +657,14 @@ bar: dimmed when off, white when ready, and recoloured red, blue or green with
 the word *listening*, *thinking* or *speaking* beside it. The button is a fixed
 width, so the word appearing and disappearing never nudges it sideways.
 
-**Left click opens the conversation**, the transcript described below with the
-controls under it. **Right click is the quick menu**: toggle voice mode, new
-conversation, swap backend, and on the Claude backend two submenus, Model and
-Effort, with the current choice marked. The mute chord works while either is
+**Left click opens the conversation.** A header line says what is happening
+and who is answering -- `Listening · Claude · fable · xhigh` -- with three
+buttons beside it: copy the whole transcript to the clipboard, new
+conversation, and voice mode on or off. Under that the transcript fills the
+rest of the screen; nothing sits below it. **Right click is the quick menu**
+with the full set of controls: toggle, new conversation, swap backend, and on
+the Claude backend the Model and Effort submenus with the current choice
+marked. The mute chord works while either is
 open, even though an open menu holds the keyboard grab, because the menu itself
 watches for it. It watches the state directory with a file monitor, so it
 changes the moment the assistant does.

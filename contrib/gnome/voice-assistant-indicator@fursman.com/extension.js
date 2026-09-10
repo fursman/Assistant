@@ -14,8 +14,10 @@
 //   thinking   robot, blue   + "thinking"     (model / tools working)
 //   speaking   robot, green  + "speaking"     (playing the reply)
 //
-// Left click opens the conversation: the transcript, and the controls under
-// it. Right click opens the controls alone, as a quick menu. Both are the same
+// Left click opens the conversation: a header saying what is happening and
+// who is answering, three buttons (copy, new conversation, on/off), and the
+// transcript filling the rest of the screen. Right click is the quick menu
+// with the full set of controls. Both are the same
 // PopupMenu with the transcript shown or hidden, because a panel button has
 // one menu.
 //
@@ -200,7 +202,35 @@ class VoiceIndicator extends PanelMenu.Button {
         this._box.add_child(this._label);
         this.add_child(this._box);
 
-        this._header = new PopupMenu.PopupMenuItem('Voice Assistant', {reactive: false});
+        // Header: what is happening and who is answering, then three buttons.
+        // In the transcript view these are the only controls, so the transcript
+        // gets the rest of the screen; the full set lives on right click.
+        this._header = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        const row = new St.BoxLayout({style_class: 'voice-header', x_expand: true});
+        this._headerLabel = new St.Label({
+            style_class: 'voice-header-label',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        row.add_child(this._headerLabel);
+        const button = (icon, name, onClick) => {
+            const b = new St.Button({style_class: 'voice-header-button', can_focus: true});
+            b.set_child(new St.Icon({icon_name: icon, style_class: 'voice-header-icon'}));
+            b.accessible_name = name;
+            b.connect('clicked', onClick);
+            row.add_child(b);
+            return b;
+        };
+        button('edit-copy-symbolic', 'Copy transcript', () => this._copyTranscript());
+        button('document-new-symbolic', 'New conversation', () => {
+            this.menu.close();
+            this._signal('USR2');
+        });
+        this._powerButton = button('system-shutdown-symbolic', 'Voice mode on or off', () => {
+            this.menu.close();
+            this._signal('USR1');
+        });
+        this._header.add_child(row);
         this.menu.addMenuItem(this._header);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -227,9 +257,8 @@ class VoiceIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(transcriptItem);
         this._transcriptItem = transcriptItem;
         this._transcriptSig = null;
+        this._lastTurns = [];
         this._showingTranscript = true;
-        this._transcriptSeparator = new PopupMenu.PopupSeparatorMenuItem();
-        this.menu.addMenuItem(this._transcriptSeparator);
 
         this._toggleItem = new PopupMenu.PopupMenuItem('Turn voice mode on');
         this._toggleItem.connect('activate', () => this._signal('USR1'));
@@ -252,12 +281,16 @@ class VoiceIndicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._effortMenu);
         this._choiceSig = null;
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        const startSep = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(startSep);
         const start = new PopupMenu.PopupMenuItem('Start the assistant service');
         start.connect('activate', () =>
             spawn(['systemctl', '--user', 'start', 'voice-assistant.service']));
         this.menu.addMenuItem(start);
         this._startItem = start;
+        // Everything that is hidden in the transcript view. The model and
+        // effort submenus are handled in _updateChoices, which also gates them.
+        this._controls = [this._toggleItem, fresh, swap, startSep];
 
         this._current = null;
         this._installClickHandling();
@@ -322,19 +355,33 @@ class VoiceIndicator extends PanelMenu.Button {
         } catch (e) {
             button = 1;
         }
-        // One menu, two shapes. Left shows the conversation, right is the
-        // quick menu: toggle, new conversation, swap.
+        // One menu, two shapes. Left is the conversation under the header;
+        // right is the quick menu with the full set of controls.
         const wantTranscript = button === 1;
         if (this.menu?.isOpen && this._showingTranscript === wantTranscript) {
             this.menu.close();
             return;
         }
         this._showingTranscript = wantTranscript;
-        this._transcriptItem.visible = wantTranscript;
-        this._transcriptSeparator.visible = wantTranscript;
-        if (wantTranscript)
-            this._sizeTranscript();
+        this._applyMode();
         this.menu?.open();
+    }
+
+    _applyMode() {
+        const t = this._showingTranscript;
+        this._transcriptItem.visible = t;
+        for (const c of this._controls)
+            c.visible = !t;
+        const status = this._current;
+        if (status) {
+            this._toggleItem.label.text =
+                status.state === 'off' ? 'Turn voice mode on' : 'Turn voice mode off';
+            this._toggleItem.sensitive = status.state !== 'down';
+            this._startItem.visible = !t && status.state === 'down';
+            this._updateChoices(status);
+        }
+        if (t)
+            this._sizeTranscript();
     }
 
     _signal(sig) {
@@ -354,19 +401,35 @@ class VoiceIndicator extends PanelMenu.Button {
             this._box.remove_style_class_name(cls);
         this._box.add_style_class_name(`voice-${status.state}`);
 
-        const backend = status.backend ? (BACKEND_LABEL[status.backend] ?? status.backend) : null;
-        this._header.label.text = backend ? `${spec.title} · ${backend}` : spec.title;
-        this._toggleItem.label.text =
-            status.state === 'off' ? 'Turn voice mode on' : 'Turn voice mode off';
-        this._toggleItem.sensitive = status.state !== 'down';
-        this._startItem.visible = status.state === 'down';
-        this._updateChoices(status);
+        // "Listening · Claude · fable · xhigh": everything about who is
+        // answering, in one line, so none of it needs a menu to find out.
+        const parts = [spec.title];
+        if (status.backend)
+            parts.push(BACKEND_LABEL[status.backend] ?? status.backend);
+        if (status.backend === 'claude') {
+            if (status.model) parts.push(status.model);
+            if (status.effort) parts.push(status.effort);
+        }
+        this._headerLabel.text = parts.join(' · ');
+        this._powerButton.opacity = status.state === 'off' ? 128 : 255;
+        this._applyMode();
+    }
+
+    _copyTranscript() {
+        const names = {you: 'You', assistant: 'Assistant', tool: 'Tool',
+            system: 'System', thinking: 'Thinking'};
+        const text = this._lastTurns
+            .map(t => `${names[t.role] ?? t.role}: ${t.text}`)
+            .join('\n\n');
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+        Main.notify('Copied transcript', `${this._lastTurns.length} entries`);
+        this.menu?.close();
     }
 
     // Rebuilt only when the list of options changes; otherwise just the tick
     // moves, so opening a submenu does not fight a rebuild underneath it.
     _updateChoices(status) {
-        const onClaude = status.backend === 'claude';
+        const onClaude = status.backend === 'claude' && !this._showingTranscript;
         this._modelMenu.visible = onClaude && status.models.length > 0;
         this._effortMenu.visible = onClaude && status.efforts.length > 0;
         if (!onClaude)
@@ -407,7 +470,8 @@ class VoiceIndicator extends PanelMenu.Button {
         const mon = Main.layoutManager?.primaryMonitor;
         if (!mon)
             return;
-        const reserve = (Main.panel?.height ?? 32) + 220;
+        // Only the header sits above the transcript now, and nothing below.
+        const reserve = (Main.panel?.height ?? 32) + 90;
         const h = Math.max(200, mon.height - reserve);
         this._transcriptScroll.style = `max-height: ${h}px;`;
     }
@@ -456,6 +520,7 @@ class VoiceIndicator extends PanelMenu.Button {
     }
 
     updateTranscript(turns) {
+        this._lastTurns = turns;
         const shown = turns.slice(-TRANSCRIPT_SHOWN);
         // Rebuilding on every poll would fight the user's scrolling, so only
         // touch it when the content actually changed.
