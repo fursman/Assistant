@@ -49,17 +49,17 @@ const TRANSCRIPT_FILE = GLib.build_filenamev([STATE_DIR, 'transcript.json']);
 // Turns rendered in the menu. The file keeps more; this is what fits.
 const TRANSCRIPT_SHOWN = 12;
 
-// Three kinds of line: what you said, what the assistant said, and what it did.
-// Tool lines are quieter than speech because they are context, not content.
-// A fenced block in a reply. The language tag is optional and is not code.
-const CODE_FENCE = /```[A-Za-z0-9_+.-]*[ \t]*\n?([\s\S]*?)```/g;
-
-const ROLE_CLASS = {
-    you: 'voice-turn-you',
-    assistant: 'voice-turn-assistant',
-    tool: 'voice-turn-tool',
-    system: 'voice-turn-system',
-    thinking: 'voice-turn-thinking',
+// Per-role colour and face, as Pango span attributes. Markup rather than one
+// style class per label, because consecutive entries are rendered into ONE
+// text actor: a mouse selection lives inside a single ClutterText, so separate
+// labels could never be selected together, and this is what lets a selection
+// run across entries and across changes of font.
+const ROLE_MARKUP = {
+    you:       'foreground="#99c1f1" weight="bold"',
+    assistant: 'foreground="#ffffff"',
+    tool:      'foreground="#9a9996" font_family="monospace" size="smaller"',
+    thinking:  'foreground="#9a9996" style="italic" size="smaller"',
+    system:    'foreground="#f9f06b" style="italic" size="smaller"',
 };
 const ASSISTANT_BIN = GLib.build_filenamev([HOME, '.local', 'bin', 'assistant']);
 const POLL_SECONDS = 5;
@@ -258,6 +258,7 @@ class VoiceIndicator extends PanelMenu.Button {
         this._transcriptItem = transcriptItem;
         this._transcriptSig = null;
         this._lastTurns = [];
+        this._runs = [];
         this._showingTranscript = true;
 
         this._toggleItem = new PopupMenu.PopupMenuItem('Turn voice mode on');
@@ -303,6 +304,18 @@ class VoiceIndicator extends PanelMenu.Button {
         this.menu.actor.connect('key-press-event', (_a, event) => {
             const sym = event.get_key_symbol();
             const mods = event.get_state();
+            // Ctrl+C on a mouse selection. The menu holds the grab, so this is
+            // the only place the key can be seen.
+            if ((sym === Clutter.KEY_c || sym === Clutter.KEY_C) &&
+                (mods & Clutter.ModifierType.CONTROL_MASK)) {
+                for (const ct of this._runs ?? []) {
+                    const sel = ct.get_selection();
+                    if (sel) {
+                        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, sel);
+                        return Clutter.EVENT_STOP;
+                    }
+                }
+            }
             // Super arrives as MOD4_MASK in practice; SUPER_MASK is often
             // simply unset, which is why only the Alt-first order worked.
             const superHeld = (mods & (Clutter.ModifierType.SUPER_MASK |
@@ -489,13 +502,25 @@ class VoiceIndicator extends PanelMenu.Button {
         ct.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
     }
 
-    _addProse(text, styleClass) {
-        if (!text.trim())
-            return;
-        const label = new St.Label({style_class: styleClass, text: text.trim()});
+    _markup(role, text) {
+        const attrs = ROLE_MARKUP[role] ?? ROLE_MARKUP.assistant;
+        return `<span ${attrs}>${GLib.markup_escape_text(text, -1)}</span>`;
+    }
+
+    // One selectable text actor holding a run of entries.
+    _addRun(markup) {
+        const label = new St.Label({style_class: 'voice-transcript-run'});
         label.x_expand = true;
+        label.reactive = true;      // or the pointer never reaches the text
+        label.can_focus = true;
         this._transcriptBox.add_child(label);
         this._wrap(label);
+        const ct = label.clutter_text;
+        ct.set_markup(markup);
+        ct.selectable = true;
+        ct.editable = false;
+        ct.cursor_visible = false;
+        this._runs.push(ct);
     }
 
     _addCode(code) {
@@ -522,13 +547,14 @@ class VoiceIndicator extends PanelMenu.Button {
     updateTranscript(turns) {
         this._lastTurns = turns;
         const shown = turns.slice(-TRANSCRIPT_SHOWN);
-        // Rebuilding on every poll would fight the user's scrolling, so only
-        // touch it when the content actually changed.
+        // Rebuilding on every poll would fight the user's scrolling and drop
+        // their selection, so only touch it when the content actually changed.
         const sig = shown.map(t => `${t.role}\u0000${t.at}\u0000${t.text.length}`).join('|');
         if (sig === this._transcriptSig)
             return;
         this._transcriptSig = sig;
         this._transcriptBox.destroy_all_children();
+        this._runs = [];
 
         if (!shown.length) {
             this._transcriptBox.add_child(new St.Label({
@@ -538,25 +564,36 @@ class VoiceIndicator extends PanelMenu.Button {
             return;
         }
 
+        // Entries accumulate into one run; a code block flushes the run and
+        // sits between runs as its own clickable row, so a selection crosses
+        // everything except a code block.
+        let pending = [];
+        const flush = () => {
+            if (pending.length)
+                this._addRun(pending.join('\n\n'));
+            pending = [];
+        };
         for (const turn of shown) {
-            const cls = ROLE_CLASS[turn.role] ?? 'voice-turn-assistant';
-            // A reply may contain fenced blocks. Those become their own
-            // clickable rows, because the assistant only says "code block"
-            // aloud and the text is no use unless you can get at it.
             if (turn.role === 'assistant' && turn.text.includes('```')) {
                 let last = 0;
                 CODE_FENCE.lastIndex = 0;
                 let m;
                 while ((m = CODE_FENCE.exec(turn.text)) !== null) {
-                    this._addProse(turn.text.slice(last, m.index), cls);
+                    const before = turn.text.slice(last, m.index).trim();
+                    if (before)
+                        pending.push(this._markup('assistant', before));
+                    flush();
                     this._addCode(m[1].trim());
                     last = m.index + m[0].length;
                 }
-                this._addProse(turn.text.slice(last), cls);
+                const after = turn.text.slice(last).trim();
+                if (after)
+                    pending.push(this._markup('assistant', after));
             } else {
-                this._addProse(turn.text, cls);
+                pending.push(this._markup(turn.role, turn.text));
             }
         }
+        flush();
 
         // Scroll to the newest, once the labels have been laid out.
         GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {

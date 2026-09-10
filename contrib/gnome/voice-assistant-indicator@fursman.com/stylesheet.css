@@ -49,6 +49,10 @@
 
 /* A fixed width is what the labels wrap against. Without it they size to
    their longest line and the menu runs off the screen. */
+/* Prose runs carry their colour and face as markup, so they share one width
+   rule. The per-role classes below are kept for the empty state and any
+   theme that wants to restyle a role. */
+.voice-transcript-run,
 .voice-turn-you,
 .voice-turn-assistant,
 .voice-turn-tool,

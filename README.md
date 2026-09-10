@@ -682,6 +682,13 @@ reasoning streams into the transcript at the same sentence boundaries the
 popup uses, in the tool lines' grey but the normal typeface, since it is prose.
 It interleaves with speech and tool calls in the order it happened.
 
+**You can select it with the mouse and Ctrl+C.** Consecutive entries are
+rendered into one text actor, with each role's colour and face carried as
+Pango markup rather than as separate labels. That is what makes a selection
+run across entries and across changes of font: a selection lives inside a
+single text object, so separate labels could never be selected together. A
+code block is the one thing that breaks a run, because it is a button.
+
 **Code blocks are rows you can click.** A fenced block cannot be spoken -- the
 speech layer says only "code block" -- so in the transcript it renders as a
 boxed, monospaced row that copies itself when clicked. It uses `St.Clipboard`,
