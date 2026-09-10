@@ -51,6 +51,7 @@ network in each mode.
 - [Speech recognition](#speech-recognition) · [End of turn](#end-of-turn) · [Speech synthesis](#speech-synthesis) · [Making text speakable](#making-text-speakable)
 - [Knowing that time passed](#knowing-that-time-passed) · [Web search](#web-search) · [Desktop](#desktop) · [Configuration](#configuration)
 - [Privacy](#privacy-and-what-leaves-the-machine) · [Power and GPU passthrough](#power-suspend-and-gpu-passthrough) · [Troubleshooting](#troubleshooting)
+- [Addendum: for the next reader, human or model](#addendum-for-the-next-reader-human-or-model)
 
 ## Quick start
 
@@ -100,7 +101,7 @@ picks per query.
 
 1. **SUPER** toggles voice mode. The status bar shows the state (a waybar module
    on Hyprland, a top-bar indicator on GNOME); chimes mark the edges.
-   **SUPER+M** swaps which model answers; **SUPER+SHIFT+V** starts a new
+   **SUPER+M** swaps which backend answers; **SUPER+SHIFT+V** starts a new
    conversation. You can also just type: `assistant <question>` joins the same
    conversation from a terminal.
 2. **Silero VAD** watches the mic. Speech has to persist for ~96 ms before a
@@ -115,6 +116,10 @@ picks per query.
 6. **Pocket TTS** synthesises the reply clause by clause and plays it through a
    single PipeWire stream, so speech starts as soon as the first few words exist
    and there are no gaps between sentences.
+7. **Everything lands in the top-bar transcript as it happens** — what you said,
+   the model's reasoning when it reasons, each tool call with the reason and the
+   exact command, and the reply clause by clause. Notifications only carry
+   status. Left click the robot to read along; right click for the controls.
 
 ## Features
 
@@ -140,8 +145,19 @@ picks per query.
 - **Audible turn-taking** — the same chime that arms voice mode plays again when
   the microphone goes live after a reply.
 - **Ask by voice or by keyboard**, in one conversation.
-- **Systemd user service**, a **status indicator**, and **desktop notifications**
-  for what it heard, what it is thinking and what it is doing.
+- **A live transcript in the top bar** — you, the model's thinking, every tool
+  call headed by its reason with the exact command beneath, and the reply as it
+  streams. Select across it with the mouse and Ctrl+C; click a code block to
+  copy it; one button copies the whole thing.
+- **Change the Claude model or effort out loud** — "switch to fable", "set the
+  effort to high". The session is resumed, so nothing said so far is lost.
+- **Knows when time passed** — after a long gap, a restart or a reboot, the
+  model is told so, and only then, so it stops describing last night's browser
+  windows as though they were still open.
+- **Systemd user service**, a **status indicator** whose header says what is
+  happening and which model is answering, and **desktop notifications** for
+  status only: tool calls, model changes, errors. They dismiss themselves; the
+  transcript is the record.
 
 ## Control
 
@@ -164,7 +180,9 @@ voice-llm logs                   # the model server's own log
 ```
 
 Say **"new conversation"** (or "start over", "forget everything", "fresh start")
-to clear the context by voice.
+to clear the context by voice. Say **"switch to fable"** (or opus, sonnet,
+haiku) or **"set the effort to extra high"** (low, medium, high, xhigh, max) to
+change what answers; see [Swapping models](#swapping-models).
 
 ### Asking from a terminal
 
@@ -608,14 +626,19 @@ GNOME shows **one banner at a time** and queues the rest, and it treats the two
 ways a notification ends very differently. One that times out stays in the
 message list. One the app closes is erased from it. Both measured here.
 
-That decides the design. Nothing is ever closed and no id is ever reused, so
-each notification gets its own banner and its own line in the list, and the
-whole turn is there to scroll back through afterwards.
+That decided the design twice. The first pass closed nothing and let
+everything expire, so the whole turn stayed in the message list. Then the
+transcript took over the conversation *and* the commands, and a popup repeating
+what the transcript already records became noise that GNOME never dismisses on
+its own. So now **every notification closes itself after a few seconds**
+(`VOICE_ASSISTANT_NOTIFY_TRANSIENT`), with one exception: errors, which nothing
+else records, stay until you dismiss them. The message list is not the history
+any more. The transcript is.
 
-GNOME is a poor display and a good log, so it is used as a log. **The
-conversation is not in the notifications at all** -- it lives in the indicator
-(see below). Notifications carry only status: tool calls, voice mode on and off,
-model swaps, errors.
+GNOME is a poor display, so it is used only for glances. **The conversation is
+not in the notifications at all** -- it lives in the indicator (see below).
+Notifications carry only status: tool calls, voice mode on and off, model
+changes, errors.
 
 Three findings forced that split, all measured on GNOME 50:
 
@@ -702,6 +725,7 @@ the Shell's own, which matters: a Wayland clipboard is served by the process tha
 set it, and anything the assistant spawns dies with the command, which is why an
 earlier attempt at copying from the assistant kept losing the selection. The
 Shell outlives everything.
+
 `setup.sh` installs and enables it; **GNOME on Wayland loads new extensions only
 at login**, so log out and back in once.
 
@@ -821,6 +845,7 @@ optional.
 |---|---|---|
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
 | `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` | ms a notification stays up. This is also the lag before the next one can show, so raising it puts the banner behind reality |
+| `VOICE_ASSISTANT_NOTIFY_TRANSIENT` | `4` | seconds before a status notification closes itself; errors never do |
 | `VOICE_ASSISTANT_TRANSCRIPT_TURNS` | `200` | entries kept in the transcript file; every tool call is one, so a tool-heavy turn must not evict the speech around it |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
 
@@ -904,6 +929,20 @@ across turns, because closing it froze the microphone.
 serving, loading, or failed, and `voice-llm logs` shows why. Loading from cold
 takes ~35 s, during which questions go to Claude if the fallback is on.
 
+**A menu item in the indicator does nothing.** The extension calls the installed
+`assistant` command, and if that copy is older than the checkout it rejects the
+flag and exits, silently. `./test_installation.py` names any installed copy that
+differs from the checkout and how to refresh it; the extension also logs what
+the command said to the journal (`journalctl --user -b -S -5min`).
+
+**I edited the extension and nothing changed.** JavaScript loads only at login.
+`gnome-extensions disable` then `enable` reloads the *stylesheet* only. Copy it
+into place with `./setup.sh --desktop`, then log out and back in.
+
+**The transcript shows no thinking.** Only models that reason first produce any:
+Fable, or the local model with `VOICE_ASSISTANT_LOCAL_THINK=1`. Opus at the
+default settings answers directly.
+
 **Everything is slow on battery.** Unrelated to this project, but worth knowing:
 power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 
@@ -937,6 +976,147 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 - [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) — alternative synthesis
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) — local model serving
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — alternative agent runtime
+
+## Addendum: for the next reader, human or model
+
+This is for whoever picks the project up cold: a person deciding whether to
+run it, or an assistant asked to change it. It is the shortest true account of
+what the thing does, and of the things that are not visible in the code.
+
+### What it is, in one breath
+
+A push-to-talk voice assistant for a Wayland desktop. Voice detection,
+streaming recognition, semantic end-of-turn and synthesis all run locally on
+the CPU. The thinking is Claude Code, or a local Qwen served by llama.cpp,
+either with full shell access. The conversation is shown live in a top-bar
+indicator; notifications are only for status. Nothing needs a GPU except the
+optional local model.
+
+### Where things are
+
+- **One program**, `voice_assistant.py`. `VoiceAssistant` owns the loop.
+  `ClaudeSession` and `DshSession` are the persistent backends. Every question,
+  spoken or typed, goes through `_query_and_speak`; `_run_turn` picks the
+  backend; `_finish_turn` ends the turn. `_notify` is status popups.
+  `_append_transcript` and `_stream_transcript` write the indicator's
+  transcript. `_set_status` publishes the status file. `set_claude_setting`
+  changes model or effort. `_control_command` is the socket protocol the
+  `assistant` command speaks.
+- **State**, in `~/.local/state/voice-assistant/`: `status` (phase, backend,
+  model, effort), `transcript.json` (the last 200 entries, roles `you`,
+  `assistant`, `thinking`, `tool`, `system`), `turn_context.json` (for the
+  time-gap marker), `session_id`, `voice-assistant.log`, `voice-assistant.pid`.
+  The control socket lives in `$XDG_RUNTIME_DIR`.
+- **Config**, in `~/.config/voice-assistant/`: `env` holds every
+  `VOICE_ASSISTANT_*` above, and the backend, model and effort are written back
+  into it when changed at runtime; `vocabulary.txt` holds names to repair.
+- **Copies.** The extension under `contrib/gnome/` is installed as a copy in
+  `~/.local/share/gnome-shell/extensions/`, and `assistant`, `voice-llm` and
+  `voice-assistant-ctl` as copies in `~/.local/bin`. The service itself runs the
+  checkout directly. Editing a copied file's source changes nothing until it is
+  copied again; `./test_installation.py` names any copy that has drifted.
+
+### What shows where
+
+| surface | shows |
+|---|---|
+| indicator header | `Listening · Claude · fable · xhigh`, plus copy, new conversation, on/off |
+| left click | the transcript, full height, selectable, code blocks clickable |
+| right click | toggle, new conversation, swap backend, Model and Effort submenus |
+| notifications | status only: tool calls, model changes, voice mode; all transient except errors |
+| status file | phase and backend for waybar; also model, effort and the valid choices |
+| `voice-assistant-ctl status` | service, process, phase, backend, Claude model and effort, session |
+| the `[context: …]` line | prepended to a user turn only after a long gap, a restart or a reboot |
+
+### Say it
+
+- **"new conversation"**, "start over", "forget everything", "fresh start".
+- **"switch to fable"** -- or opus, sonnet, haiku. Needs a switching verb and a
+  short sentence; "use fable to explain the encoder" is a request, not a switch.
+- **"set the effort to extra high"** -- or low, medium, high, max. Needs the
+  word effort, thinking or reasoning.
+- Tap the toggle key mid-reply to abort it.
+
+### Things the code will not tell you
+
+1. **If you are an assistant running inside this service**, restarting
+   `voice-assistant.service` kills the process that is answering, mid-sentence.
+   Either let the user do it, or schedule it detached with a delay so the spoken
+   reply finishes first: `nohup bash -c 'sleep 12; systemctl --user restart
+   voice-assistant.service' &`. The same pattern with `gnome-session-quit
+   --logout --no-prompt` logs the user out cleanly, and that restarts *both*
+   GNOME Shell and the assistant. A logout done by hand sometimes leaves the
+   assistant running, because the new session overlaps the old one.
+2. **Extension JavaScript loads only at login.** `gnome-extensions disable`
+   then `enable` reloads the stylesheet and nothing else.
+3. **`journalctl -S` silently rejects** the timestamp format `ps -o lstart=`
+   prints, and with stderr discarded an empty result looks exactly like "no
+   errors". Use `-S "-5min"` or `YYYY-MM-DD HH:MM:SS`. Extension `console.log`
+   lines appear in `journalctl --user -b` as `gnome-shell[pid]: …`.
+4. **`Meta` and `Clutter` cannot be introspected** from a plain `gjs` outside
+   the shell process; only GLib and Gio can. Pure functions can be lifted into a
+   temporary module and tested with `gjs -m` -- the selection highlight builder
+   was.
+5. **`timeout` on Ubuntu 26.04 is the uutils rewrite** and it crashed under us.
+   Do not wrap commands in it.
+6. **`sudo` logs its arguments** to `auth.log`. Never put a secret on a sudo
+   command line; pass it on stdin.
+7. **The `[context: …]` line** before a user turn is generated, not spoken. It
+   means "what you remember may be stale", not "greet the user about the time".
+8. **The recogniser hears the room.** Short fragments that make no sense --
+   "post mode on", "you're a little" -- are usually the user talking to someone
+   else. Ask; do not act on a guess. The user's surname arrives as "Fersman";
+   that is what `vocabulary.txt` is for.
+
+### Decisions, and the measurement behind each
+
+- **The conversation lives in the indicator, not in notifications.** GNOME
+  queues banners, ignores the expiry an app asks for, and the only way to clear
+  one early also deletes it from the history. No tuning satisfies "newest thing
+  visible" and "keep everything" at once; 5 s, 4 s, 2 s and 1 s each failed
+  from a different direction.
+- **Notifications are transient except errors.** Everything else is recorded
+  better elsewhere, and GNOME never dismisses them itself.
+- **`--replace-id` is never used.** It edits the tray entry in place and never
+  raises a banner again; once the first banner has gone the update is invisible.
+- **The transcript streams per clause**, and a change of role or a tool call
+  closes the entry, so thinking, speech and commands appear in the order they
+  happened rather than as a record afterwards.
+- **A tool entry is the popup's description over the verbatim command.** The
+  phrase glimpsed in a bubble is the line to scroll to.
+- **Code blocks are clickable rows, not auto-copied.** Auto-copy clobbered the
+  clipboard on every reply, and a Wayland selection dies with the process that
+  set it; the Shell's own clipboard outlives everything.
+- **Selection is driven from the capture phase and painted by us.** A press
+  reaches the text in capture but its own handler never fires, and ClutterText
+  paints a selection only while focused, which an open menu takes back. The
+  highlight is a background span in the markup the run is already rendered
+  with; copy slices the run's own character array.
+- **Model and effort changes keep the session id**, so `--resume` carries the
+  conversation across the switch. They are refused while an answer is in
+  flight, because replacing the process would cut it off.
+- **The time-gap marker fires only on a change.** A timestamp on every turn
+  gets echoed back as small talk.
+- **The transcript keeps 200 entries.** Every tool call is one, and at 40 a
+  tool-heavy turn evicted the speech it was serving.
+- **Pocket TTS is the default** because it stays faster than realtime on a
+  throttled laptop CPU (RTF 0.48 against Kokoro's 1.23, measured at ~1.4 GHz).
+- **This MacBook's hardware quirks** -- palm rejection, the lid, the sound card
+  -- live in [fursman/Ubuntu](https://github.com/fursman/Ubuntu) under
+  `macbook/`, not here.
+
+### How to check a change
+
+- `./test_installation.py`: 42 checks, including whether every installed copy
+  matches the checkout.
+- Python: bind the methods onto a stub object and call them against a temporary
+  `TRANSCRIPT_FILE`. To test chunking, feed `_flush_sentences` a reply in small
+  deltas, the way it actually arrives; testing `_prepare_for_speech` on a whole
+  reply passes while the real path fails.
+- JavaScript: lift pure functions into a temporary module and run `gjs -m`.
+  Anything touching St, Clutter or Meta needs a login and the journal.
+- When something silently does nothing, put one log line at the point of
+  decision and read the journal with a valid timestamp. Do not guess twice.
 
 ## License
 
