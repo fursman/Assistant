@@ -115,7 +115,19 @@ function readStatus() {
             // so this is an old or foreign file; treat it as unknown state.
         }
     }
-    return {state, backend, pid};
+    let model = null, effort = null, models = [], efforts = [];
+    if (text) {
+        try {
+            const d = JSON.parse(text);
+            model = d.model ?? null;
+            effort = d.effort ?? null;
+            models = Array.isArray(d.models) ? d.models : [];
+            efforts = Array.isArray(d.efforts) ? d.efforts : [];
+        } catch (e) {
+            // handled above
+        }
+    }
+    return {state, backend, pid, model, effort, models, efforts};
 }
 
 function readTranscript() {
@@ -210,9 +222,18 @@ class VoiceIndicator extends PanelMenu.Button {
         fresh.connect('activate', () => this._signal('USR2'));
         this.menu.addMenuItem(fresh);
 
-        const swap = new PopupMenu.PopupMenuItem('Swap model');
+        const swap = new PopupMenu.PopupMenuItem('Swap backend');
         swap.connect('activate', () => spawn([ASSISTANT_BIN, '--swap']));
         this.menu.addMenuItem(swap);
+
+        // Claude's model and effort. Only meaningful on the Claude backend, so
+        // both are hidden otherwise rather than offering a setting that would
+        // sit unused until you switched back.
+        this._modelMenu = new PopupMenu.PopupSubMenuMenuItem('Model');
+        this.menu.addMenuItem(this._modelMenu);
+        this._effortMenu = new PopupMenu.PopupSubMenuMenuItem('Effort');
+        this.menu.addMenuItem(this._effortMenu);
+        this._choiceSig = null;
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const start = new PopupMenu.PopupMenuItem('Start the assistant service');
@@ -322,6 +343,44 @@ class VoiceIndicator extends PanelMenu.Button {
             status.state === 'off' ? 'Turn voice mode on' : 'Turn voice mode off';
         this._toggleItem.sensitive = status.state !== 'down';
         this._startItem.visible = status.state === 'down';
+        this._updateChoices(status);
+    }
+
+    // Rebuilt only when the list of options changes; otherwise just the tick
+    // moves, so opening a submenu does not fight a rebuild underneath it.
+    _updateChoices(status) {
+        const onClaude = status.backend === 'claude';
+        this._modelMenu.visible = onClaude && status.models.length > 0;
+        this._effortMenu.visible = onClaude && status.efforts.length > 0;
+        if (!onClaude)
+            return;
+
+        const sig = `${status.models.join(',')}|${status.efforts.join(',')}`;
+        if (sig !== this._choiceSig) {
+            this._choiceSig = sig;
+            this._modelItems = this._fillChoices(this._modelMenu, status.models, '--model');
+            this._effortItems = this._fillChoices(this._effortMenu, status.efforts, '--effort');
+        }
+        this._modelMenu.label.text = `Model: ${status.model ?? '?'}`;
+        this._effortMenu.label.text = `Effort: ${status.effort ?? '?'}`;
+        for (const [name, item] of this._modelItems ?? [])
+            item.setOrnament(name === status.model
+                ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+        for (const [name, item] of this._effortItems ?? [])
+            item.setOrnament(name === status.effort
+                ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+    }
+
+    _fillChoices(submenu, names, flag) {
+        submenu.menu.removeAll();
+        const items = [];
+        for (const name of names) {
+            const item = new PopupMenu.PopupMenuItem(name);
+            item.connect('activate', () => spawn([ASSISTANT_BIN, flag, name]));
+            submenu.menu.addMenuItem(item);
+            items.push([name, item]);
+        }
+        return items;
     }
 
     // Sized against the monitor rather than a fixed number of pixels, so it

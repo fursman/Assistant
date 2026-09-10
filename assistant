@@ -5,6 +5,8 @@
     assistant "remind me what we decided about the tomatoes"
     assistant --swap                 # local -> DeepSeek Harness -> Claude, with a notification
     assistant --backend local        # or dsh, claude, auto
+    assistant --model fable          # or opus, sonnet, haiku
+    assistant --effort xhigh         # or low, medium, high, max
     assistant --status
     assistant --new                  # start a fresh conversation
 
@@ -80,6 +82,10 @@ def main():
     p.add_argument("--speak", action="store_true", help="read the answer aloud too")
     p.add_argument("--swap", action="store_true",
                    help="cycle local model -> DeepSeek Harness -> Claude")
+    p.add_argument("--model", choices=("opus", "sonnet", "haiku", "fable"),
+                   help="Claude model to use from here on")
+    p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                   help="Claude effort level to use from here on")
     p.add_argument("--backend", choices=("local", "dsh", "claude", "auto"),
                    help="select a backend explicitly (dsh = DeepSeek Harness on the local model)")
     p.add_argument("--status", action="store_true", help="show what is running")
@@ -87,7 +93,9 @@ def main():
     p.add_argument("--json", action="store_true", help="print the raw reply")
     args = p.parse_args()
 
-    if args.swap or args.backend:
+    if args.model or args.effort:
+        r = request({"cmd": "claude", "model": args.model, "effort": args.effort})
+    elif args.swap or args.backend:
         r = request({"cmd": "backend", "value": args.backend or "toggle"})
     elif args.status:
         r = request({"cmd": "status"})

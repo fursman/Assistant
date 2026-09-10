@@ -192,7 +192,16 @@ which one you landed on. The same thing from a terminal:
 ```bash
 assistant --swap                 # local -> dsh -> Claude -> local
 assistant --backend local        # or dsh, claude, auto
+assistant --model fable          # or opus, sonnet, haiku
+assistant --effort xhigh         # or low, medium, high, max
 ```
+
+**Claude's model and effort change the same way**, by voice ("switch to fable",
+"set the effort to extra high"), from the indicator's Model and Effort submenus
+with the current one ticked, or with the flags above. Both are handed to the CLI
+at spawn, so the persistent process is replaced when either changes -- but its
+session id is kept and passed to `--resume`, so the new model picks the
+conversation up where the old one left off. Switching mid-thought costs nothing.
 
 The choice is written to `~/.config/voice-assistant/env`, so it survives a
 restart and `voice-llm status` agrees with it. Switching *to* the local model
@@ -695,7 +704,8 @@ optional.
 | `VOICE_ASSISTANT_LOCAL_HARNESS` | `native` | what `auto` uses for the local model: `native` or `dsh` |
 | `VOICE_ASSISTANT_LLM_FALLBACK` | `1` | answer with Claude while the local model is down |
 | `VOICE_ASSISTANT_LOCAL_MIN_VRAM_MIB` | `15000` | VRAM needed to pick the local model |
-| `VOICE_ASSISTANT_MODEL` / `_EFFORT` | `opus` / `max` | Claude model and effort |
+| `VOICE_ASSISTANT_MODEL` | `opus` | `opus`, `sonnet`, `haiku` or `fable`; changeable at runtime |
+| `VOICE_ASSISTANT_EFFORT` | `max` | `low`, `medium`, `high`, `xhigh` or `max`; changeable at runtime |
 | `VOICE_ASSISTANT_CLAUDE_PERSISTENT` | `1` | keep one `claude` process alive across turns |
 | `VOICE_ASSISTANT_CLI_TIMEOUT` | | seconds a `claude` turn may take |
 | `VOICE_ASSISTANT_CONTEXT_MARKERS` | `1` | tell the model when time passed or the machine restarted |

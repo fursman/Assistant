@@ -3427,6 +3427,12 @@ class VoiceAssistant:
             "text": symbols.get(state, ""),
             "class": [state, backend or self.backend],
             "tooltip": f"Voice Assistant — {state} ({backend or self.backend})",
+            # Extra keys for the indicator's model menu. waybar ignores what it
+            # does not know, so this stays a valid custom-module payload.
+            "model": CLAUDE_MODEL,
+            "effort": CLAUDE_EFFORT,
+            "models": list(CLAUDE_MODELS),
+            "efforts": list(CLAUDE_EFFORTS),
         }
         try:
             tmp = status_file.with_suffix(".tmp")
@@ -4248,6 +4254,7 @@ class VoiceAssistant:
         self.logger.info(f"Claude settings: {note} "
                          f"(model={CLAUDE_MODEL}, effort={CLAUDE_EFFORT})")
         self._append_transcript("system", f"Claude: {note}")
+        self._set_status(self._status_state)      # republish so the menu agrees
         self._notify(f"🎚 Claude {note}", title="Assistant model", transient=True,
                      timeout_ms=3000, slot="backend")
         return result
@@ -5133,6 +5140,8 @@ class VoiceAssistant:
                     "session": self._session_id}
         if cmd == "backend":
             return self._switch_backend(str(req.get("value", "toggle")))
+        if cmd == "claude":
+            return self.set_claude_setting(req.get("model"), req.get("effort"))
         if cmd == "new_session":
             self._new_session()
             return {"ok": True, "message": "started a new conversation"}
