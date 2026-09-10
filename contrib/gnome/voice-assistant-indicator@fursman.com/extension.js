@@ -35,8 +35,6 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import Pango from 'gi://Pango';
-import Meta from 'gi://Meta';
-import Cogl from 'gi://Cogl';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -63,6 +61,45 @@ const ROLE_MARKUP = {
     thinking:  'foreground="#9a9996" style="italic" size="smaller"',
     system:    'foreground="#f9f06b" style="italic" size="smaller"',
 };
+
+// A run is a list of {role, text} segments joined by a blank line. Its plain
+// text is what pointer offsets index into, in characters, not JS code units:
+// an emoji is one character to the text layout and two to a JS string.
+function runPlainChars(segments) {
+    return Array.from(segments.map(s => s.text).join('\n\n'));
+}
+
+// Markup for a run with [a, b) highlighted. The highlight is drawn by us, as
+// a background span, because ClutterText only paints its own selection while
+// it holds key focus and an open menu takes that focus straight back -- the
+// selection was real and copyable but never visible. a == b, or -1, means no
+// highlight.
+function runMarkup(segments, a = -1, b = -1) {
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const esc = s => GLib.markup_escape_text(s, -1);
+    const parts = [];
+    let offset = 0;
+    segments.forEach((seg, i) => {
+        if (i > 0)
+            offset += 2;                      // the "\n\n" between segments
+        const chars = Array.from(seg.text);
+        const attrs = ROLE_MARKUP[seg.role] ?? ROLE_MARKUP.assistant;
+        const s = Math.max(lo - offset, 0);
+        const e = Math.min(hi - offset, chars.length);
+        let inner;
+        if (lo >= 0 && e > s) {
+            inner = esc(chars.slice(0, s).join('')) +
+                `<span background="#62a0ea" foreground="#ffffff">` +
+                esc(chars.slice(s, e).join('')) + '</span>' +
+                esc(chars.slice(e).join(''));
+        } else {
+            inner = esc(seg.text);
+        }
+        parts.push(`<span ${attrs}>${inner}</span>`);
+        offset += chars.length;
+    });
+    return parts.join('\n\n');
+}
 const ASSISTANT_BIN = GLib.build_filenamev([HOME, '.local', 'bin', 'assistant']);
 const POLL_SECONDS = 5;
 
@@ -81,24 +118,6 @@ const BACKEND_LABEL = {
     local: 'Local Qwen3.8',
     dsh: 'DeepSeek Harness · Qwen3.8',
 };
-
-// Clutter.Color became Cogl.Color in GNOME 47. Try both, and give up quietly
-// rather than let a colour take the whole extension down.
-function color(str) {
-    for (const make of [
-        () => { const [ok, c] = Cogl.Color.from_string(str); return ok ? c : null; },
-        () => Cogl.Color.from_string(str),
-        () => { const [ok, c] = Clutter.Color.from_string(str); return ok ? c : null; },
-    ]) {
-        try {
-            const c = make();
-            if (c) return c;
-        } catch (e) {
-            // next
-        }
-    }
-    return null;
-}
 
 function readFile(path) {
     try {
@@ -275,6 +294,32 @@ class VoiceIndicator extends PanelMenu.Button {
         });
         transcriptItem.add_child(this._transcriptScroll);
         this.menu.addMenuItem(transcriptItem);
+        // Motion and release for a selection in progress, on the scroll view
+        // rather than the text so a drag that drifts off the run keeps
+        // extending it; the pointer is mapped back into the run's own space.
+        // Returning STOP for these also keeps them from becoming a scroll-pan.
+        this._selRun = null;
+        this._transcriptScroll.connect('captured-event', (_a, ev) => {
+            if (!this._selRun)
+                return Clutter.EVENT_PROPAGATE;
+            const type = ev.type();
+            try {
+                if (type === Clutter.EventType.MOTION) {
+                    const pos = this._posAt(this._selRun, ev);
+                    if (pos >= 0 && pos !== this._selRun._cur)
+                        this._select(this._selRun, this._selRun._anchor, pos);
+                    return Clutter.EVENT_STOP;
+                }
+                if (type === Clutter.EventType.BUTTON_RELEASE) {
+                    this._selRun = null;      // the selection stays; the drag ends
+                    return Clutter.EVENT_STOP;
+                }
+            } catch (e) {
+                logError(e, 'voice-assistant-indicator: selection drag');
+                this._selRun = null;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
         this._transcriptItem = transcriptItem;
         this._transcriptSig = null;
         this._lastTurns = [];
@@ -514,44 +559,83 @@ class VoiceIndicator extends PanelMenu.Button {
         ct.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
     }
 
-    _markup(role, text) {
-        const attrs = ROLE_MARKUP[role] ?? ROLE_MARKUP.assistant;
-        return `<span ${attrs}>${GLib.markup_escape_text(text, -1)}</span>`;
-    }
 
-    // One selectable text actor holding a run of entries.
-    _addRun(markup) {
+    // One text actor holding a run of entries, with its own selection.
+    _addRun(segments) {
         const label = new St.Label({style_class: 'voice-transcript-run'});
         label.x_expand = true;
+        label.reactive = true;
         this._transcriptBox.add_child(label);
         this._wrap(label);
         const ct = label.clutter_text;
-        ct.set_markup(markup);
-        // The ClutterText inside the label is what selects, so IT has to be
-        // reactive; making the label reactive was not enough and the pointer
-        // never reached it. Focusable so a press can grab key focus.
-        ct.reactive = true;
-        ct.can_focus = true;
-        ct.selectable = true;
+        ct.reactive = true;             // it must be picked, or capture never reaches it
         ct.editable = false;
         ct.cursor_visible = false;
-        // The default selection colour is invisible on the dark menu.
-        const bg = color('#62a0ea'), fg = color('#ffffff');
-        if (bg) ct.selection_color = bg;
-        if (fg) ct.selected_text_color = fg;
-        // An I-beam over selectable text, so it reads as selectable.
-        ct.connect('enter-event', () => {
-            try { global.display.set_cursor(Meta.Cursor.TEXT ?? Meta.Cursor.IBEAM); } catch (e) {}
-            return Clutter.EVENT_PROPAGATE;
-        });
-        ct.connect('leave-event', () => {
-            try { global.display.set_cursor(Meta.Cursor.DEFAULT); } catch (e) {}
-            return Clutter.EVENT_PROPAGATE;
+        ct._segments = segments;
+        ct._chars = runPlainChars(segments);
+        ct._anchor = -1;
+        ct._cur = -1;
+        ct.set_markup(runMarkup(segments));
+        // Selection is driven from the capture phase, deliberately. Measured:
+        // a press descends through the menu and the scroll view and reaches
+        // this text in capture, but the text's own bubble-phase handler never
+        // fires -- something above claims the sequence after it arrives, so
+        // ClutterText's built-in drag-select never starts. Capture provably
+        // arrives, so: press anchors here, motion and release are handled on
+        // the scroll view (a drag drifts), and the toolkit is not relied on
+        // for either the selection or its painting.
+        ct.connect('captured-event', (_a, ev) => {
+            if (ev.type() !== Clutter.EventType.BUTTON_PRESS || ev.get_button() !== 1)
+                return Clutter.EVENT_PROPAGATE;
+            try {
+                const pos = this._posAt(ct, ev);
+                if (pos < 0)
+                    return Clutter.EVENT_PROPAGATE;
+                for (const other of this._runs)
+                    if (other !== ct)
+                        this._select(other, -1, -1);
+                this._select(ct, pos, pos);
+                this._selRun = ct;
+                return Clutter.EVENT_STOP;
+            } catch (e) {
+                logError(e, 'voice-assistant-indicator: selection start');
+                return Clutter.EVENT_PROPAGATE;
+            }
         });
         // A focused ClutterText sees keys before the menu does and may not
         // pass them on, so Ctrl+C is handled here as well as on the menu.
         ct.connect('key-press-event', (_a, event) => this._maybeCopy(event));
         this._runs.push(ct);
+    }
+
+    _select(ct, anchor, cur) {
+        ct._anchor = anchor;
+        ct._cur = cur;
+        ct.set_markup(runMarkup(ct._segments, anchor, cur));
+    }
+
+    _selectedText(ct) {
+        if (ct._anchor < 0 || ct._cur === ct._anchor)
+            return '';
+        const lo = Math.min(ct._anchor, ct._cur), hi = Math.max(ct._anchor, ct._cur);
+        return ct._chars.slice(lo, hi).join('');
+    }
+
+    // Character offset under the pointer within `ct`, or -1 if outside it.
+    _posAt(ct, ev) {
+        const [sx, sy] = ev.get_coords();
+        // transform_stage_point returns [ok, x, y] in most GJS versions but
+        // some bindings drop the boolean; the wrong destructure maps every
+        // point to "outside" and nothing ever selects.
+        const r = ct.transform_stage_point(sx, sy);
+        let ok, x, y;
+        if (Array.isArray(r) && r.length === 3)
+            [ok, x, y] = r;
+        else if (Array.isArray(r) && r.length === 2)
+            [ok, [x, y]] = [true, r];
+        else
+            return -1;
+        return ok ? ct.coords_to_position(x, y) : -1;
     }
 
     _maybeCopy(event) {
@@ -560,7 +644,7 @@ class VoiceIndicator extends PanelMenu.Button {
             !(event.get_state() & Clutter.ModifierType.CONTROL_MASK))
             return Clutter.EVENT_PROPAGATE;
         for (const ct of this._runs ?? []) {
-            const sel = ct.get_selection();
+            const sel = this._selectedText(ct);
             if (sel) {
                 St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, sel);
                 return Clutter.EVENT_STOP;
@@ -616,7 +700,7 @@ class VoiceIndicator extends PanelMenu.Button {
         let pending = [];
         const flush = () => {
             if (pending.length)
-                this._addRun(pending.join('\n\n'));
+                this._addRun(pending);
             pending = [];
         };
         for (const turn of shown) {
@@ -627,16 +711,16 @@ class VoiceIndicator extends PanelMenu.Button {
                 while ((m = CODE_FENCE.exec(turn.text)) !== null) {
                     const before = turn.text.slice(last, m.index).trim();
                     if (before)
-                        pending.push(this._markup('assistant', before));
+                        pending.push({role: 'assistant', text: before});
                     flush();
                     this._addCode(m[1].trim());
                     last = m.index + m[0].length;
                 }
                 const after = turn.text.slice(last).trim();
                 if (after)
-                    pending.push(this._markup('assistant', after));
+                    pending.push({role: 'assistant', text: after});
             } else {
-                pending.push(this._markup(turn.role, turn.text));
+                pending.push({role: turn.role, text: turn.text});
             }
         }
         flush();
