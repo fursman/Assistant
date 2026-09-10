@@ -146,9 +146,25 @@ function readTranscript() {
 }
 
 function spawn(argv) {
+    // Output is captured rather than silenced. Silencing it hid a real bug for
+    // a while: the installed `assistant` was older than the extension and
+    // rejected --model, so clicking a menu item printed a usage error into the
+    // void and looked like nothing happening at all.
     try {
-        Gio.Subprocess.new(argv,
-            Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE);
+        const proc = Gio.Subprocess.new(argv,
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        proc.communicate_utf8_async(null, null, (p, res) => {
+            try {
+                const [, out, err] = p.communicate_utf8_finish(res);
+                if (!p.get_successful()) {
+                    const why = (err || out || '').trim().split('\n')[0];
+                    logError(new Error(`${argv.join(' ')}: ${why}`),
+                        'voice-assistant-indicator');
+                }
+            } catch (e) {
+                logError(e, 'voice-assistant-indicator');
+            }
+        });
     } catch (e) {
         logError(e, `voice-assistant-indicator: ${argv.join(' ')} failed`);
     }
