@@ -231,7 +231,10 @@ class VoiceIndicator extends PanelMenu.Button {
         this.menu.actor.connect('key-press-event', (_a, event) => {
             const sym = event.get_key_symbol();
             const mods = event.get_state();
-            const superHeld = (mods & Clutter.ModifierType.SUPER_MASK) !== 0;
+            // Super arrives as MOD4_MASK in practice; SUPER_MASK is often
+            // simply unset, which is why only the Alt-first order worked.
+            const superHeld = (mods & (Clutter.ModifierType.SUPER_MASK |
+                                       Clutter.ModifierType.MOD4_MASK)) !== 0;
             const altHeld = (mods & Clutter.ModifierType.MOD1_MASK) !== 0;
             const isAlt = sym === Clutter.KEY_Alt_L || sym === Clutter.KEY_Alt_R;
             const isSuper = sym === Clutter.KEY_Super_L || sym === Clutter.KEY_Super_R;
