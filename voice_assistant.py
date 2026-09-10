@@ -3355,23 +3355,24 @@ class VoiceAssistant:
         self._transcript_open = False
         self._write_transcript(turns)
 
-    def _stream_transcript(self, text):
-        """Extend the reply being written, or start one.
+    def _stream_transcript(self, text, role="assistant"):
+        """Extend the entry being written for `role`, or start one.
 
         Called per finished clause rather than once at the end of the turn, so
         the indicator reads along as the answer arrives instead of receiving a
-        record of it afterwards. A tool call closes the entry, so a turn shows
-        as text, the tool that interrupted it, then more text.
+        record of it afterwards. A change of role or a tool call closes the
+        entry, so a turn shows as thinking, then text, then the tool that
+        interrupted it, then more text -- in the order it happened.
         """
         text = (text or "").strip()
         if not text:
             return
         turns = self._read_transcript()
-        if self._transcript_open and turns and turns[-1].get("role") == "assistant":
+        if self._transcript_open and turns and turns[-1].get("role") == role:
             turns[-1]["text"] = f"{turns[-1]['text']} {text}"[:4000]
             turns[-1]["at"] = time.time()
         else:
-            turns.append({"role": "assistant", "text": text[:4000], "at": time.time()})
+            turns.append({"role": role, "text": text[:4000], "at": time.time()})
             self._transcript_open = True
         self._write_transcript(turns)
 
@@ -3483,6 +3484,11 @@ class VoiceAssistant:
             if len(to_send) >= 20:
                 self._last_thinking_notify = now
                 self._thinking_shown_len = prev_len + last_boundary
+                # Thinking goes into the transcript too, at the same sentence
+                # boundaries the popup uses; the popup is a glance, this is the
+                # record. Only thinking models produce any, so on the others
+                # this never fires.
+                self._stream_transcript(to_send, role="thinking")
                 self._notify(f"🧠 {to_send}", title="Thinking...", transient=True,
                              slot="progress")
 
@@ -4734,6 +4740,7 @@ class VoiceAssistant:
         if self._thinking_text:
             remaining = self._thinking_text[self._thinking_shown_len:].strip()
             if remaining:
+                self._stream_transcript(remaining, role="thinking")
                 self._notify(f"🧠 {remaining}", title="Thinking...", transient=True,
                              silent=True, slot="progress")
 

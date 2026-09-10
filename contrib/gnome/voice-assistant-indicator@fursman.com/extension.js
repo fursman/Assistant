@@ -57,6 +57,7 @@ const ROLE_CLASS = {
     assistant: 'voice-turn-assistant',
     tool: 'voice-turn-tool',
     system: 'voice-turn-system',
+    thinking: 'voice-turn-thinking',
 };
 const ASSISTANT_BIN = GLib.build_filenamev([HOME, '.local', 'bin', 'assistant']);
 const POLL_SECONDS = 5;

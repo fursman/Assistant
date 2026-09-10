@@ -673,6 +673,11 @@ scrolling. This is a surface the project owns, which is the whole point: no
 queue, no expiry policy, no history semantics to work around, so it can simply
 show the newest thing.
 
+**Thinking is in there too.** When the model is one that reasons first, its
+reasoning streams into the transcript at the same sentence boundaries the
+popup uses, in the tool lines' grey but the normal typeface, since it is prose.
+It interleaves with speech and tool calls in the order it happened.
+
 **Code blocks are rows you can click.** A fenced block cannot be spoken -- the
 speech layer says only "code block" -- so in the transcript it renders as a
 boxed, monospaced row that copies itself when clicked. It uses `St.Clipboard`,

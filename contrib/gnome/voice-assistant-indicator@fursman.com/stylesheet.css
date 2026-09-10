@@ -52,6 +52,7 @@
 .voice-turn-you,
 .voice-turn-assistant,
 .voice-turn-tool,
+.voice-turn-thinking,
 .voice-turn-empty {
     width: 380px;
 }
@@ -109,6 +110,15 @@
 .voice-turn-system {
     width: 380px;
     color: #f9f06b;
+    font-size: 0.85em;
+    font-style: italic;
+}
+
+/* The model's reasoning, when it is a model that reasons. Same grey as the tool
+   lines, since it is context rather than the answer, but in the normal face:
+   it is prose, not a command. */
+.voice-turn-thinking {
+    color: #9a9996;
     font-size: 0.85em;
     font-style: italic;
 }
