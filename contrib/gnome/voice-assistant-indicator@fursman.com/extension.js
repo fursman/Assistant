@@ -35,6 +35,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import Pango from 'gi://Pango';
+import Meta from 'gi://Meta';
+import Cogl from 'gi://Cogl';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -79,6 +81,24 @@ const BACKEND_LABEL = {
     local: 'Local Qwen3.8',
     dsh: 'DeepSeek Harness · Qwen3.8',
 };
+
+// Clutter.Color became Cogl.Color in GNOME 47. Try both, and give up quietly
+// rather than let a colour take the whole extension down.
+function color(str) {
+    for (const make of [
+        () => { const [ok, c] = Cogl.Color.from_string(str); return ok ? c : null; },
+        () => Cogl.Color.from_string(str),
+        () => { const [ok, c] = Clutter.Color.from_string(str); return ok ? c : null; },
+    ]) {
+        try {
+            const c = make();
+            if (c) return c;
+        } catch (e) {
+            // next
+        }
+    }
+    return null;
+}
 
 function readFile(path) {
     try {
@@ -304,18 +324,10 @@ class VoiceIndicator extends PanelMenu.Button {
         this.menu.actor.connect('key-press-event', (_a, event) => {
             const sym = event.get_key_symbol();
             const mods = event.get_state();
-            // Ctrl+C on a mouse selection. The menu holds the grab, so this is
-            // the only place the key can be seen.
-            if ((sym === Clutter.KEY_c || sym === Clutter.KEY_C) &&
-                (mods & Clutter.ModifierType.CONTROL_MASK)) {
-                for (const ct of this._runs ?? []) {
-                    const sel = ct.get_selection();
-                    if (sel) {
-                        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, sel);
-                        return Clutter.EVENT_STOP;
-                    }
-                }
-            }
+            // Ctrl+C on a mouse selection, for when the key reaches the menu
+            // rather than the focused text.
+            if (this._maybeCopy(event) === Clutter.EVENT_STOP)
+                return Clutter.EVENT_STOP;
             // Super arrives as MOD4_MASK in practice; SUPER_MASK is often
             // simply unset, which is why only the Alt-first order worked.
             const superHeld = (mods & (Clutter.ModifierType.SUPER_MASK |
@@ -511,16 +523,50 @@ class VoiceIndicator extends PanelMenu.Button {
     _addRun(markup) {
         const label = new St.Label({style_class: 'voice-transcript-run'});
         label.x_expand = true;
-        label.reactive = true;      // or the pointer never reaches the text
-        label.can_focus = true;
         this._transcriptBox.add_child(label);
         this._wrap(label);
         const ct = label.clutter_text;
         ct.set_markup(markup);
+        // The ClutterText inside the label is what selects, so IT has to be
+        // reactive; making the label reactive was not enough and the pointer
+        // never reached it. Focusable so a press can grab key focus.
+        ct.reactive = true;
+        ct.can_focus = true;
         ct.selectable = true;
         ct.editable = false;
         ct.cursor_visible = false;
+        // The default selection colour is invisible on the dark menu.
+        const bg = color('#62a0ea'), fg = color('#ffffff');
+        if (bg) ct.selection_color = bg;
+        if (fg) ct.selected_text_color = fg;
+        // An I-beam over selectable text, so it reads as selectable.
+        ct.connect('enter-event', () => {
+            try { global.display.set_cursor(Meta.Cursor.TEXT ?? Meta.Cursor.IBEAM); } catch (e) {}
+            return Clutter.EVENT_PROPAGATE;
+        });
+        ct.connect('leave-event', () => {
+            try { global.display.set_cursor(Meta.Cursor.DEFAULT); } catch (e) {}
+            return Clutter.EVENT_PROPAGATE;
+        });
+        // A focused ClutterText sees keys before the menu does and may not
+        // pass them on, so Ctrl+C is handled here as well as on the menu.
+        ct.connect('key-press-event', (_a, event) => this._maybeCopy(event));
         this._runs.push(ct);
+    }
+
+    _maybeCopy(event) {
+        const sym = event.get_key_symbol();
+        if ((sym !== Clutter.KEY_c && sym !== Clutter.KEY_C) ||
+            !(event.get_state() & Clutter.ModifierType.CONTROL_MASK))
+            return Clutter.EVENT_PROPAGATE;
+        for (const ct of this._runs ?? []) {
+            const sel = ct.get_selection();
+            if (sel) {
+                St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, sel);
+                return Clutter.EVENT_STOP;
+            }
+        }
+        return Clutter.EVENT_PROPAGATE;
     }
 
     _addCode(code) {
