@@ -103,3 +103,12 @@
 .voice-turn-code:hover {
     background-color: rgba(255, 255, 255, 0.14);
 }
+
+/* A change in the machinery rather than the conversation: which model answered,
+   a fallback. Set apart from both speech and commands. */
+.voice-turn-system {
+    width: 380px;
+    color: #f9f06b;
+    font-size: 0.85em;
+    font-style: italic;
+}

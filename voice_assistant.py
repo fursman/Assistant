@@ -271,6 +271,9 @@ LOCAL_LLM_MIN_VRAM_MIB = int(os.getenv("VOICE_ASSISTANT_LOCAL_MIN_VRAM_MIB", "15
 LLM_FALLBACK = os.getenv("VOICE_ASSISTANT_LLM_FALLBACK", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 
+# Aliases the CLI accepts; it resolves each to the latest of that family.
+CLAUDE_MODELS = ("opus", "sonnet", "haiku", "fable")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_MODEL = os.getenv("VOICE_ASSISTANT_MODEL", "opus")
 # Valid: low, medium, high, xhigh, max. Measured: effort makes no difference to
 # latency on easy questions (adaptive thinking), so the deepest setting is
@@ -1229,6 +1232,39 @@ def _start_user_unit(unit: str) -> bool:
         return True
     except Exception:
         return False
+
+
+_EFFORT_WORDS = {"low": "low", "medium": "medium", "high": "high",
+                 "x high": "xhigh", "extra high": "xhigh", "xhigh": "xhigh",
+                 "max": "max", "maximum": "max"}
+
+
+def _parse_claude_request(text: str):
+    """Pull a model and/or an effort level out of a spoken command.
+
+    Deliberately narrow. It only fires on a sentence that is asking for a
+    change, so "opus is good at this sort of thing" is discussion, not an
+    instruction. Returns (model, effort); either may be None.
+    """
+    s = _normalize_command(text)
+    # A command, not a sentence that happens to mention a model. Anything long
+    # is discussion: "use fable to explain how the encoder works" is a request
+    # for an explanation, not for a model change.
+    if len(s.split()) > 10:
+        return None, None
+    if not re.search(r"\b(switch|change|swap|set|use|put|go)\b", s):
+        return None, None
+    model = None
+    m = re.search(r"\b(opus|sonnet|haiku|fable)\b", s)
+    if m:
+        model = m.group(1)
+    effort = None
+    if re.search(r"\b(effort|thinking|reasoning)\b", s):
+        words = "|".join(sorted(_EFFORT_WORDS, key=len, reverse=True))
+        e = re.search(rf"\b({words})\b", s)
+        if e:
+            effort = _EFFORT_WORDS[e.group(1)]
+    return model, effort
 
 
 def _write_env_setting(key: str, value: str):
@@ -4174,6 +4210,48 @@ class VoiceAssistant:
         if self.is_active and not self.is_processing:
             threading.Thread(target=self._say, args=(text,), daemon=True).start()
 
+    def set_claude_setting(self, model=None, effort=None) -> dict:
+        """Change the Claude model or effort level, mid-conversation.
+
+        Both are handed to the CLI at spawn, so the persistent process has to be
+        replaced for a change to take. Its session id is kept and passed back to
+        `--resume`, so switching model costs nothing in context: the new one
+        picks up the conversation where the old one left off.
+        """
+        global CLAUDE_MODEL, CLAUDE_EFFORT
+        changed = []
+        if model:
+            model = model.strip().lower()
+            if model not in CLAUDE_MODELS:
+                return {"ok": False, "error": f"unknown model {model!r}"}
+            if model != CLAUDE_MODEL:
+                CLAUDE_MODEL = model
+                _write_env_setting("VOICE_ASSISTANT_MODEL", model)
+                changed.append(model)
+        if effort:
+            effort = effort.strip().lower()
+            if effort not in CLAUDE_EFFORTS:
+                return {"ok": False, "error": f"unknown effort {effort!r}"}
+            if effort != CLAUDE_EFFORT:
+                CLAUDE_EFFORT = effort
+                _write_env_setting("VOICE_ASSISTANT_EFFORT", effort)
+                changed.append(f"{effort} effort")
+        result = {"ok": True, "changed": changed,
+                  "model": CLAUDE_MODEL, "effort": CLAUDE_EFFORT}
+        if not changed:
+            return result
+        if self._claude is not None and self._claude.alive:
+            sid = self._claude.session_id
+            self._claude.stop()
+            self._claude.start(sid)
+        note = " and ".join(changed)
+        self.logger.info(f"Claude settings: {note} "
+                         f"(model={CLAUDE_MODEL}, effort={CLAUDE_EFFORT})")
+        self._append_transcript("system", f"Claude: {note}")
+        self._notify(f"🎚 Claude {note}", title="Assistant model", transient=True,
+                     timeout_ms=3000, slot="backend")
+        return result
+
     def _ensure_claude_session(self) -> bool:
         if not CLAUDE_PERSISTENT:
             return False
@@ -4403,6 +4481,11 @@ class VoiceAssistant:
                 threading.Thread(target=self._ensure_dsh_session, daemon=True).start()
         label = self.BACKEND_LABEL.get(self.backend, self.backend)
         self.logger.info(f"Backend switched to {self.backend} ({why}){note}")
+        # Into the transcript as well. The popup is transient, and a swap is
+        # the one status event the transcript cannot infer: if a later reply
+        # reads oddly, knowing the model changed just before it is exactly the
+        # context you want.
+        self._append_transcript("system", f"Model: {label}{note}")
         self._notify(f"🔀 {label}{note}", title="Assistant model", transient=True,
                      timeout_ms=3000, slot="backend")
         self._set_status("ready" if self.is_active else "off")
@@ -4415,6 +4498,7 @@ class VoiceAssistant:
                  "failed": "failed mid-answer"}.get(why, str(why))
         self.logger.warning(f"Local LLM {why} — this query goes to claude")
         self._play_chime_async("fallback")
+        self._append_transcript("system", f"Local model {label} — this turn went to Claude")
         self._notify(f"☁️ Local model {label} — asking Claude", transient=True,
                      slot="progress")
         self._set_status("thinking", backend="claude")
@@ -5204,6 +5288,25 @@ class VoiceAssistant:
                              timeout_ms=4000, transient=True)
                 await loop.run_in_executor(None, self._say, "Starting a new conversation.")
                 spoke = True     # so the "your turn" chime plays on the way out
+                return
+
+            # "switch to fable", "set the effort to high". Handled before the
+            # query goes anywhere, since it changes who answers it.
+            want_model, want_effort = _parse_claude_request(transcription)
+            if want_model or want_effort:
+                res = await loop.run_in_executor(
+                    None, self.set_claude_setting, want_model, want_effort)
+                if not res.get("ok"):
+                    await loop.run_in_executor(
+                        None, self._say, f"Sorry, {res.get('error', 'that did not work')}.")
+                elif res.get("changed"):
+                    await loop.run_in_executor(
+                        None, self._say, f"Switched to {' and '.join(res['changed'])}.")
+                else:
+                    await loop.run_in_executor(
+                        None, self._say,
+                        f"Already on {res['model']} at {res['effort']} effort.")
+                spoke = True
                 return
 
             if command in _HALLUCINATION_PATTERNS:
