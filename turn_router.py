@@ -60,6 +60,7 @@ ROUTER_QUESTIONS: List[Tuple[str, str]] = [
     ("question", "Is the user asking a question, as opposed to giving an instruction, confirming, or making a remark?"),
 ]
 QUESTION_IDS = [q for q, _ in ROUTER_QUESTIONS]
+REQUIRED_QUESTIONS = ("addressed", "intelligible", "needs_web", "needs_shell", "risky", "simple")
 OPTIONS = ["yes", "no"]
 
 # How the dataset was built: a previous exchange counts only when it happened
@@ -187,11 +188,12 @@ class Verdict:
 
     @property
     def followup(self) -> bool:
-        return self.probs["followup"] >= 0.5
+        # descriptive only (no policy reads it); a rubric may leave it out
+        return self.probs.get("followup", 0.0) >= 0.5
 
     @property
     def question(self) -> bool:
-        return self.probs["question"] >= 0.5
+        return self.probs.get("question", 0.0) >= 0.5
 
     @property
     def route(self) -> str:
@@ -219,10 +221,10 @@ class Verdict:
         tools = {(True, True): "web+shell", (True, False): "web",
                  (False, True): "shell", (False, False): "none"}[(self.needs_web, self.needs_shell)]
         flags = " risky" if self.risky else ""
-        return (f"Router: addressed={p['addressed']:.2f} intelligible={p['intelligible']:.2f} "
-                f"web={p['needs_web']:.2f} shell={p['needs_shell']:.2f} risky={p['risky']:.2f} "
-                f"simple={p['simple']:.2f} followup={p['followup']:.2f} question={p['question']:.2f} "
-                f"-> route={self.route} tools={tools}{flags} ({self.latency_ms:.0f} ms)")
+        short = {"addressed": "addressed", "intelligible": "intelligible", "needs_web": "web", "needs_shell": "shell",
+                 "risky": "risky", "simple": "simple", "followup": "followup", "question": "question"}
+        parts = " ".join(f"{short.get(k, k)}={v:.2f}" for k, v in p.items())
+        return f"Router: {parts} -> route={self.route} tools={tools}{flags} ({self.latency_ms:.0f} ms)"
 
     def to_dict(self) -> Dict[str, object]:
         return {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self.at)),
@@ -257,21 +259,31 @@ class TurnRouter:
         self.logger = logger
         self.session = requests.Session()
         self.calibration_path, cal = self._load_calibration(calibration_path)
+        # The rubric is data: the calibration file names the questions (ids, wording, order) it was
+        # fitted on, and those are what get asked. The module's ROUTER_QUESTIONS is the fallback
+        # for a file without texts. The policies need addressed, intelligible, needs_web,
+        # needs_shell, risky and simple; anything else is descriptive.
         self.calibration: Dict[str, Tuple[float, float]] = {}
-        for qid, _ in ROUTER_QUESTIONS:
-            q = (cal.get("questions") or {}).get(qid) or {}
+        file_qs = cal.get("questions") or {}
+        if file_qs and all(isinstance(v, dict) and v.get("text") for v in file_qs.values()):
+            rubric = [(qid, v["text"]) for qid, v in file_qs.items()]
+        else:
+            rubric = [(qid, self._question_text(qid)) for qid, _ in ROUTER_QUESTIONS]
+        missing = [q for q in REQUIRED_QUESTIONS if q not in dict(rubric)]
+        if missing:
+            self._warn(f"router calibration lacks {missing}; falling back to the built-in rubric")
+            rubric = [(qid, self._question_text(qid)) for qid, _ in ROUTER_QUESTIONS]
+        for qid, _ in rubric:
+            q = file_qs.get(qid) or {}
             try:
                 self.calibration[qid] = (float(q["a"]), float(q["c"]))
             except (KeyError, TypeError, ValueError):
                 self._warn(f"router calibration has no fit for {qid!r}; using the raw answer")
                 self.calibration[qid] = (1.0, 0.0)
-            if q.get("text") and q["text"] != self._question_text(qid):
-                self._warn(f"router calibration was fitted on different wording for {qid!r}")
         if cal.get("system") and cal["system"] != ROUTER_SYSTEM:
             self._warn("router calibration was fitted with a different system prompt")
         self.thresholds = load_thresholds(cal.get("thresholds"))
-        self._questions = [{"id": qid, "text": self._question_text(qid), "options": list(OPTIONS)}
-                           for qid, _ in ROUTER_QUESTIONS]
+        self._questions = [{"id": qid, "text": text, "options": list(OPTIONS)} for qid, text in rubric]
 
     # -- setup ---------------------------------------------------------------
     @staticmethod
