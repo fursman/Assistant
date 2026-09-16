@@ -516,6 +516,29 @@ install_local_llm() {
             log_info "Cloning llama.cpp"
             git clone --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
         fi
+        # --- the turn router's /judge route (contrib/llama.cpp) ---
+        # The patch is against a pinned upstream commit: the server code it touches churns,
+        # so a fresh clone is moved to that commit before the patch is applied. Without the
+        # route the assistant still works; the router just fails open.
+        local llama_pin="e70802a01f03f0ed31a26338a5664796f3824371"
+        local judge_patch="$(pwd)/contrib/llama.cpp/judge.patch"
+        if [[ -f "$judge_patch" ]]; then
+            if git -C "$LLAMA_DIR" grep -q 'judge_slots' -- common/common.h 2>/dev/null; then
+                log_info "llama.cpp already carries the /judge route"
+            else
+                log_info "Pinning llama.cpp to ${llama_pin:0:7} and applying the /judge patch"
+                git -C "$LLAMA_DIR" fetch --depth 1 origin "$llama_pin" \
+                    && git -C "$LLAMA_DIR" checkout -q FETCH_HEAD \
+                    || log_warning "could not pin llama.cpp; applying the patch to what is there"
+                if git -C "$LLAMA_DIR" apply --check "$judge_patch" 2>/dev/null; then
+                    git -C "$LLAMA_DIR" apply "$judge_patch"
+                    cp contrib/llama.cpp/server-judge.h "$LLAMA_DIR/tools/server/server-judge.h"
+                    log_success "/judge patch applied"
+                else
+                    log_warning "the /judge patch does not apply to this llama.cpp; the turn router will fail open"
+                fi
+            fi
+        fi
         # CMAKE_CUDA_HOST_COMPILER is passed explicitly: without it CMake omits
         # -ccbin and nvcc picks whichever g++ the PATH shim finds first.
         cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" \

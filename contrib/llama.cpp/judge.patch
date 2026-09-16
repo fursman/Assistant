@@ -1,0 +1,234 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index e346863e..62d35118 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2556,6 +2556,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         ).set_env("LLAMA_ARG_N_PARALLEL"));
+     }
++    add_opt(common_arg(
++        {"--judge-slots"}, "N",
++        string_format("number of extra sequences reserved for prefill-only /judge requests (default: %d, 0 = disabled; forces --kv-unified)", params.judge_slots),
++        [](common_params & params, int value) {
++            params.judge_slots = value;
++        }
++    ).set_env("LLAMA_ARG_JUDGE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-ns", "--sequences"}, "N",
+         string_format("number of sequences to decode (default: %d)", params.n_sequences),
+diff --git a/common/common.h b/common/common.h
+index a333f702..9682c7e3 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -453,6 +453,7 @@ struct common_params {
+     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
+     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
+     int32_t n_parallel            =     1; // number of parallel sequences to decode
++    int32_t judge_slots           =     0; // server: question sequences reserved for prefill-only /judge (0 = disabled)
+     int32_t n_sequences           =     1; // number of sequences to decode
+     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f5477356..7e54482a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6,6 +6,7 @@
+ #include "server-queue.h"
+ #include "server-schema.h"
+ #include "server-stream.h"
++#include "server-judge.h"
+ 
+ #include "build-info.h"
+ #include "common.h"
+@@ -906,6 +907,10 @@ private:
+     // slots / clients
+     std::vector<server_slot> slots;
+ 
++    // prefill-only typed-question judgments (/judge); owns the sequence ids above the slots
++    server_judge judge;
++    int32_t judge_max_outputs = 0;
++
+     int trace = 0;        // env: LLAMA_TRACE
+     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+@@ -1096,11 +1101,35 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        // /judge reserves 1 + judge_slots extra sequences in the same context. A unified KV cache
++        // keeps one shared pool, so a judge sequence copied from a slot shares its prompt cells
++        // instead of duplicating them (and hybrid models cannot fan out at all without it).
++        if (params_base.judge_slots > 0) {
++            if (!params_base.kv_unified) {
++                SRV_WRN("--judge-slots %d requires a unified KV cache, enabling --kv-unified\n", params_base.judge_slots);
++                params_base.kv_unified = true;
++            }
++            params_base.n_parallel += params_base.judge_slots + 1;
++            // the output buffer must cover every sequence plus the logits a judge batch reads
++            // (one per question, more for multi-token option scoring); each output row is n_vocab floats
++            judge_max_outputs = params_base.n_parallel + 32;
++            params_base.n_outputs_max = std::max(params_base.n_outputs_max, judge_max_outputs);
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
++        if (params_base.judge_slots > 0) {
++            params_base.n_parallel -= params_base.judge_slots + 1;
++        }
++
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
+ 
++        if (judge.enabled() && ctx_tgt != nullptr) {
++            // resumed after sleeping: the context is new, the sequence layout is not
++            judge.init(ctx_tgt, judge.tmpls, judge.seq0, judge.n_qslots, judge.alias, judge_max_outputs);
++        }
++
+         if (model_tgt == nullptr) {
+             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
+             return false;
+@@ -1489,6 +1518,13 @@ private:
+                 /* force_pure_content    */ params_base.force_pure_content_parser
+             };
+ 
++            if (params_base.judge_slots > 0) {
++                judge.init(ctx_tgt, chat_params.tmpls.get(), (llama_seq_id) params_base.n_parallel, params_base.judge_slots,
++                           params_base.model_alias.empty() ? std::string("model") : *params_base.model_alias.begin(), judge_max_outputs);
++                SRV_INF("judge: context sequence %d, %d question sequences (%d..%d)\n",
++                        params_base.n_parallel, params_base.judge_slots, params_base.n_parallel + 1, params_base.n_parallel + params_base.judge_slots);
++            }
++
+             {
+                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
+                 auto it = params_base.default_template_kwargs.find("preserve_reasoning");
+@@ -2471,6 +2507,38 @@ private:
+                 {
+                     // do nothing
+                 } break;
++            case SERVER_TASK_TYPE_JUDGE:
++                {
++                    if (!judge.enabled()) {
++                        send_error(task, "judge is disabled: start the server with --judge-slots N", ERROR_TYPE_NOT_SUPPORTED);
++                        break;
++                    }
++                    auto res = std::make_unique<server_task_result_judge>();
++                    res->id = task.id;
++                    try {
++                        // idle slots offer their cached prompt as a prefix source, so a judgment about
++                        // the live conversation costs only the question suffixes
++                        auto caches = [this]() {
++                            std::vector<server_judge::slot_cache> out;
++                            for (const auto & slot : slots) {
++                                if (slot.is_processing() || slot.prompt.tokens.has_mtmd || slot.prompt.tokens.size() == 0) {
++                                    continue;
++                                }
++                                out.push_back({ (llama_seq_id) slot.id, slot.prompt.tokens.get_text_tokens() });
++                            }
++                            return out;
++                        };
++                        // the judge speaks nlohmann json; the server's json is its own wrapper, so
++                        // convert at the boundary (the bodies are a few KB)
++                        const auto body = nlohmann::ordered_json::parse(task.judge_body.dump());
++                        const auto out  = judge.judge(body, caches);
++                        res->data = json::parse(out.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace));
++                    } catch (const std::exception & e) {
++                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
++                        break;
++                    }
++                    queue_results.send(std::move(res));
++                } break;
+             case SERVER_TASK_TYPE_METRICS:
+                 {
+                     int n_processing_slots = 0;
+@@ -4699,6 +4767,29 @@ void server_routes::init_routes() {
+         return res;
+     };
+ 
++    this->post_judge = [this](const server_http_req & req) {
++        auto res = create_response();
++        if (params.judge_slots <= 0) {
++            res->error(format_error_response("This server has no judge sequences. Start it with --judge-slots N", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++        server_task task(SERVER_TASK_TYPE_JUDGE);
++        task.id = res->rd.get_new_id();
++        task.judge_body = json::parse(req.body);
++        res->rd.post_task(std::move(task), true); // ahead of queued completions: a router decision gates the next turn
++        auto result = res->rd.next([&]{ return req.should_stop(); });
++        if (!result) {
++            res->error(format_error_response("judge request cancelled", ERROR_TYPE_SERVER));
++            return res;
++        }
++        if (result->is_error()) {
++            res->error(result->to_json());
++            return res;
++        }
++        res->ok(result->to_json());
++        return res;
++    };
++
+     this->get_slots = [this](const server_http_req & req) {
+         auto res = create_response();
+         if (!params.endpoint_slots) {
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 0acbbffa..1cc3dde7 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -154,6 +154,7 @@ struct server_routes {
+     server_http_context::handler_t post_rerank;
+     server_http_context::handler_t get_lora_adapters;
+     server_http_context::handler_t post_lora_adapters;
++    server_http_context::handler_t post_judge;
+ 
+     // to be used in router mode
+     json get_model_info() const;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143f..ed79d95b 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -27,6 +27,7 @@ enum server_task_type {
+     SERVER_TASK_TYPE_SLOT_ERASE,
+     SERVER_TASK_TYPE_GET_LORA,
+     SERVER_TASK_TYPE_SET_LORA,
++    SERVER_TASK_TYPE_JUDGE,
+ };
+ 
+ // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
+@@ -175,6 +176,9 @@ struct server_task {
+     // used by SERVER_TASK_TYPE_SET_LORA
+     std::map<int, float> set_lora; // mapping adapter ID -> scale
+ 
++    // used by SERVER_TASK_TYPE_JUDGE: the request body (context + typed questions)
++    json judge_body;
++
+     server_task() = default;
+ 
+     server_task(server_task_type type) : type(type) {}
+@@ -489,6 +493,15 @@ struct server_task_result_error : server_task_result {
+     virtual json to_json() override;
+ };
+ 
++// used by /judge API
++struct server_task_result_judge : server_task_result {
++    json data;
++
++    virtual json to_json() override {
++        return data;
++    }
++};
++
+ // used by /metrics API
+ struct server_task_result_metrics : server_task_result {
+     // these are immediate stats, not accumulated (server_metrics is cumulative)
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 22378b38..db8c0e6c 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -272,6 +272,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
+     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
+     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
++    ctx_http.post("/judge",                    ex_wrapper(routes.post_judge)); // prefill-only typed questions
+     // token counting
+     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
+     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));

@@ -581,6 +581,13 @@ always silent.
 
 ## Turn router
 
+The questions are answered by a `/judge` route that lives inside the same llama-server
+process as the local model (`contrib/llama.cpp/`: a small patch against a pinned upstream
+commit plus one header, applied by `setup.sh`). One batched forward pass reads the answer
+logits for every question; nothing is generated. The unit runs with `--judge-slots 6
+--kv-unified`, a 16k context and no MTP draft (with speculative decoding on, llama.cpp keeps
+three copies of every sequence's recurrent state and six sequences do not fit).
+
 Before a turn goes to any model, the local llama-server is asked six yes/no
 questions about it in one forward pass -- no generation, just the
 log-probabilities of "yes" and "no" after each question (`POST /judge`, about

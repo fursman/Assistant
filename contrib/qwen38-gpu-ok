@@ -10,9 +10,10 @@
 # all skip cleanly instead of restart-looping on a 14 GB allocation failure.
 set -u
 
-# Measured resident size of Qwen3.8-27B UD-IQ4_XS with the MTP draft head and a
+# Measured resident size of Qwen3.8-27B UD-IQ4_XS with 16K q8_0 KV, no MTP, and 4 judge
+# sequences for the turn router (2026-09-16): 14537 MiB. Before that (MTP + 32K KV):
 # 32K q8_0 KV cache: 15341 MiB.
-NEED_MIB=${QWEN38_NEED_MIB:-15400}
+NEED_MIB=${QWEN38_NEED_MIB:-14700}
 
 command -v nvidia-smi >/dev/null 2>&1 || {
     echo "skip: nvidia-smi not installed"; exit 1; }
