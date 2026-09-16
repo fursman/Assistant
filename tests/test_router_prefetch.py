@@ -264,17 +264,34 @@ def test_router_norm():
 
 # --- (c) a mismatching final transcript judges again, once ------------------
 
-def test_mismatching_final_judges_synchronously_once(monkeypatch):
+def test_prefix_prefetch_is_reused_when_it_covers_most_of_the_final(monkeypatch):
+    # The streaming decoder lags by about a word: a prefetch that is a prefix covering at
+    # least ROUTER_PREFETCH_MIN_MATCH of the final transcript was judged on the same request.
     monkeypatch.setattr(va, "ROUTER_PREFETCH", True)
     monkeypatch.setattr(va, "ROUTER_TIMEOUT", 1.5)
+    monkeypatch.setattr(va, "ROUTER_PREFETCH_MIN_MATCH", 0.8)
     router = FakeRouter(delay=0.05)
     host = Host(router)
     assert host._router_prefetch_start("what time is")      # the last word not decoded yet
-    verdict = host._router_judge_spoken("What time is it?")
+    verdict = host._router_judge_spoken("What time is it?")  # "what time is" = 12 of 15 chars
     assert verdict is router.verdict
-    # Give the abandoned prefetch thread a moment, then count.
     time.sleep(0.1)
-    assert router.calls == [("what time is", False), ("What time is it?", False)]
+    assert router.calls == [("what time is", False)]
+    assert host._router_prefetch is None
+
+
+def test_mismatching_final_judges_synchronously_once(monkeypatch):
+    monkeypatch.setattr(va, "ROUTER_PREFETCH", True)
+    monkeypatch.setattr(va, "ROUTER_TIMEOUT", 1.5)
+    monkeypatch.setattr(va, "ROUTER_PREFETCH_MIN_MATCH", 0.8)
+    router = FakeRouter(delay=0.05)
+    host = Host(router)
+    assert host._router_prefetch_start("what time is")
+    verdict = host._router_judge_spoken("Delete everything in my downloads folder.")  # different words
+    assert verdict is router.verdict
+    # The abandoned prefetch is waited out before the second call, so both are counted.
+    time.sleep(0.1)
+    assert router.calls == [("what time is", False), ("Delete everything in my downloads folder.", False)]
     assert host._router_prefetch is None
 
 
