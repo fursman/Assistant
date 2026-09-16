@@ -315,7 +315,10 @@ LOCAL_LLM_HISTORY_CHARS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_CHARS", "
 # turn used to push every earlier exchange out. That is what produced "I don't
 # have the context for which three people we're discussing" one turn after the
 # names were given.
-LOCAL_TOOL_HISTORY_OUTPUT = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_HISTORY_OUTPUT", "600"))
+# Keep in history exactly what the model was shown (LOCAL_TOOL_MAX_OUTPUT, 4000 chars): a shorter
+# stored copy changes the prompt prefix on the next turn, and the hybrid model then re-processes the
+# whole conversation. The history size cap (block-trimmed) bounds the total.
+LOCAL_TOOL_HISTORY_OUTPUT = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_HISTORY_OUTPUT", "4000"))
 LOCAL_LLM_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_LOCAL_TIMEOUT", "120"))
 # Qwen3.8 reasons by default. For a voice assistant that is pure latency, so
 # thinking is OFF unless asked for. `/no_think` in the prompt does NOT work on
