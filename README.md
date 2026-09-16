@@ -628,6 +628,15 @@ utterance, the exact context the judge saw, the raw and calibrated
 probabilities, the decisions, the latency, and which backend actually
 answered -- so the turns can be relabelled and the calibration refitted.
 
+For spoken turns the call overlaps the end-of-turn wait instead of following
+it: at the first smart-turn checkpoint (0.35 s of silence) the streaming
+transcript so far goes to the judge in the background, and when the final
+transcript turns out to be the same words the verdict is already in
+(`Router: verdict prefetched during end-of-turn (640 ms early)`), so the
+router adds nothing to the reply's latency; a final transcript that differs
+is judged again after the flush, exactly as before. `VOICE_ASSISTANT_ROUTER_PREFETCH=0`
+turns the overlap off and judges every turn after its transcript.
+
 The router **fails open**. No `/judge` endpoint, a server that is loading or
 down, a slow answer (`VOICE_ASSISTANT_ROUTER_TIMEOUT`, 1.5 s), a missing
 calibration file: the verdict is "no opinion" and the turn runs exactly as it
@@ -882,6 +891,7 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_TOOLS` | `1` | offer the local model only the tools the verdict asks for |
 | `VOICE_ASSISTANT_ROUTER_DROP` | `1` | ignore spoken turns the verdict calls junk |
 | `VOICE_ASSISTANT_ROUTER_TIMEOUT` | `1.5` | seconds before the router has no opinion |
+| `VOICE_ASSISTANT_ROUTER_PREFETCH` | `1` | judge a spoken turn during the end-of-turn wait, from the streaming transcript so far |
 | `VOICE_ASSISTANT_ROUTER_THR_DROP` | `0.8` | junk probability at which a spoken turn is dropped |
 | `VOICE_ASSISTANT_ROUTER_THR_WEB` / `_SHELL` | `0.2` / `0.2` | probability at which a tool is offered |
 | `VOICE_ASSISTANT_ROUTER_THR_RISKY` | `0.3` | probability at which the risky marker is added |
