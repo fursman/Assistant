@@ -367,6 +367,14 @@ ROUTER_DROP = os.getenv("VOICE_ASSISTANT_ROUTER_DROP", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 # Past this many seconds the router has no opinion and the turn proceeds.
 ROUTER_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_ROUTER_TIMEOUT", "1.5"))
+# Judge a spoken turn while the end-of-turn silence is still being waited
+# out. At the first smart-turn checkpoint the streaming transcript so far is
+# sent to the router in the background; when the final transcript turns out
+# to be the same words, the verdict is already in and the router cost the
+# turn nothing. Any difference and the turn is judged after the transcript,
+# exactly as before. Typed input never prefetches.
+ROUTER_PREFETCH = os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
 # Prepended to the user's words when the verdict says the turn may change or
 # disrupt something. Same shape as the "[context: ...]" marker, and the system
 # prompts already say to confirm before anything irreversible; this only makes
@@ -2503,6 +2511,22 @@ class ToolMarkupGate:
 # Assistant
 # ---------------------------------------------------------------------------
 
+class _RouterPrefetch:
+    """One utterance's early router call: what was asked and what came back."""
+
+    __slots__ = ("raw", "text", "verdict", "thread", "text_ready", "done", "started", "finished")
+
+    def __init__(self, raw):
+        self.raw = raw            # the transcript so far, as the recogniser had it
+        self.text = None          # after the vocabulary repair: what the router saw
+        self.verdict = None
+        self.thread = None
+        self.text_ready = threading.Event()
+        self.done = threading.Event()
+        self.started = time.monotonic()
+        self.finished = None
+
+
 class VoiceAssistant:
     def __init__(self):
         self.is_active = False
@@ -2534,6 +2558,7 @@ class VoiceAssistant:
         self._router = None
         self._router_verdict = None
         self._router_turn_at = None      # when the previous turn's utterance arrived
+        self._router_prefetch = None     # this utterance's early router call, if any
 
         # Per-turn streaming state
         self._sentence_queue: Optional[queue.Queue] = None
@@ -2874,6 +2899,12 @@ class VoiceAssistant:
                 self._q = None
                 self._worker = None
                 self._failed = False
+                # The transcript so far, by line id, kept up to date by the
+                # stream's own events after every decoding pass. partial()
+                # reads this and never asks the engine for anything: a pass
+                # is 0.3-0.8 s of CPU and belongs to the worker thread.
+                self._lines = {}
+                self._lines_lock = threading.Lock()
 
             # -- batch --
             def transcribe(self, audio, **_kwargs):
@@ -2888,6 +2919,8 @@ class VoiceAssistant:
                     return
                 self._end_stream()
                 self._failed = False
+                with self._lines_lock:
+                    self._lines = {}
                 try:
                     self._stream = transcriber.create_stream(
                         update_interval=MOONSHINE_UPDATE_INTERVAL)
@@ -2896,6 +2929,10 @@ class VoiceAssistant:
                     logger.warning(f"Could not open STT stream ({e}); using batch")
                     self._stream = None
                     return
+                try:
+                    self._stream.add_listener(self._on_line)
+                except Exception as e:
+                    logger.warning(f"STT stream takes no listener ({e}); no partial transcript")
                 self._q = queue.Queue()
                 self._worker = threading.Thread(target=self._pump, daemon=True)
                 self._worker.start()
@@ -2921,6 +2958,29 @@ class VoiceAssistant:
                 if self._q is None or self._failed:
                     return
                 self._q.put((np.asarray(chunk, dtype=np.float32), sample_rate))
+
+            def _on_line(self, event):
+                """One line of the transcript changed. Called by the stream from
+                inside a decoding pass, on whichever thread made it (the worker
+                during recording, finish() at the flush)."""
+                line = getattr(event, "line", None)
+                if line is None:            # an Error event
+                    return
+                with self._lines_lock:
+                    self._lines[line.line_id] = line.text
+
+            def partial(self):
+                """The transcript so far, without touching the stream.
+
+                Only what the last decoding pass produced: the engine runs up
+                to one update interval plus one pass behind the microphone,
+                so the last word or two may still be missing. "" when no
+                stream is running.
+                """
+                if self._stream is None or self._failed:
+                    return ""
+                with self._lines_lock:
+                    return " ".join(t for t in self._lines.values() if t).strip()
 
             def finish(self):
                 """Final text, or None to tell the caller to fall back to batch."""
@@ -4650,6 +4710,111 @@ class VoiceAssistant:
             self.logger.warning(f"Router failed ({e}); proceeding without it")
             return None
 
+    # -- prefetch: judging the spoken turn during the end-of-turn wait --------
+    #
+    # The router's 0.7-0.9 s used to sit squarely between the last word and
+    # the first token of the reply. But the end of a turn is at least 0.35 s
+    # of silence away from the last word, and the streaming recogniser has
+    # usually decoded the whole utterance by then, so the question can be
+    # asked while that wait runs. The answer is used only when the final
+    # transcript is the same words; anything else falls back to the
+    # synchronous call, which is what every turn did before.
+
+    @staticmethod
+    def _router_norm(text) -> str:
+        """Two transcripts of the same words compare equal: case, spacing and
+        whatever punctuation the final flush hangs on the end do not count."""
+        t = re.sub(r"\s+", " ", text or "").strip().lower()
+        return t.rstrip(" .,!?;:\u2026\"'")
+
+    def _router_prefetch_start(self, text) -> bool:
+        """Start judging `text`, the transcript so far, on a background thread.
+
+        Returns whether one was started. Refused when the overlap is off,
+        there is no router, the text is empty, or this utterance already
+        has one. Never raises and never blocks: the caller is the audio loop.
+        """
+        if not ROUTER_PREFETCH or self._router is None or self._router_prefetch is not None:
+            return False
+        if not text or not text.strip():
+            return False
+        try:
+            pf = _RouterPrefetch(text)
+            pf.thread = threading.Thread(target=self._router_prefetch_run, args=(pf,),
+                                         name="router-prefetch", daemon=True)
+            self._router_prefetch = pf
+            pf.thread.start()
+            return True
+        except Exception as e:
+            self.logger.warning(
+                f"Router prefetch could not start ({e}); judging after the transcript")
+            self._router_prefetch = None
+            return False
+
+    def _router_prefetch_run(self, pf):
+        """The background half: the vocabulary repair the final transcript
+        gets, then the router call the turn would have made, left on `pf`."""
+        try:
+            try:
+                pf.text = self._vocab(pf.raw)
+            except Exception as e:
+                self.logger.warning(f"Router prefetch: vocabulary repair failed ({e})")
+                pf.text = pf.raw
+            finally:
+                pf.text_ready.set()
+            pf.verdict = self._router_judge(pf.text, False)     # never raises
+        except Exception as e:
+            self.logger.warning(f"Router prefetch failed ({e})")
+        finally:
+            pf.finished = time.monotonic()
+            pf.done.set()
+
+    def _router_take_prefetch(self, final_text):
+        """Claim this utterance's prefetch for `final_text`.
+
+        (True, verdict) when the prefetch was for the same words: the answer
+        is waited for (up to ROUTER_TIMEOUT) and is this turn's, None
+        included, since the router had its one chance. (False, None) when
+        there was no prefetch or it was for different words, and the caller
+        judges the final text itself. Never raises.
+        """
+        pf, self._router_prefetch = self._router_prefetch, None
+        if pf is None:
+            return False, None
+        try:
+            t0 = time.monotonic()
+            # The repair takes milliseconds; this only covers a thread that
+            # has not been scheduled yet.
+            pf.text_ready.wait(0.2)
+            if pf.text is None or self._router_norm(pf.text) != self._router_norm(final_text):
+                self.logger.info("Router: prefetch mismatch, judging again")
+                return False, None
+            pf.done.wait(ROUTER_TIMEOUT)
+            waited_ms = (time.monotonic() - t0) * 1000.0
+            if not pf.done.is_set():
+                self.logger.info(f"Router: prefetch not back after {waited_ms:.0f} ms; no opinion")
+                return True, None
+            # How much sooner the answer was in than a call made now would
+            # have delivered it: its own latency, less what was still waited.
+            early_ms = max(0.0, (pf.finished - pf.started) * 1000.0 - waited_ms)
+            if pf.verdict is None:
+                self.logger.info("Router: prefetched during end-of-turn, no opinion")
+            else:
+                self.logger.info(
+                    f"Router: verdict prefetched during end-of-turn ({early_ms:.0f} ms early)")
+            return True, pf.verdict
+        except Exception as e:
+            self.logger.warning(f"Router prefetch unusable ({e}); judging again")
+            return False, None
+
+    def _router_judge_spoken(self, text):
+        """The verdict for a spoken turn: the one prefetched during the
+        end-of-turn wait when it was for these words, else a fresh judgment."""
+        hit, verdict = self._router_take_prefetch(text)
+        if hit:
+            return verdict
+        return self._router_judge(text, False)
+
     def _router_record(self, verdict):
         """Append a verdict to router.jsonl. Never raises."""
         if verdict is None or self._router is None:
@@ -5204,6 +5369,13 @@ class VoiceAssistant:
         next_check = 0
         feed = getattr(self.stt, "feed", None)
         begin = getattr(self.stt, "begin_utterance", None)
+        # The router is asked about the transcript so far while the silence
+        # is still being waited out (see _router_prefetch_start).
+        partial = getattr(self.stt, "partial", None)
+        self._router_prefetch = None
+        can_prefetch = (ROUTER_PREFETCH and partial is not None
+                        and self._router is not None and bool(SMART_TURN_CHECKPOINTS))
+        prefetch_due = can_prefetch
         if begin is not None:
             begin()
         if pre_audio is not None:
@@ -5234,10 +5406,22 @@ class VoiceAssistant:
                 had_speech = True
                 silence_s = 0.0
                 next_check = 0     # new speech invalidates earlier verdicts
+                prefetch_due = can_prefetch
                 continue
             if not had_speech:
                 continue
             silence_s += RECORD_CHUNK_DURATION
+
+            # The first checkpoint of this pause: hand the router what has
+            # been heard so far, before smart-turn is asked and whatever it
+            # says. One per utterance (the method refuses a second), and only
+            # a thread start happens here.
+            if prefetch_due and silence_s >= SMART_TURN_CHECKPOINTS[0][0]:
+                prefetch_due = False
+                try:
+                    self._router_prefetch_start(partial())
+                except Exception as e:
+                    self.logger.warning(f"Router prefetch skipped ({e})")
 
             if (self.smart_turn is not None
                     and next_check < len(SMART_TURN_CHECKPOINTS)
@@ -5558,7 +5742,8 @@ class VoiceAssistant:
             # The router's opinion: junk is dropped like any other rejected
             # transcript (no reply, no chime); anything else is kept for the
             # turn, which reads it when choosing a backend and offering tools.
-            verdict = await loop.run_in_executor(None, self._router_judge, transcription, False)
+            # Usually already in by now: see _router_prefetch_start.
+            verdict = await loop.run_in_executor(None, self._router_judge_spoken, transcription)
             if verdict is not None:
                 if verdict.drop and ROUTER_DROP:
                     self.logger.info(f"Router: ignored (junk p={verdict.junk:.2f}) : {transcription}")
