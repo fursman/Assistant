@@ -300,12 +300,14 @@ LOCAL_LLM_URL = os.getenv("VOICE_ASSISTANT_LOCAL_URL", "http://127.0.0.1:8081/v1
 LOCAL_LLM_MODEL = os.getenv("VOICE_ASSISTANT_LOCAL_MODEL", "qwen3.8-27b")
 LOCAL_LLM_API_KEY = os.getenv("VOICE_ASSISTANT_LOCAL_API_KEY", "none")
 LOCAL_LLM_MAX_TOKENS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOKENS", "512"))
-LOCAL_LLM_HISTORY_TURNS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_TURNS", "12"))
+LOCAL_LLM_HISTORY_TURNS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_TURNS", "24"))
+# When the history is over budget, keep this fraction of the caps (see _trim_local_history).
+LOCAL_HISTORY_KEEP = float(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_KEEP", "0.6"))
 # Hard ceiling on retained history, in characters (~4 chars/token). Turn count
 # alone is not a bound: a few 4000-character tool outputs can overflow the
 # 32K context, after which llama-server 400s on every request and the
 # conversation is stuck until a new session.
-LOCAL_LLM_HISTORY_CHARS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_CHARS", "24000"))
+LOCAL_LLM_HISTORY_CHARS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_CHARS", "32000"))
 # What a tool result shrinks to once its turn is over. The model needs the full
 # output while it is reasoning, but afterwards its own spoken reply is the
 # summary, and the raw text is dead weight that evicts the conversation: five
@@ -3819,8 +3821,18 @@ class VoiceAssistant:
         # Count exchanges, not messages. A turn that ran five commands is
         # eleven messages, so a raw message cap of 2*turns threw away the
         # conversation after two searches while claiming to keep twelve turns.
-        while (exchanges(self._local_history) > LOCAL_LLM_HISTORY_TURNS
-               or size(self._local_history) > LOCAL_LLM_HISTORY_CHARS):
+        # Hysteresis: once over budget, cut down to LOCAL_HISTORY_KEEP of it in one go. Trimming
+        # exactly to the cap would drop one exchange per turn from then on, which shifts the
+        # prompt prefix every turn; a hybrid model like Qwen3.8 cannot rewind its recurrent
+        # state, so each shift re-processed the whole conversation (measured: 1.6k-3.5k tokens,
+        # 2-5 s, on every turn). Cutting in blocks keeps the prefix stable for many turns.
+        if (exchanges(self._local_history) <= LOCAL_LLM_HISTORY_TURNS
+                and size(self._local_history) <= LOCAL_LLM_HISTORY_CHARS):
+            return
+        keep_turns = max(1, int(LOCAL_LLM_HISTORY_TURNS * LOCAL_HISTORY_KEEP))
+        keep_chars = max(1, int(LOCAL_LLM_HISTORY_CHARS * LOCAL_HISTORY_KEEP))
+        while (exchanges(self._local_history) > keep_turns
+               or size(self._local_history) > keep_chars):
             # Drop whole exchanges from the front. Cuts land on a user message
             # because a `tool` message orphaned from the assistant message
             # carrying its tool_calls is a 400 on the next request.
@@ -3873,8 +3885,12 @@ class VoiceAssistant:
         # of the saved history: it is not something the user said.
         nudge_at = None
         markup_suppressed = False
-        # Every tool, or only what the router's verdict asked for.
-        tools = self._router_tools()
+        # The tool schema is rendered into the system message, so it must be the SAME every
+        # turn or the server's prompt cache is useless (a changed schema diverges at token 3).
+        # The router gates tool use with tool_choice instead: "none" makes the server parse
+        # content only; the schema stays in the prompt.
+        tools = LOCAL_TOOLS
+        tool_choice = self._router_tool_choice()
 
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
             # Offer tools until the last allowed step, so the model has to
@@ -3895,6 +3911,8 @@ class VoiceAssistant:
                 max_tokens=LOCAL_LLM_MAX_TOKENS, extra_body=extra_body)
             if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS and tools:
                 kwargs["tools"] = tools
+                if tool_choice != "auto":
+                    kwargs["tool_choice"] = tool_choice
 
             stream = None
             text_at_step_start = len(self._assistant_text)
@@ -4663,25 +4681,25 @@ class VoiceAssistant:
             self.logger.warning(f"Router marker failed ({e})")
             return ""
 
-    def _router_tools(self):
-        """The tool schemas the local model is offered this turn.
+    def _router_tool_choice(self) -> str:
+        """tool_choice for the local model this turn: "auto" unless the router has a
+        verdict, gating is on, and the verdict wants no tool at all, then "none".
 
-        All of them, as before, unless the router has a verdict and gating is
-        on; then only what the verdict asked for, and an empty list when it
-        asked for nothing -- the schema is withheld entirely, which is also
-        what switches off llama-server's tool-call parser for the turn.
+        The schema itself is never changed per turn (it lives in the system message and
+        would break prompt caching); "none" only stops the server from parsing tool calls,
+        so the turn is answered in words. A verdict that wants some tools gets "auto": the
+        model picks among all of them.
         """
         v = self._router_verdict
         if v is None or not ROUTER_TOOLS:
-            return LOCAL_TOOLS
+            return "auto"
         try:
-            wanted = set(v.tools)
-            tools = [t for t in LOCAL_TOOLS if t["function"]["name"] in wanted]
-            self.logger.info(f"Router: tools offered: {', '.join(sorted(wanted)) or 'none'}")
-            return tools
+            wanted = sorted(set(v.tools))
+            self.logger.info(f"Router: tools allowed: {', '.join(wanted) or 'none'}")
+            return "auto" if wanted else "none"
         except Exception as e:
-            self.logger.warning(f"Router tool gating failed ({e}); offering every tool")
-            return LOCAL_TOOLS
+            self.logger.warning(f"Router tool gating failed ({e}); tools stay auto")
+            return "auto"
 
     def _router_route(self):
         """The router's backend for this turn, or None to leave today's choice alone.
