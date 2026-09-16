@@ -367,6 +367,9 @@ ROUTER_DROP = os.getenv("VOICE_ASSISTANT_ROUTER_DROP", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 # Past this many seconds the router has no opinion and the turn proceeds.
 ROUTER_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_ROUTER_TIMEOUT", "1.5"))
+# A prefetched verdict is reused when its transcript is a prefix of the final one covering at
+# least this fraction of its characters (the streaming decoder lags by about a word).
+ROUTER_PREFETCH_MIN_MATCH = float(os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH_MIN_MATCH", "0.8"))
 # Judge a spoken turn while the end-of-turn silence is still being waited
 # out. At the first smart-turn checkpoint the streaming transcript so far is
 # sent to the router in the background; when the final transcript turns out
@@ -4786,9 +4789,19 @@ class VoiceAssistant:
             # The repair takes milliseconds; this only covers a thread that
             # has not been scheduled yet.
             pf.text_ready.wait(0.2)
-            if pf.text is None or self._router_norm(pf.text) != self._router_norm(final_text):
+            a = self._router_norm(pf.text) if pf.text else ""
+            b = self._router_norm(final_text)
+            # The decoder lags the audio by up to a second, so the common "mismatch" is the
+            # final transcript carrying one more word than the prefetch saw. A prefetch that
+            # is a prefix covering most of the final words was judged on the same request.
+            if not a or not (a == b or (b.startswith(a) and len(a) >= ROUTER_PREFETCH_MIN_MATCH * len(b))):
                 self.logger.info("Router: prefetch mismatch, judging again")
+                # The abandoned request is still running on the single-slot server; let it
+                # finish so the judgment made now does not queue behind it and time out.
+                pf.done.wait(ROUTER_TIMEOUT)
                 return False, None
+            if a != b:
+                self.logger.info(f"Router: prefetch accepted as a prefix of the final transcript ({len(a)}/{len(b)} chars)")
             pf.done.wait(ROUTER_TIMEOUT)
             waited_ms = (time.monotonic() - t0) * 1000.0
             if not pf.done.is_set():
