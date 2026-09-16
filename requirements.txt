@@ -41,5 +41,10 @@ deepseek-harness-sdk>=0.1.2rc1
 # Model downloads in setup.sh (the `hf` CLI).
 huggingface_hub>=0.30.0
 
+# Turn router (turn_router.py): one small POST to the local server's /judge
+# endpoint before each turn. Already a transitive dependency; pinned so the
+# router does not depend on what huggingface_hub happens to pull in.
+requests>=2.28.0
+
 # Optional alternative TTS engine, selected with VOICE_ASSISTANT_TTS_ENGINE:
 #   supertonic     # Supertonic 3       (~99M, ONNX, 31 languages) -- RTF 1.90 here

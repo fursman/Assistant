@@ -1,0 +1,97 @@
+{
+ "version": 1,
+ "rubric": "v2",
+ "model": "Qwen3.8-27B-UD-IQ4_XS",
+ "fitted_on": "331 gold-labeled utterances, 2026-09-16",
+ "system": "You are the front-door router of a voice assistant running on the user's Linux laptop. The assistant can answer from its own knowledge, search the web, and run shell commands. The transcript comes from speech recognition and may contain errors. Answer each question with exactly one word.",
+ "questions": {
+  "addressed": {
+   "text": "Is the speaker talking to the voice assistant, rather than to someone else in the room or thinking aloud? Answer yes or no.",
+   "a": 1.2430087029684174,
+   "c": 2.6624229195053832,
+   "n": 331,
+   "base_rate": 0.979,
+   "acc_raw": 0.955,
+   "acc_cal": 0.988,
+   "auroc": 0.988
+  },
+  "intelligible": {
+   "text": "Taking the previous exchange into account, is it clear what the user wants? Answer yes or no.",
+   "a": 0.9496657791107265,
+   "c": 4.623868297694492,
+   "n": 331,
+   "base_rate": 0.937,
+   "acc_raw": 0.701,
+   "acc_cal": 0.964,
+   "auroc": 0.966
+  },
+  "needs_web": {
+   "text": "Taking the previous exchange into account, would acting on this turn require looking something up on the internet (news, weather, a specific person, company, product, or anything recent)? Answer yes or no.",
+   "a": 0.8513931678394445,
+   "c": -0.8400201855939612,
+   "n": 331,
+   "base_rate": 0.184,
+   "acc_raw": 0.934,
+   "acc_cal": 0.94,
+   "auroc": 0.97
+  },
+  "needs_shell": {
+   "text": "Taking the previous exchange into account, would acting on this turn require running a command on this computer (inspecting or changing hardware, files, processes, services or settings)? A 'yes' or 'go ahead' that confirms a proposed command counts. Answer yes or no.",
+   "a": 0.7046076613401919,
+   "c": 0.6906970675995946,
+   "n": 331,
+   "base_rate": 0.35,
+   "acc_raw": 0.873,
+   "acc_cal": 0.879,
+   "auroc": 0.942
+  },
+  "risky": {
+   "text": "Taking the previous exchange into account, would acting on this turn change or disrupt the machine or the user's data (turn hardware off, delete or overwrite files, reboot, change passwords, settings or firmware)? Confirming such a proposal counts. Answer yes or no.",
+   "a": 1.5105870494814797,
+   "c": 2.6840033193650967,
+   "n": 331,
+   "base_rate": 0.124,
+   "acc_raw": 0.94,
+   "acc_cal": 0.952,
+   "auroc": 0.973
+  },
+  "simple": {
+   "text": "Is this a simple question or casual remark that a small local model can answer well without any tools? A confirmation of a proposed action is not simple. Answer yes or no.",
+   "a": 0.6973098257133618,
+   "c": 0.8168743524617235,
+   "n": 331,
+   "base_rate": 0.378,
+   "acc_raw": 0.828,
+   "acc_cal": 0.852,
+   "auroc": 0.926
+  },
+  "followup": {
+   "text": "Is this utterance a follow-up to the previous exchange rather than a new topic? Answer yes or no.",
+   "a": 1.0360546252417904,
+   "c": -0.1358556523657512,
+   "n": 331,
+   "base_rate": 0.613,
+   "acc_raw": 0.9,
+   "acc_cal": 0.9,
+   "auroc": 0.969
+  },
+  "question": {
+   "text": "Is the user asking a question, as opposed to giving an instruction, confirming, or making a remark? Answer yes or no.",
+   "a": 0.9847947271214924,
+   "c": -1.4256690729996024,
+   "n": 331,
+   "base_rate": 0.505,
+   "acc_raw": 0.912,
+   "acc_cal": 0.924,
+   "auroc": 0.976
+  }
+ },
+ "thresholds": {
+  "drop_junk": 0.8,
+  "needs_web": 0.2,
+  "needs_shell": 0.2,
+  "risky": 0.3,
+  "simple_local": 0.7
+ },
+ "formula": "p_yes = sigmoid(a * (logit_yes - logit_no) + c) with the engine's option log-probs; junk = 1 - min(p_addressed, p_intelligible)"
+}

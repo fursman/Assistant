@@ -68,6 +68,14 @@ from silero_vad import load_silero_vad
 
 import web_tools  # search and fetch, shared with the dsh MCP sidecar
 
+# The turn router is optional twice over: it needs `requests`, and it needs
+# the /judge endpoint on the local server. Without either the assistant is
+# exactly what it was before the router existed.
+try:
+    from turn_router import TurnRouter
+except Exception:  # ImportError, or requests missing from an older venv
+    TurnRouter = None
+
 # faster-whisper is NOT imported here on purpose: it costs ~4.7 s and ~255 MB
 # of RSS at startup for a fallback the default configuration never takes.
 # _load_whisper() imports it at the moment it is actually needed.
@@ -327,6 +335,39 @@ LOCAL_TOOL_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_TIMEOUT", "30")
 LOCAL_TOOL_MAX_OUTPUT = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_MAX_OUTPUT", "4000"))
 # How many tool round-trips before the model must answer in words.
 LOCAL_MAX_TOOL_ITERS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS", "5"))
+
+# --- Turn router -----------------------------------------------------------
+# One prefill-only judgment call in front of every turn (turn_router.py). The
+# local llama-server's /judge endpoint answers the eight yes/no questions of
+# the router rubric in a single forward pass (~0.4 s on the 27B), and the
+# calibrated answers decide three things before the turn goes anywhere:
+# whether it is junk to ignore (the room talking, not the user), which tools
+# the local model is offered, and whether it is simple enough for the local
+# model or should go to Claude. Each is switchable on its own. The router
+# fails open: when the endpoint is missing, slow or down, the verdict is
+# "no opinion" and the turn runs exactly as it did before the router existed.
+ROUTER_ENABLED = os.getenv("VOICE_ASSISTANT_ROUTER", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# The server with the /judge endpoint: the local model's own, unless told otherwise.
+ROUTER_URL = os.getenv("VOICE_ASSISTANT_ROUTER_URL", "").strip() \
+    or re.sub(r"/v1/?$", "", LOCAL_LLM_URL.rstrip("/"))
+# Move a turn between the local model and Claude on the verdict.
+ROUTER_ROUTE = os.getenv("VOICE_ASSISTANT_ROUTER_ROUTE", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# Offer the local model only the tools the verdict asks for.
+ROUTER_TOOLS = os.getenv("VOICE_ASSISTANT_ROUTER_TOOLS", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# Ignore a spoken turn the verdict calls junk (typed input is never dropped).
+ROUTER_DROP = os.getenv("VOICE_ASSISTANT_ROUTER_DROP", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# Past this many seconds the router has no opinion and the turn proceeds.
+ROUTER_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_ROUTER_TIMEOUT", "1.5"))
+# Prepended to the user's words when the verdict says the turn may change or
+# disrupt something. Same shape as the "[context: ...]" marker, and the system
+# prompts already say to confirm before anything irreversible; this only makes
+# it salient on the turns where it matters.
+ROUTER_RISKY_MARKER = ("[router: this request may change or disrupt the machine or "
+                       "the user's data; confirm before acting]\n")
 
 # --- DeepSeek Harness (dsh) -------------------------------------------------
 # The harness's home: its generated `sdk-minimal` profile, our patch to it and
@@ -2483,6 +2524,12 @@ class VoiceAssistant:
         self._dsh_reset_pending = False
         self._dsh_error = ""
 
+        # Turn router (turn_router.py): a verdict per turn, held from the
+        # moment the utterance is known until the turn ends.
+        self._router = None
+        self._router_verdict = None
+        self._router_turn_at = None      # when the previous turn's utterance arrived
+
         # Per-turn streaming state
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
@@ -2521,6 +2568,7 @@ class VoiceAssistant:
         self._vocab = VocabularyCorrector.load(
             STT_VOCAB_FILE, STT_VOCAB_MIN_RATIO, self.logger)
         self._preflight_checks()
+        self._setup_router()
         self._session_id = self._load_session_id()
         self._load_local_history()
         self._setup_audio()
@@ -3825,6 +3873,8 @@ class VoiceAssistant:
         # of the saved history: it is not something the user said.
         nudge_at = None
         markup_suppressed = False
+        # Every tool, or only what the router's verdict asked for.
+        tools = self._router_tools()
 
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
             # Offer tools until the last allowed step, so the model has to
@@ -3843,8 +3893,8 @@ class VoiceAssistant:
                 model=LOCAL_LLM_MODEL, messages=messages, stream=True,
                 temperature=LOCAL_LLM_TEMP, top_p=LOCAL_LLM_TOP_P,
                 max_tokens=LOCAL_LLM_MAX_TOKENS, extra_body=extra_body)
-            if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS:
-                kwargs["tools"] = LOCAL_TOOLS
+            if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS and tools:
+                kwargs["tools"] = tools
 
             stream = None
             text_at_step_start = len(self._assistant_text)
@@ -4447,6 +4497,9 @@ class VoiceAssistant:
         while it is loading or down -- and the check here is what keeps the
         harness's own five retries (17 s, measured) from ever being paid.
         """
+        routed = self._router_route()
+        if routed is not None:
+            return routed
         if self.backend not in ("local", "dsh"):
             return "claude"
         state = _local_llm_health()
@@ -4519,6 +4572,155 @@ class VoiceAssistant:
         self._notify(f"☁️ Local model {label} — asking Claude", transient=True,
                      slot="progress")
         self._set_status("thinking", backend="claude")
+
+    # ------------------------------------------------------------------
+    # Turn router
+    # ------------------------------------------------------------------
+    # Every method here is wrapped so that a failure inside the router path
+    # is logged and the turn proceeds exactly as it would have without one.
+
+    def _setup_router(self):
+        if not ROUTER_ENABLED:
+            self.logger.info("Turn router: off (VOICE_ASSISTANT_ROUTER=0)")
+            return
+        if TurnRouter is None:
+            self.logger.warning("Turn router: turn_router.py could not be imported "
+                                "(is `requests` installed in the venv?) — off")
+            return
+        try:
+            self._router = TurnRouter(ROUTER_URL, timeout=ROUTER_TIMEOUT, logger=self.logger)
+            self.logger.info(f"Turn router: {self._router.describe()}")
+        except Exception as e:
+            self.logger.warning(f"Turn router: {e} — off")
+            self._router = None
+
+    def _router_previous(self):
+        """The last exchange as (user, assistant, age_seconds), or None.
+
+        The pair comes from the shared conversation ledger, so it is the same
+        pair whichever backend answered it and it survives a restart. The age
+        is measured from when the previous turn's utterance arrived: kept in
+        memory across turns, and after a restart taken from the turn-context
+        state file, which _turn_context rewrites on every turn (this runs
+        before that rewrite). No timestamp means no previous exchange, which
+        is how the calibration set was built.
+        """
+        exchanges = self._ledger().transcript
+        if not exchanges:
+            return None
+        last = exchanges[-1]
+        at = self._router_turn_at
+        if at is None:
+            try:
+                at = json.loads(TURN_CONTEXT_FILE.read_text()).get("at")
+            except (OSError, ValueError, AttributeError):
+                at = None
+        if not isinstance(at, (int, float)):
+            return None
+        return (str(last.get("user", "")), str(last.get("assistant", "")), time.time() - at)
+
+    def _router_judge(self, text, typed=False):
+        """Ask the router about this turn. Never raises; None means no opinion."""
+        if self._router is None:
+            return None
+        try:
+            return self._router.judge(text, typed=typed, previous=self._router_previous())
+        except Exception as e:
+            self.logger.warning(f"Router failed ({e}); proceeding without it")
+            return None
+
+    def _router_record(self, verdict):
+        """Append a verdict to router.jsonl. Never raises."""
+        if verdict is None or self._router is None:
+            return
+        try:
+            self._router.record(verdict)
+        except Exception as e:
+            self.logger.debug(f"Router: could not record the verdict ({e})")
+
+    def _router_used(self, backend):
+        """Note which backend actually took the turn, for the record."""
+        v = self._router_verdict
+        if v is not None:
+            v.backend = backend
+
+    def _router_finish(self):
+        """End of turn: record the verdict with its outcome and forget it.
+
+        Idempotent, and called from every path a turn can end on, so a
+        verdict is written exactly once even when the turn never reached the
+        model.
+        """
+        v, self._router_verdict = self._router_verdict, None
+        self._router_record(v)
+
+    def _router_marker(self) -> str:
+        """The risky-turn marker for this turn, or ""."""
+        try:
+            v = self._router_verdict
+            return ROUTER_RISKY_MARKER if v is not None and v.risky else ""
+        except Exception as e:
+            self.logger.warning(f"Router marker failed ({e})")
+            return ""
+
+    def _router_tools(self):
+        """The tool schemas the local model is offered this turn.
+
+        All of them, as before, unless the router has a verdict and gating is
+        on; then only what the verdict asked for, and an empty list when it
+        asked for nothing -- the schema is withheld entirely, which is also
+        what switches off llama-server's tool-call parser for the turn.
+        """
+        v = self._router_verdict
+        if v is None or not ROUTER_TOOLS:
+            return LOCAL_TOOLS
+        try:
+            wanted = set(v.tools)
+            tools = [t for t in LOCAL_TOOLS if t["function"]["name"] in wanted]
+            self.logger.info(f"Router: tools offered: {', '.join(sorted(wanted)) or 'none'}")
+            return tools
+        except Exception as e:
+            self.logger.warning(f"Router tool gating failed ({e}); offering every tool")
+            return LOCAL_TOOLS
+
+    def _router_route(self):
+        """The router's backend for this turn, or None to leave today's choice alone.
+
+        A turn only moves when the destination can take it: "local" needs a
+        server that is ready, "claude" needs the CLI. A verdict that agrees
+        with the backend already in force changes nothing and is not cued.
+        A harness preference (dsh) is never overridden.
+        """
+        v = self._router_verdict
+        if v is None or not ROUTER_ROUTE or self.backend_pref == "dsh":
+            return None
+        try:
+            if v.route == "local":
+                if self.backend in ("local", "dsh"):
+                    return None
+                if _local_llm_health() != "ready":
+                    self.logger.info("Router: wanted the local model, but it is not ready")
+                    return None
+                target = self._local_backend()
+            else:
+                if self.backend == "claude":
+                    return None
+                if not self._claude_available:
+                    self.logger.info("Router: wanted Claude, but the claude CLI is not installed")
+                    return None
+                target = "claude"
+            label = self.BACKEND_LABEL.get(target, target)
+            self.logger.info(f"Router: this turn goes to {target} "
+                             f"({self.BACKEND_LABEL.get(self.backend, self.backend)} is the default)")
+            # The transcript is the record, and a swap is the one thing it
+            # cannot infer. Silent otherwise: this can happen on any turn, and
+            # a chime each time would make the routing the loudest thing here.
+            self._append_transcript("system", f"Router: {label} answers this turn")
+            self._set_status("thinking", backend=target)
+            return target
+        except Exception as e:
+            self.logger.warning(f"Router routing failed ({e}); using the usual backend")
+            return None
 
     @staticmethod
     def _discard_sentences(sentence_q):
@@ -4614,6 +4816,9 @@ class VoiceAssistant:
         marker = self._turn_context()
         if marker:
             self.logger.info(f"Context: {marker.strip()}")
+        marker += self._router_marker()
+        # For the next turn's router call: when this utterance arrived.
+        self._router_turn_at = time.time()
 
         try:
             return self._run_turn(marker + text, abort, sentence_q, tts_thread)
@@ -4624,9 +4829,11 @@ class VoiceAssistant:
             if self._sentence_queue is sentence_q:
                 self.logger.warning("Turn ended abnormally — closing the TTS pipeline")
                 self._end_tts(sentence_q, tts_thread, drain=False)
+            self._router_finish()
 
     def _run_turn(self, text, abort, sentence_q, tts_thread):
         backend = self._pick_backend_for_query()
+        self._router_used(backend)
         if backend in ("local", "dsh"):
             self._play_chime_async("processing")
             if backend == "dsh":
@@ -4640,6 +4847,7 @@ class VoiceAssistant:
                 if LLM_FALLBACK and self._claude_available:
                     self._cue_fallback("failed")
                     backend = "claude"
+                    self._router_used(backend)
                 else:
                     detail = self._dsh_error if backend == "dsh" else ""
                     return self._speak_error(
@@ -5171,6 +5379,13 @@ class VoiceAssistant:
                 muted = True
             self._set_status("thinking")
             self.logger.info(f"Typed query: {text[:80]}")
+            # The router's opinion. Typed input is never dropped: the user
+            # pressed Enter on it, so "not addressed to the assistant" cannot
+            # be true.
+            verdict = await loop.run_in_executor(None, self._router_judge, text, True)
+            if verdict is not None:
+                self._router_verdict = verdict
+                self.logger.info(verdict.log_line())
             abort = threading.Event()
             reply = await loop.run_in_executor(
                 None, self._query_and_speak, text, abort, speak)
@@ -5180,6 +5395,7 @@ class VoiceAssistant:
             self.logger.error(f"Typed query failed: {e}", exc_info=True)
             return {"ok": False, "error": str(e)}
         finally:
+            self._router_finish()
             if muted:
                 self.capture.flush()
                 self.capture.mute(False)
@@ -5318,6 +5534,18 @@ class VoiceAssistant:
                 self.logger.info(f"Rejected (echo of TTS): {transcription}")
                 return
 
+            # The router's opinion: junk is dropped like any other rejected
+            # transcript (no reply, no chime); anything else is kept for the
+            # turn, which reads it when choosing a backend and offering tools.
+            verdict = await loop.run_in_executor(None, self._router_judge, transcription, False)
+            if verdict is not None:
+                if verdict.drop and ROUTER_DROP:
+                    self.logger.info(f"Router: ignored (junk p={verdict.junk:.2f}) : {transcription}")
+                    self._router_record(verdict)
+                    return
+                self._router_verdict = verdict
+                self.logger.info(verdict.log_line())
+
             self.logger.info(f"Transcription: {transcription}")
             # Goes to the indicator, not to a notification: the conversation is
             # a live view, and GNOME notifications cannot be one.
@@ -5340,6 +5568,7 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.error(f"Processing error: {e}", exc_info=True)
         finally:
+            self._router_finish()
             # Both of these exist to swallow the room's tail rather than
             # transcribe our own voice -- so both are conditional on having
             # actually spoken. On a turn that produced nothing (a breath that

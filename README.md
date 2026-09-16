@@ -49,7 +49,7 @@ network in each mode.
 - [Quick start](#quick-start) · [Requirements](#requirements) · [How it works](#how-it-works) · [Features](#features)
 - [Control](#control) · [LLM backends](#llm-backends-claude-or-a-local-qwen38-27b)
 - [Speech recognition](#speech-recognition) · [End of turn](#end-of-turn) · [Speech synthesis](#speech-synthesis) · [Making text speakable](#making-text-speakable)
-- [Knowing that time passed](#knowing-that-time-passed) · [Web search](#web-search) · [Desktop](#desktop) · [Configuration](#configuration)
+- [Knowing that time passed](#knowing-that-time-passed) · [Turn router](#turn-router) · [Web search](#web-search) · [Desktop](#desktop) · [Configuration](#configuration)
 - [Privacy](#privacy-and-what-leaves-the-machine) · [Power and GPU passthrough](#power-suspend-and-gpu-passthrough) · [Troubleshooting](#troubleshooting)
 - [Addendum: for the next reader, human or model](#addendum-for-the-next-reader-human-or-model)
 
@@ -579,6 +579,65 @@ spoken, and not to greet the user about it. State lives in
 means no marker rather than a wrong one, and the first turn after an install is
 always silent.
 
+## Turn router
+
+Before a turn goes to any model, the local llama-server is asked eight yes/no
+questions about it in one forward pass -- no generation, just the
+log-probabilities of "yes" and "no" after each question (`POST /judge`, about
+0.4 s on the 27B). Is the speaker talking to the assistant? Is it clear what
+they want? Would acting on it need the web, or a command on this machine?
+Could it change or disrupt something? Is it simple enough for a small model
+with no tools? A follow-up? A question? The questions are asked with the
+previous exchange in front of them, so "yes, go ahead" inherits the meaning of
+what was just proposed.
+
+The raw answers are calibrated per question (`router_calibration.json`, a
+Platt fit on 331 hand-labelled utterances from this laptop's logs) and the
+calibrated probabilities make three decisions, each switchable on its own:
+
+| decision | rule | effect |
+|---|---|---|
+| **drop** | `1 - min(addressed, intelligible) >= 0.8`, spoken input only | the turn is ignored like any other rejected transcript: no reply, no chime |
+| **tools** | `web >= 0.2`, `shell >= 0.2` | the local model is offered only `web_search`/`fetch_page`, only `run_shell`, both, or no tool schema at all |
+| **route** | `simple >= 0.7` and no web, no shell, not risky | the turn stays local; anything else goes to Claude when the CLI is installed |
+
+A turn the router calls **risky** (`>= 0.3`) also gets a marker in front of the
+user's words, in the same style as the context marker, so the standing rule
+about confirming before anything irreversible is salient on exactly the turns
+where it matters:
+
+```
+[router: this request may change or disrupt the machine or the user's data; confirm before acting]
+```
+
+Routing respects what can actually answer: "local" needs a server that is
+ready, "claude" needs the `claude` CLI, a `dsh` preference is never overridden,
+and a verdict that agrees with the backend already chosen changes nothing. A
+routed turn is noted once in the log and the transcript; no chime, since this
+can happen on any turn.
+
+Every verdict is one line in the log:
+
+```
+Router: addressed=0.99 intelligible=0.97 web=0.05 shell=0.91 risky=0.12 simple=0.08 followup=0.80 question=0.30 -> route=claude tools=shell (412 ms)
+Router: ignored (junk p=0.93) : and then she said the thing about the
+```
+
+and one JSON line in `~/.local/state/voice-assistant/router.jsonl` -- the
+utterance, the exact context the judge saw, the raw and calibrated
+probabilities, the decisions, the latency, and which backend actually
+answered -- so the turns can be relabelled and the calibration refitted.
+
+The router **fails open**. No `/judge` endpoint, a server that is loading or
+down, a slow answer (`VOICE_ASSISTANT_ROUTER_TIMEOUT`, 1.5 s), a missing
+calibration file: the verdict is "no opinion" and the turn runs exactly as it
+did before the router existed. Typed input is never dropped. To switch it off
+entirely, `VOICE_ASSISTANT_ROUTER=0`; to keep the verdicts in the log but act
+on none of them, set `_ROUTE`, `_TOOLS` and `_DROP` to `0`. A calibration of
+your own goes in `~/.config/voice-assistant/router_calibration.json` and takes
+precedence over the repo's; the thresholds in it can be overridden one at a
+time with `VOICE_ASSISTANT_ROUTER_THR_*`.
+
 ## Web search
 
 The local backends get two tools, `web_search` and `fetch_page`, shared by the
@@ -813,6 +872,25 @@ optional.
 | `VOICE_ASSISTANT_WEB_PAGE_CHARS` | `4000` | characters of a fetched page |
 | `VOICE_ASSISTANT_WEB_TIMEOUT` | `12` | seconds for a search or fetch |
 
+### Turn router
+
+| variable | default | meaning |
+|---|---|---|
+| `VOICE_ASSISTANT_ROUTER` | `1` | ask the local server's `/judge` endpoint about every turn |
+| `VOICE_ASSISTANT_ROUTER_URL` | from `_LOCAL_URL` | the server with that endpoint (`/v1` stripped) |
+| `VOICE_ASSISTANT_ROUTER_ROUTE` | `1` | move a turn between the local model and Claude on the verdict |
+| `VOICE_ASSISTANT_ROUTER_TOOLS` | `1` | offer the local model only the tools the verdict asks for |
+| `VOICE_ASSISTANT_ROUTER_DROP` | `1` | ignore spoken turns the verdict calls junk |
+| `VOICE_ASSISTANT_ROUTER_TIMEOUT` | `1.5` | seconds before the router has no opinion |
+| `VOICE_ASSISTANT_ROUTER_THR_DROP` | `0.8` | junk probability at which a spoken turn is dropped |
+| `VOICE_ASSISTANT_ROUTER_THR_WEB` / `_SHELL` | `0.2` / `0.2` | probability at which a tool is offered |
+| `VOICE_ASSISTANT_ROUTER_THR_RISKY` | `0.3` | probability at which the risky marker is added |
+| `VOICE_ASSISTANT_ROUTER_THR_SIMPLE` | `0.7` | probability at which a turn is simple enough to stay local |
+
+The threshold defaults are the ones in `router_calibration.json`; the file
+under `~/.config/voice-assistant/` wins over the repo copy, and the variables
+win over both.
+
 ### DeepSeek Harness
 
 | variable | default | meaning |
@@ -973,6 +1051,9 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 | `voice_assistant.py` | The assistant |
 | `web_tools.py` | Keyless web search and page fetch, shared by the local backends |
 | `dsh_web_mcp.py` | The same two tools served to the DeepSeek Harness over MCP |
+| `turn_router.py` | The turn router: one `/judge` call per turn, calibrated, failing open |
+| `router_calibration.json` | Its rubric fit and thresholds (`~/.config/voice-assistant/` copy wins) |
+| `tests/test_turn_router.py` | Router tests; `.venv/bin/python -m pytest tests` |
 | `setup.sh` | One-shot installer, including the local LLM stack |
 | `voice-assistant-ctl` | start / stop / status / toggle / logs / test |
 | `voice-llm` | Switch and inspect the LLM backend |
