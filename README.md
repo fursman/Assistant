@@ -581,7 +581,7 @@ always silent.
 
 ## Turn router
 
-Before a turn goes to any model, the local llama-server is asked eight yes/no
+Before a turn goes to any model, the local llama-server is asked six yes/no
 questions about it in one forward pass -- no generation, just the
 log-probabilities of "yes" and "no" after each question (`POST /judge`, about
 0.4 s on the 27B). Is the speaker talking to the assistant? Is it clear what
