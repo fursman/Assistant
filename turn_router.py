@@ -2,8 +2,8 @@
 
 The local llama-server (the same one that answers as the local model) has a
 POST /judge endpoint that answers typed yes/no questions about a context in a
-single forward pass and returns the log-probability of each option. Eight
-such questions -- the v2 rubric, verbatim from the System One project -- are
+single forward pass and returns the log-probability of each option. The
+questions named in the calibration file (v3: six terse questions from the System One project) are
 asked about every utterance, the answers are calibrated with a per-question
 Platt fit (`router_calibration.json`), and the calibrated probabilities make
 three decisions:
@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 # --- The rubric ---------------------------------------------------------------
-# Verbatim ROUTER_SYSTEM and ROUTER_Q2 from systemone/data.py. The calibration
+# Verbatim ROUTER_SYSTEM and ROUTER_Q3 from systemone/data.py (the built-in fallback). The calibration
 # was fitted on these exact strings; a changed word is an uncalibrated router.
 ROUTER_SYSTEM = ("You are the front-door router of a voice assistant running on the user's Linux laptop. "
                  "The assistant can answer from its own knowledge, search the web, and run shell commands. "
@@ -50,14 +50,12 @@ ROUTER_SYSTEM = ("You are the front-door router of a voice assistant running on 
                  "Answer each question with exactly one word.")
 
 ROUTER_QUESTIONS: List[Tuple[str, str]] = [
-    ("addressed", "Is the speaker talking to the voice assistant, rather than to someone else in the room or thinking aloud?"),
-    ("intelligible", "Taking the previous exchange into account, is it clear what the user wants?"),
-    ("needs_web", "Taking the previous exchange into account, would acting on this turn require looking something up on the internet (news, weather, a specific person, company, product, or anything recent)?"),
-    ("needs_shell", "Taking the previous exchange into account, would acting on this turn require running a command on this computer (inspecting or changing hardware, files, processes, services or settings)? A 'yes' or 'go ahead' that confirms a proposed command counts."),
-    ("risky", "Taking the previous exchange into account, would acting on this turn change or disrupt the machine or the user's data (turn hardware off, delete or overwrite files, reboot, change passwords, settings or firmware)? Confirming such a proposal counts."),
-    ("simple", "Is this a simple question or casual remark that a small local model can answer well without any tools? A confirmation of a proposed action is not simple."),
-    ("followup", "Is this utterance a follow-up to the previous exchange rather than a new topic?"),
-    ("question", "Is the user asking a question, as opposed to giving an instruction, confirming, or making a remark?"),
+    ("addressed", "Is the speaker talking to the assistant, not to someone else or to themselves?"),
+    ("intelligible", "Given the previous exchange, is it clear what the user wants?"),
+    ("needs_web", "Given the previous exchange, does this turn need an internet lookup (news, weather, a person, company, product, anything recent)?"),
+    ("needs_shell", "Given the previous exchange, does this turn need a command run on this computer (inspect or change hardware, files, processes, services, settings)? Confirming a proposed command counts."),
+    ("risky", "Given the previous exchange, would acting on this turn change or disrupt the machine or the user's data (power off, delete, overwrite, reboot, passwords, settings, firmware)? Confirming such a proposal counts."),
+    ("simple", "Is this a simple question or remark a small local model can answer well without tools? Confirming a proposed action is not simple."),
 ]
 QUESTION_IDS = [q for q, _ in ROUTER_QUESTIONS]
 REQUIRED_QUESTIONS = ("addressed", "intelligible", "needs_web", "needs_shell", "risky", "simple")
@@ -363,7 +361,7 @@ class TurnRouter:
     def _parse(self, data: dict):
         by_id = {q.get("id"): q for q in data["questions"]}
         probs, raw, mass = {}, {}, {}
-        for qid in QUESTION_IDS:
+        for qid in self.calibration:  # the rubric actually asked (from the calibration file)
             q = by_id[qid]
             opts = {o["text"]: o for o in q["options"]}
             ly, ln = float(opts["yes"]["logprob"]), float(opts["no"]["logprob"])

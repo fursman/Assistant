@@ -111,7 +111,7 @@ def _verdict(probs, typed=False, thresholds=None):
                    latency_ms=1.0)
 
 
-# --- the rubric is the v2 rubric, verbatim --------------------------------------
+# --- the rubric is the v3 rubric, verbatim --------------------------------------
 
 def test_rubric_matches_calibration_file_and_systemone():
     cal = json.loads(REPO_CAL.read_text())
@@ -125,12 +125,12 @@ def test_rubric_matches_calibration_file_and_systemone():
         ns = {}
         src = SYSTEMONE_DATA.read_text()
         # Execute just the two definitions, not the module (it imports pandas).
-        for name in ("ROUTER_Q2", "ROUTER_SYSTEM"):
+        for name in ("ROUTER_Q3", "ROUTER_SYSTEM"):
             m = re.search(rf"^{name} = (\[.*?^\]|\(.*?\))\n", src, re.S | re.M)
             assert m, name
             exec(f"{name} = {m.group(1)}", ns)
         assert ns["ROUTER_SYSTEM"] == ROUTER_SYSTEM
-        assert ns["ROUTER_Q2"] == ROUTER_QUESTIONS
+        assert ns["ROUTER_Q3"] == ROUTER_QUESTIONS
 
 
 def test_request_body_is_exactly_the_judge_contract(router):
@@ -240,7 +240,7 @@ def test_decisions_end_to_end_over_http(router):
     v = r.judge("what is using all my disk space")
     assert v.route == "claude" and v.tools == ["run_shell"] and not v.drop and not v.risky
     assert v.log_line() == ("Router: addressed=0.99 intelligible=0.97 web=0.05 shell=0.91 risky=0.12 "
-                            f"simple=0.08 followup=0.80 question=0.30 -> route=claude tools=shell "
+                            f"simple=0.08 -> route=claude tools=shell "
                             f"({v.latency_ms:.0f} ms)")
 
     state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.99, "needs_web": 0.02,
