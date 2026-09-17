@@ -38,8 +38,9 @@ class FakeRouter:
         self.fail = fail
         self.verdict = FakeVerdict()
 
-    def judge(self, text, typed=False, previous=None):
+    def judge(self, text, typed=False, previous=None, timeout=None):
         self.calls.append((text, typed))
+        self.timeouts = getattr(self, "timeouts", []) + [timeout]
         if self.fail:
             raise RuntimeError("judge exploded")
         time.sleep(self.delay)
@@ -138,6 +139,7 @@ def loop_env(monkeypatch):
     """Deterministic recording-loop constants: 0.2 s chunks, checkpoints at
     0.35 s and 0.7 s of silence, a 2.5 s hard timeout."""
     monkeypatch.setattr(va, "ROUTER_PREFETCH", True)
+    monkeypatch.setattr(va, "ROUTER_PREFETCH_EARLY", True)
     monkeypatch.setattr(va, "RECORD_CHUNK_DURATION", 0.2)
     monkeypatch.setattr(va, "SMART_TURN_CHECKPOINTS", [(0.35, 0.9), (0.7, 0.75)])
     monkeypatch.setattr(va, "SILENCE_TIMEOUT", 2.5)
@@ -181,6 +183,25 @@ def test_prefetch_fires_once_at_first_checkpoint(loop_env):
     assert host.smart_turn.calls == 2, "the later checkpoint was reached"
     assert pf is not None and pf.raw == "what time is it"
     assert router.calls == [("what time is it", False)], "one router call, spoken"
+
+
+def test_default_is_one_prefetch_at_the_end_of_the_turn(loop_env, monkeypatch):
+    """With the early checkpoint call off (the default), the only judgment is
+    the one made when the turn completes, on the transcript as it stands; it
+    carries the longer prefetch timeout."""
+    monkeypatch.setattr(va, "ROUTER_PREFETCH_EARLY", False)
+    monkeypatch.setattr(va, "ROUTER_PREFETCH_TIMEOUT", 3.0)
+    router = FakeRouter(delay=0.02)
+    host = Host(router)
+    _record(host, [True, True, False, False, False, False], "what time is it", [0.1, 0.99])
+    pf = _wait_prefetch(host)
+    assert host.stt.partial_calls == [6], "partial() only when the turn ended"
+    assert host.events == ["predict", "predict", "partial"]
+    assert pf is not None and pf.raw == "what time is it"
+    assert router.calls == [("what time is it", False)]
+    assert router.timeouts == [3.0]
+    assert host._router_judge_spoken("What time is it?") is router.verdict
+    assert len(router.calls) == 1
 
 
 def test_prefetch_refreshed_at_end_of_turn_when_words_arrived(loop_env):

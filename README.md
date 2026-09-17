@@ -121,6 +121,15 @@ picks per query.
    exact command, and the reply clause by clause. Notifications only carry
    status. Left click the robot to read along; right click for the controls.
 
+The same switch is a spoken command: "switch to Claude", "go back to the local
+model", "use the harness". It is handled by the assistant before any model sees
+it, with the recogniser's usual misses accepted ("clog", "clawed" and "cloud"
+are all Claude). That matters because a model with a shell will otherwise do it
+the hard way: the harness once found `voice-llm claude` and ran it from inside
+its own tool call, which restarted the service it was running in, mid-sentence.
+The shell tool now runs any command that would stop or restart the assistant
+detached and a few seconds later, so the reply finishes first.
+
 ## Features
 
 - **Semantic end of turn** — an 8.7 MB audio classifier, not a silence timer.
@@ -904,6 +913,7 @@ optional.
 |---|---|---|
 | `VOICE_ASSISTANT_LOCAL_TOOLS` | `1` | give the local model a shell |
 | `VOICE_ASSISTANT_LOCAL_TOOL_TIMEOUT` | `30` | seconds one command may run |
+| `VOICE_ASSISTANT_SELF_RESTART_DELAY` | `6` | a tool command that would stop or restart the assistant's own service runs detached, this many seconds later |
 | `VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS` | `5` | tool rounds in one turn |
 | `VOICE_ASSISTANT_LOCAL_TOOL_MAX_OUTPUT` | `4000` | characters of output the model sees |
 | `VOICE_ASSISTANT_LOCAL_TOOL_HISTORY_OUTPUT` | `600` | and what is kept in later turns |
@@ -921,7 +931,9 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_TOOLS` | `1` | offer the local model only the tools the verdict asks for |
 | `VOICE_ASSISTANT_ROUTER_DROP` | `1` | ignore spoken turns the verdict calls junk |
 | `VOICE_ASSISTANT_ROUTER_TIMEOUT` | `1.5` | seconds before the router has no opinion |
-| `VOICE_ASSISTANT_ROUTER_PREFETCH` | `1` | judge a spoken turn during the end-of-turn wait, from the streaming transcript so far |
+| `VOICE_ASSISTANT_ROUTER_PREFETCH` | `1` | judge a spoken turn as soon as it is complete, from the streaming transcript, while the final transcript is produced |
+| `VOICE_ASSISTANT_ROUTER_PREFETCH_EARLY` | `0` | also judge at the first silence checkpoint (0.35 s); off because the decoder lagged the last words on every real turn and the call queued behind it |
+| `VOICE_ASSISTANT_ROUTER_PREFETCH_TIMEOUT` | `3.0` | seconds a prefetched call may take; the turn itself waits at most `ROUTER_TIMEOUT` for it |
 | `VOICE_ASSISTANT_ROUTER_THR_DROP` | `0.8` | junk probability at which a spoken turn is dropped |
 | `VOICE_ASSISTANT_ROUTER_THR_WEB` / `_SHELL` | `0.2` / `0.2` | probability at which a tool is offered |
 | `VOICE_ASSISTANT_ROUTER_THR_RISKY` | `0.3` | probability at which a turn is risky: Claude, with the risky marker |
@@ -948,8 +960,8 @@ win over both.
 | variable | default | meaning |
 |---|---|---|
 | `VOICE_ASSISTANT_DSH_MAX_TOKENS` | `2048` | reply cap under the harness |
-| `VOICE_ASSISTANT_DSH_CONTEXT_WINDOW` | `32768` | context declared to the runtime |
-| `VOICE_ASSISTANT_DSH_ROTATE_TOKENS` | `24000` | prompt size at which it gets a fresh, recapped session |
+| `VOICE_ASSISTANT_DSH_CONTEXT_WINDOW` | the server's `n_ctx` | context declared to the runtime (read from `/props` unless set; `32768` when the server cannot be asked) |
+| `VOICE_ASSISTANT_DSH_ROTATE_TOKENS` | `24000` | prompt size at which it gets a fresh, recapped session; capped at 75% of the window |
 | `VOICE_ASSISTANT_DSH_RECAP_CHARS` | `6000` | size of that recap |
 | `VOICE_ASSISTANT_DSH_TOOL_TIMEOUT` | `45` | seconds one harness `bash` command may run |
 | `VOICE_ASSISTANT_DSH_MAX_TOOL_CALLS` | `500` | tool calls in one turn before it is cut short |

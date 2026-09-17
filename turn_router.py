@@ -384,15 +384,17 @@ class TurnRouter:
                 "questions": self._questions}
 
     def judge(self, text: str, typed: bool = False,
-              previous: Optional[Tuple[str, str, float]] = None) -> Optional[Verdict]:
+              previous: Optional[Tuple[str, str, float]] = None,
+              timeout: Optional[float] = None) -> Optional[Verdict]:
         """One verdict, or None when the router has no opinion (disabled, down,
-        slow, or answering something other than what was asked)."""
+        slow, or answering something other than what was asked). `timeout`
+        overrides the router's own for this call (a prefetch may take longer)."""
         if not self.enabled or not text or not text.strip():
             return None
         body = self.request_body(text, typed=typed, previous=previous)
         t0 = time.monotonic()
         try:
-            r = self.session.post(self.url, json=body, timeout=self.timeout)
+            r = self.session.post(self.url, json=body, timeout=self.timeout if timeout is None else timeout)
         except requests.RequestException as e:
             self._debug(f"router: no answer from {self.url} ({e.__class__.__name__})")
             return None
