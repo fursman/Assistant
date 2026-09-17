@@ -189,7 +189,7 @@ def test_thresholds_come_from_file_then_env(monkeypatch, tmp_path):
     r = TurnRouter("http://127.0.0.1:1", calibration_path=str(REPO_CAL), log_path=tmp_path / "r.jsonl")
     assert r.thresholds == {"drop_junk": 0.55, "needs_web": 0.33, "needs_shell": 0.44,
                             "risky": 0.66, "simple_local": 0.77,
-                            "escalate_web": 0.6, "escalate_shell": 0.6, "hard": 0.3, "caution": 0.1}
+                            "escalate_web": 1.01, "escalate_shell": 1.01, "hard": 0.3, "caution": 0.1}
     monkeypatch.setenv("VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL", "0.9")
     monkeypatch.setenv("VOICE_ASSISTANT_ROUTER_THR_HARD", "0.25")
     r = TurnRouter("http://127.0.0.1:1", calibration_path=str(REPO_CAL), log_path=tmp_path / "r.jsonl")
@@ -227,23 +227,34 @@ def test_tool_decisions_at_their_thresholds():
     assert _verdict({"question": 0.5}).question and not _verdict({"question": 0.49}).question
 
 
-def test_route_leaves_local_only_for_risky_turns_and_real_tool_tasks():
+def test_route_leaves_local_only_for_risky_turns_by_default():
     quiet = {"needs_web": 0.0, "needs_shell": 0.0, "risky": 0.0}
-    # simple stays local, tool or no tool
     assert _verdict({**quiet, "simple": 0.7}).route == "local"
-    assert _verdict({**quiet, "simple": 0.99, "needs_shell": 0.9}).route == "local"
-    assert _verdict({**quiet, "simple": 0.99, "needs_web": 0.9}).route == "local"
-    # not simple and no strong tool need: local (the hard lane)
     assert _verdict({**quiet, "simple": 0.1}).route == "local"
-    # a glance at the machine is not a task; past the escalation bar it is
-    assert _verdict({**quiet, "simple": 0.3, "needs_shell": 0.59}).route == "local"
-    assert _verdict({**quiet, "simple": 0.3, "needs_shell": 0.6}).route == "claude"
-    assert _verdict({**quiet, "simple": 0.3, "needs_web": 0.6}).route == "claude"
-    assert _verdict({**quiet, "simple": 0.699, "needs_web": 0.6}).route == "claude"
+    # a confident tool task stays local too: the local model has the tools
+    assert _verdict({**quiet, "simple": 0.0, "needs_shell": 1.0}).route == "local"
+    assert _verdict({**quiet, "simple": 0.0, "needs_web": 1.0}).route == "local"
+    assert not _verdict({**quiet, "simple": 0.0, "needs_shell": 1.0}).escalate
     # risky always leaves
     assert _verdict({**quiet, "simple": 0.99, "risky": 0.3}).route == "claude"
     assert _verdict({**quiet, "simple": 0.99, "risky": 0.29}).route == "local"
-    assert _verdict({**quiet, "simple": 0.0, "risky": 0.3}).escalate is False
+
+
+def test_escalation_of_tool_tasks_when_switched_on():
+    thr = load_thresholds(json.loads(REPO_CAL.read_text())["thresholds"])
+    thr.update({"escalate_shell": 0.6, "escalate_web": 0.6})
+    quiet = {"needs_web": 0.0, "needs_shell": 0.0, "risky": 0.0}
+    v = lambda p: _verdict({**quiet, **p}, thresholds=thr)  # noqa: E731
+    # simple stays local, tool or no tool
+    assert v({"simple": 0.99, "needs_shell": 0.9}).route == "local"
+    assert v({"simple": 0.99, "needs_web": 0.9}).route == "local"
+    # a glance at the machine is not a task; past the escalation bar it is
+    assert v({"simple": 0.3, "needs_shell": 0.59}).route == "local"
+    assert v({"simple": 0.3, "needs_shell": 0.6}).route == "claude"
+    assert v({"simple": 0.3, "needs_web": 0.6}).route == "claude"
+    assert v({"simple": 0.699, "needs_web": 0.6}).route == "claude"
+    assert v({"simple": 0.0, "needs_shell": 1.0}).escalate
+    assert "escalate" in v({"simple": 0.0, "needs_shell": 1.0}).log_line()
 
 
 def test_the_casual_questions_that_went_to_claude_now_stay_local():
@@ -275,9 +286,9 @@ def test_decisions_end_to_end_over_http(router):
                                     "needs_shell": 0.91, "risky": 0.12, "simple": 0.08,
                                     "followup": 0.80, "question": 0.30})
     v = r.judge("what is using all my disk space")
-    assert v.route == "claude" and v.tools == ["run_shell"] and not v.drop and not v.risky
+    assert v.route == "local" and v.tools == ["run_shell"] and not v.drop and not v.risky
     assert v.log_line() == ("Router: addressed=0.99 intelligible=0.97 web=0.05 shell=0.91 risky=0.12 "
-                            f"simple=0.08 -> route=claude tools=shell escalate "
+                            f"simple=0.08 -> route=local tools=shell caution "
                             f"({v.latency_ms:.0f} ms)")
 
     state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.99, "needs_web": 0.02,
@@ -296,7 +307,7 @@ def test_decisions_end_to_end_over_http(router):
     state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.99, "needs_web": 0.0,
                                     "needs_shell": 0.9, "risky": 0.8, "simple": 0.1})
     v = r.judge("yes go ahead and reboot it")
-    assert v.risky and v.route == "claude" and v.log_line().endswith(f"tools=shell risky escalate ({v.latency_ms:.0f} ms)")
+    assert v.risky and v.route == "claude" and v.log_line().endswith(f"tools=shell risky ({v.latency_ms:.0f} ms)")
 
 
 # --- fail open --------------------------------------------------------------------------

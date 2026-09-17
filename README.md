@@ -614,7 +614,7 @@ calibrated probabilities make the decisions, each switchable on its own:
 |---|---|---|
 | **drop** | `1 - min(addressed, intelligible) >= 0.8`, spoken input only | the turn is ignored like any other rejected transcript: no reply, no chime |
 | **tools** | `web >= 0.2`, `shell >= 0.2` | the local model is offered only `web_search`/`fetch_page`, only `run_shell`, both, or no tool schema at all |
-| **route** | `risky >= 0.3`, or not simple (`< 0.7`) and `shell >= 0.6` or `web >= 0.6` | the turn goes to Claude when the CLI is installed; everything else stays local. The local model has the same tools, so a question that merely glances at the machine ("are you up?", shell 0.3) is answered in seconds rather than sent on a half-minute round trip |
+| **route** | `risky >= 0.3` | the turn goes to Claude when the CLI is installed; everything else stays local, tool calls included. The local model has the same tools, and a Claude round trip is 25-75 s. Escalating confident tool tasks (not simple, and `shell`/`web` past a bar) is available with `VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL` / `_WEB` and off by default |
 | **hard** | stays local, no tool wanted, `simple <= 0.3` | thinking on demand: the model's reasoning is switched on for this turn only under `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` tokens (512), after a spoken "Let me think about that." When `VOICE_ASSISTANT_HARD_URL` names a bigger model elsewhere and its `/health` answers, the turn goes there instead, with the last few exchanges and no tools; if it fails before answering, the local model takes the turn |
 | **caution** | stays local, `0.1 <= risky < 0.3` | a softer marker asks the model to confirm before changing anything |
 
@@ -628,9 +628,9 @@ where it matters:
 [router: this may touch the machine or the user's data; if acting on it would change or disrupt anything, confirm before acting]
 ```
 
-On the 331 labelled utterances the local lane is 55% of turns under this policy
-(25% under the old "simple and nothing else" rule); the turns it moves are the
-casual ones that scored 0.2-0.6 on shell or web.
+On the 331 labelled utterances the local lane is 88% of turns under this policy
+(25% under the old "simple and nothing else" rule); 12 of the 41 turns labelled
+risky sit below the risky bar and stay local, 10 of them with the caution marker.
 
 After a local turn, the same engine is asked three more questions about the
 exchange it just produced -- did the reply answer the question, does it state
@@ -926,7 +926,7 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_THR_WEB` / `_SHELL` | `0.2` / `0.2` | probability at which a tool is offered |
 | `VOICE_ASSISTANT_ROUTER_THR_RISKY` | `0.3` | probability at which a turn is risky: Claude, with the risky marker |
 | `VOICE_ASSISTANT_ROUTER_THR_SIMPLE` | `0.7` | probability at which a turn counts as simple (stays local whatever it needs) |
-| `VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL` / `_WEB` | `0.6` / `0.6` | tool probability past which a non-simple turn is a task for Claude |
+| `VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL` / `_WEB` | `1.01` / `1.01` | tool probability past which a non-simple turn goes to Claude; above 1 = never (the default). `0.6` sends confident tool tasks to Claude |
 | `VOICE_ASSISTANT_ROUTER_THR_HARD` | `0.3` | `simple` at or below this, with no tool wanted, is a hard question |
 | `VOICE_ASSISTANT_ROUTER_THR_CAUTION` | `0.1` | `risky` from here up (below the risky bar) adds the caution marker on a local turn |
 | `VOICE_ASSISTANT_ROUTER_BACKENDS` | `local,dsh` | backends the router runs for; add `claude` to route simple turns away from Claude as before |

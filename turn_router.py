@@ -10,10 +10,11 @@ three decisions:
 
   drop    the turn is junk (not addressed to the assistant, or unintelligible)
   tools   which tools the local model is offered (web, shell, both, none)
-  route   "claude" when the turn is risky, or is a real tool task rather than a
-          quick question (not simple, and the web or shell probability is past
-          the escalation bar); "local" otherwise -- the local model has the same
-          tools and answers in seconds what Claude takes half a minute over
+  route   "claude" when the turn is risky; "local" otherwise -- the local model
+          has the same tools and answers in seconds what Claude takes half a
+          minute over. Escalation of confident tool tasks (not simple, and the
+          web or shell probability past a bar) is available but off by default
+          (escalate_* thresholds above 1).
   hard    a local turn that wants no tool and is not a simple question: worth
           the model's own reasoning (or a bigger model, when one is configured)
   caution a local turn below the risky bar but not clear of it: a softer
@@ -74,8 +75,10 @@ PREVIOUS_REPLY_CHARS = 300
 
 DEFAULT_THRESHOLDS = {"drop_junk": 0.8, "needs_web": 0.2, "needs_shell": 0.2,
                       "risky": 0.3, "simple_local": 0.7,
-                      # a turn leaves the local model only past these (and only when not simple)
-                      "escalate_web": 0.6, "escalate_shell": 0.6,
+                      # a non-simple turn leaves the local model for Claude past these tool
+                      # probabilities; above 1 = never (the default: the local model has the
+                      # same tools, and a Claude round trip is 25-75 s)
+                      "escalate_web": 1.01, "escalate_shell": 1.01,
                       # at or below this p(simple), a tool-free local turn gets the model's reasoning
                       "hard": 0.3,
                       # from this p(risky) up (below the risky bar) a local turn carries the caution marker

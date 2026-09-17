@@ -72,8 +72,8 @@
   "needs_shell": 0.2,
   "risky": 0.3,
   "simple_local": 0.7,
-  "escalate_web": 0.6,
-  "escalate_shell": 0.6,
+  "escalate_web": 1.01,
+  "escalate_shell": 1.01,
   "hard": 0.3,
   "caution": 0.1
  },
