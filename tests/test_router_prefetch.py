@@ -95,6 +95,10 @@ class FakeSTT:
         self.events.append("partial")
         if isinstance(self.partial_text, Exception):
             raise self.partial_text
+        if isinstance(self.partial_text, list):
+            # a transcript that grows: one entry per call, the last one repeating
+            i = min(len(self.partial_calls) - 1, len(self.partial_text) - 1)
+            return self.partial_text[i]
         return self.partial_text
 
 
@@ -164,18 +168,89 @@ def test_prefetch_fires_once_at_first_checkpoint(loop_env):
     """Two speech chunks (plus the pre-roll), then silence. With 0.2 s chunks
     the first checkpoint (0.35 s) is crossed on the second silent chunk, the
     fourth read overall. smart-turn calls it unfinished there and finished
-    at 0.7 s; the prefetch must fire exactly once, at the first checkpoint,
-    and before smart-turn is consulted."""
+    at 0.7 s; the prefetch must fire at the first checkpoint, before
+    smart-turn is consulted. At the end of the turn the transcript is looked
+    at again, and since nothing new was heard the first call stands alone."""
     router = FakeRouter(delay=0.02)
     host = Host(router)
     _record(host, [True, True, False, False, False, False], "what time is it", [0.1, 0.99])
     pf = _wait_prefetch(host)
 
-    assert host.stt.partial_calls == [4], "partial() taken on the chunk that crossed 0.35 s"
-    assert host.events[:2] == ["partial", "predict"]
+    assert host.stt.partial_calls == [4, 6], "partial() at 0.35 s, and again when the turn ended"
+    assert host.events == ["partial", "predict", "predict", "partial"]
     assert host.smart_turn.calls == 2, "the later checkpoint was reached"
     assert pf is not None and pf.raw == "what time is it"
     assert router.calls == [("what time is it", False)], "one router call, spoken"
+
+
+def test_prefetch_refreshed_at_end_of_turn_when_words_arrived(loop_env):
+    """The decoder lagged: at 0.35 s it had two words, by the end of the turn
+    it had five. The end-of-turn look replaces the prefetch, and the final
+    transcript then reuses the second call."""
+    router = FakeRouter(delay=0.02)
+    host = Host(router)
+    _record(host, [True, True, False, False, False, False],
+            ["what time", "what time is it in tokyo"], [0.1, 0.99])
+    pf = _wait_prefetch(host)
+    assert pf is not None and pf.raw == "what time is it in tokyo"
+    time.sleep(0.1)
+    assert router.calls == [("what time", False), ("what time is it in tokyo", False)]
+    verdict = host._router_judge_spoken("What time is it in Tokyo?")
+    assert verdict is router.verdict
+    assert len(router.calls) == 2, "the refreshed prefetch was reused"
+
+
+def test_prefetch_kept_at_end_of_turn_when_it_covers_the_words(loop_env):
+    """One more word by the end of the turn is within the prefix rule, so the
+    first call stands and no second one is made."""
+    router = FakeRouter(delay=0.02)
+    host = Host(router)
+    _record(host, [True, True, False, False, False, False],
+            ["what time is it", "what time is it now"], [0.1, 0.99])
+    _wait_prefetch(host)
+    time.sleep(0.05)
+    assert router.calls == [("what time is it", False)]
+
+
+def test_prefetch_refreshed_on_silence_timeout(loop_env):
+    router = FakeRouter(delay=0.02)
+    host = Host(router)
+    # smart-turn never satisfied: the 2.5 s timeout ends the turn
+    _record(host, [True, True] + [False] * 20, ["what", "what is the tallest mountain"], [0.1, 0.1, 0.1])
+    _wait_prefetch(host)
+    time.sleep(0.05)
+    assert router.calls == [("what", False), ("what is the tallest mountain", False)]
+
+
+def test_prefix_rule():
+    ok = va.VoiceAssistant._router_prefix_ok
+    assert ok("what time is it", "what time is it")
+    assert ok("what time is", "what time is it")                 # 12/15 chars
+    assert ok("what time is", "what time is it now")             # 63% but only 2 words short
+    assert not ok("what time is", "what time is it now please")  # 3 words short
+    assert not ok("what time", "what is the time")               # not a prefix
+    assert not ok("", "what time is it")
+    assert ok("stop", "stop the music")
+
+
+def test_router_bypassed_when_claude_is_the_backend(monkeypatch):
+    monkeypatch.setattr(va, "ROUTER_PREFETCH", True)
+    monkeypatch.setattr(va, "ROUTER_BACKENDS", frozenset({"local", "dsh"}))
+    router = FakeRouter(delay=0.01)
+    host = Host(router)
+    host.backend = "claude"
+    assert host._router_active() is False
+    assert host._router_judge("what time is it", False) is None
+    assert host._router_judge("what time is it", True) is None
+    assert host._router_prefetch_start("what time is it") is False
+    assert host._router_judge_spoken("what time is it") is None
+    assert router.calls == [], "Claude's turns never reach the judge"
+    host.backend = "local"
+    assert host._router_active() is True
+    assert host._router_judge("what time is it", True) is router.verdict
+    monkeypatch.setattr(va, "ROUTER_BACKENDS", frozenset({"local", "dsh", "claude"}))
+    host.backend = "claude"
+    assert host._router_active() is True, "opt back in with VOICE_ASSISTANT_ROUTER_BACKENDS"
 
 
 def test_prefetch_kept_when_speech_resumes(loop_env):

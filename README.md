@@ -585,10 +585,17 @@ The questions are answered by a `/judge` route that lives inside the same llama-
 process as the local model (`contrib/llama.cpp/`: a small patch against a pinned upstream
 commit plus one header, applied by `setup.sh`). One batched forward pass reads the answer
 logits for every question; nothing is generated. The unit runs with `--judge-slots 6
---kv-unified`, a 16k context and no MTP draft (with speculative decoding on, llama.cpp keeps
-three copies of every sequence's recurrent state and six sequences do not fit).
+--kv-unified`, a 16k context and no MTP draft. Speculative decoding keeps three copies of
+every sequence's recurrent state, so six judge sequences and MTP do not fit together; two
+judge slots with MTP do fit (15.96 GB, decode 21 -> 32 tok/s, the six questions in three
+rounds at ~0.5 s) but aborted inside the MTP draft path on a real turn with the unified KV
+cache the judge needs (llama.cpp e70802a), so the unit stays without it.
 
-Before a turn goes to any model, the local llama-server is asked six yes/no
+The router runs for the local model's turns (`VOICE_ASSISTANT_ROUTER_BACKENDS`,
+default `local,dsh`). When Claude has been chosen it answers everything with its
+own judgment and the judge is not consulted at all: no extra wait, no misroute.
+
+Before a local turn goes to the model, the llama-server is asked six yes/no
 questions about it in one forward pass -- no generation, just the
 log-probabilities of "yes" and "no" after each question (`POST /judge`, about
 0.4 s on the 27B). Is the speaker talking to the assistant? Is it clear what
@@ -600,13 +607,15 @@ what was just proposed.
 
 The raw answers are calibrated per question (`router_calibration.json`, a
 Platt fit on 331 hand-labelled utterances from this laptop's logs) and the
-calibrated probabilities make three decisions, each switchable on its own:
+calibrated probabilities make the decisions, each switchable on its own:
 
 | decision | rule | effect |
 |---|---|---|
 | **drop** | `1 - min(addressed, intelligible) >= 0.8`, spoken input only | the turn is ignored like any other rejected transcript: no reply, no chime |
 | **tools** | `web >= 0.2`, `shell >= 0.2` | the local model is offered only `web_search`/`fetch_page`, only `run_shell`, both, or no tool schema at all |
-| **route** | `simple >= 0.7` and no web, no shell, not risky | the turn stays local; anything else goes to Claude when the CLI is installed |
+| **route** | `risky >= 0.3`, or not simple (`< 0.7`) and `shell >= 0.6` or `web >= 0.6` | the turn goes to Claude when the CLI is installed; everything else stays local. The local model has the same tools, so a question that merely glances at the machine ("are you up?", shell 0.3) is answered in seconds rather than sent on a half-minute round trip |
+| **hard** | stays local, no tool wanted, `simple <= 0.3` | thinking on demand: the model's reasoning is switched on for this turn only under `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` tokens (512), after a spoken "Let me think about that." When `VOICE_ASSISTANT_HARD_URL` names a bigger model elsewhere and its `/health` answers, the turn goes there instead, with the last few exchanges and no tools; if it fails before answering, the local model takes the turn |
+| **caution** | stays local, `0.1 <= risky < 0.3` | a softer marker asks the model to confirm before changing anything |
 
 A turn the router calls **risky** (`>= 0.3`) also gets a marker in front of the
 user's words, in the same style as the context marker, so the standing rule
@@ -615,7 +624,20 @@ where it matters:
 
 ```
 [router: this request may change or disrupt the machine or the user's data; confirm before acting]
+[router: this may touch the machine or the user's data; if acting on it would change or disrupt anything, confirm before acting]
 ```
+
+On the 331 labelled utterances the local lane is 55% of turns under this policy
+(25% under the old "simple and nothing else" rule); the turns it moves are the
+casual ones that scored 0.2-0.6 on shell or web.
+
+After a local turn, the same engine is asked three more questions about the
+exchange it just produced -- did the reply answer the question, does it state
+something likely wrong, should a tool have been used -- and the raw answers are
+recorded with the verdict. They decide nothing yet: there are no labels behind
+them. `apps/router_review.py` in the System One repo lists the recorded turns
+(near-threshold ones first), takes labels, and `scripts/recalibrate_router.sh`
+judges the new rows on the live server and refits the calibration.
 
 Routing respects what can actually answer: "local" needs a server that is
 ready, "claude" needs the `claude` CLI, a `dsh` preference is never overridden,
@@ -901,8 +923,20 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_PREFETCH` | `1` | judge a spoken turn during the end-of-turn wait, from the streaming transcript so far |
 | `VOICE_ASSISTANT_ROUTER_THR_DROP` | `0.8` | junk probability at which a spoken turn is dropped |
 | `VOICE_ASSISTANT_ROUTER_THR_WEB` / `_SHELL` | `0.2` / `0.2` | probability at which a tool is offered |
-| `VOICE_ASSISTANT_ROUTER_THR_RISKY` | `0.3` | probability at which the risky marker is added |
-| `VOICE_ASSISTANT_ROUTER_THR_SIMPLE` | `0.7` | probability at which a turn is simple enough to stay local |
+| `VOICE_ASSISTANT_ROUTER_THR_RISKY` | `0.3` | probability at which a turn is risky: Claude, with the risky marker |
+| `VOICE_ASSISTANT_ROUTER_THR_SIMPLE` | `0.7` | probability at which a turn counts as simple (stays local whatever it needs) |
+| `VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL` / `_WEB` | `0.6` / `0.6` | tool probability past which a non-simple turn is a task for Claude |
+| `VOICE_ASSISTANT_ROUTER_THR_HARD` | `0.3` | `simple` at or below this, with no tool wanted, is a hard question |
+| `VOICE_ASSISTANT_ROUTER_THR_CAUTION` | `0.1` | `risky` from here up (below the risky bar) adds the caution marker on a local turn |
+| `VOICE_ASSISTANT_ROUTER_BACKENDS` | `local,dsh` | backends the router runs for; add `claude` to route simple turns away from Claude as before |
+| `VOICE_ASSISTANT_ROUTER_PREFETCH_MAX_EXTRA_WORDS` | `2` | a prefetch that is a prefix of the final transcript is reused when the final adds at most this many words |
+| `VOICE_ASSISTANT_ROUTER_THINK` | `1` | thinking on demand for hard local turns |
+| `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` | `512` | reasoning tokens a hard turn may spend (llama.cpp closes the think block there) |
+| `VOICE_ASSISTANT_LOCAL_THINK_FILLER` | `Let me think about that.` | spoken while a hard turn thinks |
+| `VOICE_ASSISTANT_ROUTER_REPLY_CHECK` | `1` | judge each local reply (answered / unsupported / needed a tool) and record the raw answers |
+| `VOICE_ASSISTANT_HARD_URL` / `_MODEL` | empty | an OpenAI-compatible server for hard questions (llama-server on another machine); empty = off |
+| `VOICE_ASSISTANT_HARD_HISTORY_TURNS` | `6` | exchanges sent along as context |
+| `VOICE_ASSISTANT_HARD_THINK` | `0` | let the hard backend reason too |
 
 The threshold defaults are the ones in `router_calibration.json`; the file
 under `~/.config/voice-assistant/` wins over the repo copy, and the variables

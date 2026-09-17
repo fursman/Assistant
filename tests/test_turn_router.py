@@ -188,7 +188,12 @@ def test_thresholds_come_from_file_then_env(monkeypatch, tmp_path):
     monkeypatch.setenv("VOICE_ASSISTANT_ROUTER_THR_SIMPLE", "0.77")
     r = TurnRouter("http://127.0.0.1:1", calibration_path=str(REPO_CAL), log_path=tmp_path / "r.jsonl")
     assert r.thresholds == {"drop_junk": 0.55, "needs_web": 0.33, "needs_shell": 0.44,
-                            "risky": 0.66, "simple_local": 0.77}
+                            "risky": 0.66, "simple_local": 0.77,
+                            "escalate_web": 0.6, "escalate_shell": 0.6, "hard": 0.3, "caution": 0.1}
+    monkeypatch.setenv("VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL", "0.9")
+    monkeypatch.setenv("VOICE_ASSISTANT_ROUTER_THR_HARD", "0.25")
+    r = TurnRouter("http://127.0.0.1:1", calibration_path=str(REPO_CAL), log_path=tmp_path / "r.jsonl")
+    assert r.thresholds["escalate_shell"] == 0.9 and r.thresholds["hard"] == 0.25
     monkeypatch.setenv("VOICE_ASSISTANT_ROUTER_THR_DROP", "not a number")
     r = TurnRouter("http://127.0.0.1:1", calibration_path=str(REPO_CAL), log_path=tmp_path / "r.jsonl")
     assert r.thresholds["drop_junk"] == 0.8
@@ -222,14 +227,46 @@ def test_tool_decisions_at_their_thresholds():
     assert _verdict({"question": 0.5}).question and not _verdict({"question": 0.49}).question
 
 
-def test_route_is_local_only_when_simple_and_nothing_else():
+def test_route_leaves_local_only_for_risky_turns_and_real_tool_tasks():
     quiet = {"needs_web": 0.0, "needs_shell": 0.0, "risky": 0.0}
+    # simple stays local, tool or no tool
     assert _verdict({**quiet, "simple": 0.7}).route == "local"
-    assert _verdict({**quiet, "simple": 0.699}).route == "claude"
-    assert _verdict({**quiet, "simple": 0.99, "needs_web": 0.2}).route == "claude"
-    assert _verdict({**quiet, "simple": 0.99, "needs_shell": 0.2}).route == "claude"
+    assert _verdict({**quiet, "simple": 0.99, "needs_shell": 0.9}).route == "local"
+    assert _verdict({**quiet, "simple": 0.99, "needs_web": 0.9}).route == "local"
+    # not simple and no strong tool need: local (the hard lane)
+    assert _verdict({**quiet, "simple": 0.1}).route == "local"
+    # a glance at the machine is not a task; past the escalation bar it is
+    assert _verdict({**quiet, "simple": 0.3, "needs_shell": 0.59}).route == "local"
+    assert _verdict({**quiet, "simple": 0.3, "needs_shell": 0.6}).route == "claude"
+    assert _verdict({**quiet, "simple": 0.3, "needs_web": 0.6}).route == "claude"
+    assert _verdict({**quiet, "simple": 0.699, "needs_web": 0.6}).route == "claude"
+    # risky always leaves
     assert _verdict({**quiet, "simple": 0.99, "risky": 0.3}).route == "claude"
     assert _verdict({**quiet, "simple": 0.99, "risky": 0.29}).route == "local"
+    assert _verdict({**quiet, "simple": 0.0, "risky": 0.3}).escalate is False
+
+
+def test_the_casual_questions_that_went_to_claude_now_stay_local():
+    # Three real verdicts from 2026-09-16 that cost a Claude round trip each.
+    for shell, simple in ((0.29, 0.98), (0.24, 0.76), (0.31, 0.57)):
+        v = _verdict({"needs_web": 0.05, "needs_shell": shell, "risky": 0.02, "simple": simple})
+        assert v.route == "local" and v.needs_shell and v.tools == ["run_shell"]
+
+
+def test_hard_and_caution_flags():
+    quiet = {"needs_web": 0.0, "needs_shell": 0.0, "risky": 0.0}
+    assert _verdict({**quiet, "simple": 0.3}).hard
+    assert not _verdict({**quiet, "simple": 0.31}).hard
+    assert not _verdict({**quiet, "simple": 0.1, "needs_shell": 0.2}).hard, "a tool turn does not think"
+    assert not _verdict({**quiet, "simple": 0.1, "needs_web": 0.2}).hard
+    assert not _verdict({**quiet, "simple": 0.1, "risky": 0.3}).hard, "not local, so not hard"
+    assert _verdict({**quiet, "simple": 0.9, "risky": 0.1}).caution
+    assert not _verdict({**quiet, "simple": 0.9, "risky": 0.099}).caution
+    assert not _verdict({**quiet, "simple": 0.9, "risky": 0.3}).caution, "risky itself, not caution"
+    d = _verdict({**quiet, "simple": 0.2, "risky": 0.15}).decisions()
+    assert d["hard"] and d["caution"] and d["route"] == "local" and not d["escalate"]
+    line = _verdict({**quiet, "simple": 0.2, "risky": 0.15}).log_line()
+    assert line.endswith("tools=none hard caution (1 ms)")
 
 
 def test_decisions_end_to_end_over_http(router):
@@ -240,7 +277,7 @@ def test_decisions_end_to_end_over_http(router):
     v = r.judge("what is using all my disk space")
     assert v.route == "claude" and v.tools == ["run_shell"] and not v.drop and not v.risky
     assert v.log_line() == ("Router: addressed=0.99 intelligible=0.97 web=0.05 shell=0.91 risky=0.12 "
-                            f"simple=0.08 -> route=claude tools=shell "
+                            f"simple=0.08 -> route=claude tools=shell escalate "
                             f"({v.latency_ms:.0f} ms)")
 
     state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.99, "needs_web": 0.02,
@@ -259,7 +296,7 @@ def test_decisions_end_to_end_over_http(router):
     state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.99, "needs_web": 0.0,
                                     "needs_shell": 0.9, "risky": 0.8, "simple": 0.1})
     v = r.judge("yes go ahead and reboot it")
-    assert v.risky and v.route == "claude" and v.log_line().endswith(f"tools=shell risky ({v.latency_ms:.0f} ms)")
+    assert v.risky and v.route == "claude" and v.log_line().endswith(f"tools=shell risky escalate ({v.latency_ms:.0f} ms)")
 
 
 # --- fail open --------------------------------------------------------------------------
@@ -431,3 +468,48 @@ def test_record_never_raises(router, tmp_path):
     r.log_path = tmp_path                     # a directory: open() fails
     assert r.record(v) is False
     assert r.record(None) is False
+
+
+# --- the reply check and the outcome ----------------------------------------------------------
+
+def test_check_reply_asks_the_three_questions_about_the_exchange(router):
+    r, state = router
+    v = _verdict({"simple": 0.2})
+    v.context = "Latest utterance (spoken):\nwho wrote hamlet"
+    qs = []
+    for qid, ly in (("answered", 2.0), ("unsupported", -2.0), ("needed_tool", 0.0)):
+        qs.append({"id": qid, "options": [{"text": "yes", "logprob": ly}, {"text": "no", "logprob": 0.0}],
+                   "mass": 0.99})
+    state.body = {"questions": qs, "timings": {"total_ms": 300}}
+    res = r.check_reply(v, "William Shakespeare.")
+    assert set(res) == {"answered", "unsupported", "needed_tool"}
+    assert res["answered"] > 0.85 and res["unsupported"] < 0.15 and res["needed_tool"] == pytest.approx(0.5)
+    path, body = state.requests[-1]
+    assert path == "/judge"
+    assert body["system"] == tr.REPLY_CHECK_SYSTEM
+    assert body["context"].startswith(v.context) and body["context"].endswith("Assistant's reply:\nWilliam Shakespeare.")
+    assert [q["id"] for q in body["questions"]] == ["answered", "unsupported", "needed_tool"]
+    assert all(q["options"] == ["yes", "no"] for q in body["questions"])
+    assert body["enable_thinking"] is False
+    assert r.check_reply(v, "") is None and r.check_reply(None, "x") is None
+
+
+def test_check_reply_fails_open(router):
+    r, state = router
+    v = _verdict({})
+    v.context = "Latest utterance (spoken):\nhi"
+    state.status = 500
+    assert r.check_reply(v, "hello") is None
+    state.status = 200
+    state.raw_body = b"not json"
+    assert r.check_reply(v, "hello") is None
+
+
+def test_record_carries_the_outcome(router, tmp_path):
+    r, _ = router
+    v = _verdict({"simple": 0.9})
+    v.outcome.update({"took_s": 1.2, "check": {"answered": 0.9}})
+    assert r.record(v, backend="local")
+    row = json.loads((tmp_path / "router.jsonl").read_text().strip())
+    assert row["backend"] == "local" and row["outcome"] == {"took_s": 1.2, "check": {"answered": 0.9}}
+    assert row["decisions"]["hard"] is False and row["decisions"]["caution"] is False

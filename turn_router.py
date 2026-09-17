@@ -10,8 +10,14 @@ three decisions:
 
   drop    the turn is junk (not addressed to the assistant, or unintelligible)
   tools   which tools the local model is offered (web, shell, both, none)
-  route   "local" for a simple turn that needs no tools and changes nothing,
-          otherwise "claude"
+  route   "claude" when the turn is risky, or is a real tool task rather than a
+          quick question (not simple, and the web or shell probability is past
+          the escalation bar); "local" otherwise -- the local model has the same
+          tools and answers in seconds what Claude takes half a minute over
+  hard    a local turn that wants no tool and is not a simple question: worth
+          the model's own reasoning (or a bigger model, when one is configured)
+  caution a local turn below the risky bar but not clear of it: a softer
+          marker asks the model to confirm before changing anything
 
 Everything here FAILS OPEN. judge() returns None on any error, timeout, HTTP
 failure, missing question or unhealthy server, and None means "no opinion":
@@ -67,12 +73,35 @@ PREVIOUS_MAX_AGE = 900.0
 PREVIOUS_REPLY_CHARS = 300
 
 DEFAULT_THRESHOLDS = {"drop_junk": 0.8, "needs_web": 0.2, "needs_shell": 0.2,
-                      "risky": 0.3, "simple_local": 0.7}
+                      "risky": 0.3, "simple_local": 0.7,
+                      # a turn leaves the local model only past these (and only when not simple)
+                      "escalate_web": 0.6, "escalate_shell": 0.6,
+                      # at or below this p(simple), a tool-free local turn gets the model's reasoning
+                      "hard": 0.3,
+                      # from this p(risky) up (below the risky bar) a local turn carries the caution marker
+                      "caution": 0.1}
 THRESHOLD_ENV = {"drop_junk": "VOICE_ASSISTANT_ROUTER_THR_DROP",
                  "needs_web": "VOICE_ASSISTANT_ROUTER_THR_WEB",
                  "needs_shell": "VOICE_ASSISTANT_ROUTER_THR_SHELL",
                  "risky": "VOICE_ASSISTANT_ROUTER_THR_RISKY",
-                 "simple_local": "VOICE_ASSISTANT_ROUTER_THR_SIMPLE"}
+                 "simple_local": "VOICE_ASSISTANT_ROUTER_THR_SIMPLE",
+                 "escalate_web": "VOICE_ASSISTANT_ROUTER_THR_ESCALATE_WEB",
+                 "escalate_shell": "VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL",
+                 "hard": "VOICE_ASSISTANT_ROUTER_THR_HARD",
+                 "caution": "VOICE_ASSISTANT_ROUTER_THR_CAUTION"}
+
+# --- The reply check ------------------------------------------------------------------------
+# After a local turn, the same engine is asked about the exchange it just produced. These are
+# raw, uncalibrated answers (no labels exist yet): they are recorded with the verdict so the
+# turns can be reviewed, and decide nothing until a calibration says what they mean.
+REPLY_CHECK_SYSTEM = ("You review one exchange between a user and a voice assistant running on the user's "
+                      "Linux laptop. The assistant can answer from its own knowledge, search the web, and run "
+                      "shell commands. Answer each question with exactly one word.")
+REPLY_CHECK_QUESTIONS: List[Tuple[str, str]] = [
+    ("answered", "Does the assistant's reply actually answer what the user asked? Answer yes or no."),
+    ("unsupported", "Does the reply state something as fact that is likely wrong or made up? Answer yes or no."),
+    ("needed_tool", "Should the assistant have looked something up or run a command before answering? Answer yes or no."),
+]
 
 USER_CALIBRATION = Path.home() / ".config/voice-assistant/router_calibration.json"
 REPO_CALIBRATION = Path(__file__).with_name("router_calibration.json")
@@ -157,6 +186,7 @@ class Verdict:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     at: float = field(default_factory=time.time)
     backend: Optional[str] = None      # what actually answered, filled in later
+    outcome: Dict[str, object] = field(default_factory=dict)   # how the turn went, filled in at its end
     recorded: bool = False
 
     # -- decisions ------------------------------------------------------------
@@ -194,10 +224,31 @@ class Verdict:
         return self.probs.get("question", 0.0) >= 0.5
 
     @property
+    def escalate(self) -> bool:
+        """A real tool task rather than a quick question: not simple, and the web or shell
+        probability is past the escalation bar. Claude Code does those better; a question that
+        merely glances at the machine ("are you up?", p(shell) 0.3) is not one of them."""
+        return (not self.simple) and (self.probs["needs_shell"] >= self.thresholds["escalate_shell"]
+                                      or self.probs["needs_web"] >= self.thresholds["escalate_web"])
+
+    @property
     def route(self) -> str:
-        if self.simple and not self.needs_web and not self.needs_shell and not self.risky:
-            return "local"
-        return "claude"
+        if self.risky or self.escalate:
+            return "claude"
+        return "local"
+
+    @property
+    def hard(self) -> bool:
+        """Stays local, wants no tool, and is not a simple question: the model's own reasoning (or
+        a bigger model) is worth the wait."""
+        return (self.route == "local" and not self.needs_web and not self.needs_shell
+                and self.probs["simple"] <= self.thresholds["hard"])
+
+    @property
+    def caution(self) -> bool:
+        """Below the risky bar but not clear of it, on a turn that stays local."""
+        return (self.route == "local" and not self.risky
+                and self.probs["risky"] >= self.thresholds["caution"])
 
     @property
     def tools(self) -> List[str]:
@@ -211,14 +262,15 @@ class Verdict:
     def decisions(self) -> Dict[str, object]:
         return {"drop": self.drop, "needs_web": self.needs_web, "needs_shell": self.needs_shell,
                 "risky": self.risky, "simple": self.simple, "followup": self.followup,
-                "question": self.question, "route": self.route, "junk": round(self.junk, 4)}
+                "question": self.question, "route": self.route, "escalate": self.escalate,
+                "hard": self.hard, "caution": self.caution, "junk": round(self.junk, 4)}
 
     # -- presentation ---------------------------------------------------------
     def log_line(self) -> str:
         p = self.probs
         tools = {(True, True): "web+shell", (True, False): "web",
                  (False, True): "shell", (False, False): "none"}[(self.needs_web, self.needs_shell)]
-        flags = " risky" if self.risky else ""
+        flags = "".join(f" {f}" for f in ("risky", "escalate", "hard", "caution") if getattr(self, f))
         short = {"addressed": "addressed", "intelligible": "intelligible", "needs_web": "web", "needs_shell": "shell",
                  "risky": "risky", "simple": "simple", "followup": "followup", "question": "question"}
         parts = " ".join(f"{short.get(k, k)}={v:.2f}" for k, v in p.items())
@@ -232,7 +284,8 @@ class Verdict:
                 "mass": {k: round(v, 4) for k, v in self.mass.items()},
                 "decisions": self.decisions(), "thresholds": self.thresholds,
                 "latency_ms": round(self.latency_ms, 1), "server_ms": self.server_ms,
-                "n_prefix_tokens": self.n_prefix_tokens, "backend": self.backend}
+                "n_prefix_tokens": self.n_prefix_tokens, "backend": self.backend,
+                "outcome": dict(self.outcome)}
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False)
@@ -357,6 +410,39 @@ class TurnRouter:
                        latency_ms=latency_ms,
                        server_ms=float(server_ms) if isinstance(server_ms, (int, float)) else None,
                        n_prefix_tokens=data.get("n_prefix_tokens"))
+
+    def judge_raw(self, system: str, context: str, questions: List[Tuple[str, str]],
+                  timeout: Optional[float] = None) -> Optional[Dict[str, float]]:
+        """One /judge call with an ad-hoc rubric: {id: raw P(yes) over yes/no}, uncalibrated.
+        None when the router is disabled or the call fails. Never raises."""
+        if not self.enabled or not context or not context.strip() or not questions:
+            return None
+        body = {"mode": "chat", "system": system, "context": context, "separator": "\n\n",
+                "enable_thinking": False, "top_k": 0,
+                "questions": [{"id": qid, "text": text, "options": list(OPTIONS)} for qid, text in questions]}
+        try:
+            r = self.session.post(self.url, json=body, timeout=self.timeout if timeout is None else timeout)
+            if r.status_code != 200:
+                self._debug(f"router: {self.url} answered {r.status_code} to a raw judgment")
+                return None
+            by_id = {q.get("id"): q for q in r.json()["questions"]}
+            out = {}
+            for qid, _ in questions:
+                opts = {o["text"]: o for o in by_id[qid]["options"]}
+                ly, ln = float(opts["yes"]["logprob"]), float(opts["no"]["logprob"])
+                out[qid] = math.exp(ly) / (math.exp(ly) + math.exp(ln))
+            return out
+        except Exception as e:
+            self._debug(f"router: raw judgment failed ({e.__class__.__name__}: {e})")
+            return None
+
+    def check_reply(self, verdict: "Verdict", reply: str,
+                    timeout: Optional[float] = None) -> Optional[Dict[str, float]]:
+        """The reply check for a turn: the context the verdict was judged on, then the reply."""
+        if verdict is None or not reply or not reply.strip():
+            return None
+        context = verdict.context + "\n\nAssistant's reply:\n" + strip_markers(reply)[:1200]
+        return self.judge_raw(REPLY_CHECK_SYSTEM, context, REPLY_CHECK_QUESTIONS, timeout=timeout)
 
     def _parse(self, data: dict):
         by_id = {q.get("id"): q for q in data["questions"]}

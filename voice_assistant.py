@@ -384,6 +384,42 @@ ROUTER_PREFETCH = os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH", "1").strip().lowe
 # it salient on the turns where it matters.
 ROUTER_RISKY_MARKER = ("[router: this request may change or disrupt the machine or "
                        "the user's data; confirm before acting]\n")
+# The softer marker for a local turn that is below the risky bar but not clear of it.
+ROUTER_CAUTION_MARKER = ("[router: this may touch the machine or the user's data; if acting on it "
+                         "would change or disrupt anything, confirm before acting]\n")
+# Which backends the router runs for. Its judgments come from the local model, and they exist
+# to make the local model's turns better (tools, caution, routing the odd turn to Claude). When
+# Claude has been chosen it answers everything with its own judgment, so by default the judge
+# is not consulted at all on those turns: no 0.8 s, no misroute. "local,dsh,claude" restores
+# the old behaviour of routing simple turns away from Claude.
+ROUTER_BACKENDS = frozenset(
+    b.strip() for b in os.getenv("VOICE_ASSISTANT_ROUTER_BACKENDS", "local,dsh").lower().split(",")
+    if b.strip())
+# A prefetched verdict is also reused when the final transcript adds at most this many words to
+# a prefetch that was its prefix: on a short utterance the 80% rule alone rejects a one-word lag.
+ROUTER_PREFETCH_MAX_EXTRA_WORDS = int(os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH_MAX_EXTRA_WORDS", "2"))
+# Thinking on demand: a local turn the router calls hard (no tool wanted, not a simple question)
+# gets the model's reasoning, with a token budget so it stays a voice-sized wait, and a spoken
+# filler so the wait is not silence.
+ROUTER_THINK = os.getenv("VOICE_ASSISTANT_ROUTER_THINK", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+LOCAL_THINK_BUDGET = int(os.getenv("VOICE_ASSISTANT_LOCAL_THINK_BUDGET", "512"))
+LOCAL_THINK_FILLER = os.getenv("VOICE_ASSISTANT_LOCAL_THINK_FILLER", "Let me think about that.")
+# After a local turn, the same engine is asked whether the reply answered the question, states
+# something likely wrong, or should have used a tool. Raw answers, recorded with the verdict for
+# review; they decide nothing until there are labels behind them.
+ROUTER_REPLY_CHECK = os.getenv("VOICE_ASSISTANT_ROUTER_REPLY_CHECK", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# A bigger model for hard questions, on another machine: any OpenAI-compatible /v1 (llama-server
+# on pile, later the Dell). Empty = off. A hard turn goes there when its /health answers, with the
+# last few exchanges as context and no tools; otherwise it stays local and thinks.
+HARD_URL = os.getenv("VOICE_ASSISTANT_HARD_URL", "").strip()
+HARD_MODEL = os.getenv("VOICE_ASSISTANT_HARD_MODEL", "").strip()
+HARD_HISTORY_TURNS = int(os.getenv("VOICE_ASSISTANT_HARD_HISTORY_TURNS", "6"))
+HARD_THINK = os.getenv("VOICE_ASSISTANT_HARD_THINK", "0").strip().lower() \
+    not in ("0", "false", "no", "off", "")
+HARD_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_HARD_TIMEOUT", "180"))
+HARD_HEALTH_TTL = 30.0    # seconds a health answer is trusted before asking again
 
 # --- DeepSeek Harness (dsh) -------------------------------------------------
 # The harness's home: its generated `sdk-minimal` profile, our patch to it and
@@ -2562,6 +2598,11 @@ class VoiceAssistant:
         self._router_verdict = None
         self._router_turn_at = None      # when the previous turn's utterance arrived
         self._router_prefetch = None     # this utterance's early router call, if any
+        self._hard_client = None
+        self._hard_health = (0.0, False)  # (monotonic time of the last check, was it ready)
+        self._turn_tool_calls = 0
+        self._turn_think = False
+        self._turn_model = ""
 
         # Per-turn streaming state
         self._sentence_queue: Optional[queue.Queue] = None
@@ -3617,6 +3658,7 @@ class VoiceAssistant:
         shown when the window opens, so a burst of fast tools no longer looks
         like nothing happening.
         """
+        self._turn_tool_calls = getattr(self, "_turn_tool_calls", 0) + 1
         labels = {
             "Bash": "Running command", "Read": "Reading file",
             "Edit": "Editing file", "Write": "Writing file",
@@ -3911,13 +3953,18 @@ class VoiceAssistant:
                 return
             del self._local_history[:cut]
 
-    def _stream_local_llm(self, text, abort) -> bool:
+    def _stream_local_llm(self, text, abort, allow_hard=True) -> bool:
         """Stream one reply from the local model, running tools as it asks.
 
         Mirrors the Claude path's side effects so the whole TTS pipeline
         downstream is unchanged: append to _assistant_text, call
         _flush_sentences per delta, surface reasoning and tool use as the same
         notifications. Returns True if the turn completed.
+
+        A turn the router called hard goes to the hard backend when one is
+        configured and answering (no tools, the last few exchanges as context),
+        and otherwise gets the local model's own reasoning under a token budget.
+        `allow_hard=False` is the retry after a hard backend failed to answer.
         """
         try:
             client = self._local_llm_client()
@@ -3931,18 +3978,49 @@ class VoiceAssistant:
             self._local_history.append({"role": "user", "content": x["user"]})
             self._local_history.append({"role": "assistant", "content": x["assistant"]})
         self._ledger().caught_up("local")
-        messages = [{"role": "system", "content": LOCAL_VOICE_PROMPT}]
-        messages.extend(self._local_history)
+
+        v = self._router_verdict
+        hard = bool(v is not None and getattr(v, "hard", False))
+        use_hard = hard and allow_hard and self._hard_backend_ready()
+        model = LOCAL_LLM_MODEL
+        if use_hard:
+            try:
+                client = self._hard_llm_client()
+            except Exception as e:
+                self.logger.warning(f"Hard backend client failed ({e}); answering locally")
+                use_hard = False
+        if use_hard:
+            model = HARD_MODEL or LOCAL_LLM_MODEL
+            think = HARD_THINK
+            messages = [{"role": "system", "content": self._hard_voice_prompt()}]
+            messages.extend(self._history_tail(self._local_history, HARD_HISTORY_TURNS))
+            self.logger.info(f"Router: hard question -> {model} at {HARD_URL}")
+            self._router_used("hard")
+        else:
+            # Thinking on demand: the router's hard verdict turns Qwen's reasoning on for this
+            # turn only, under LOCAL_THINK_BUDGET tokens (llama.cpp closes the think block at
+            # the budget and the answer follows).
+            think = LOCAL_LLM_THINK or (hard and ROUTER_THINK)
+            messages = [{"role": "system", "content": LOCAL_VOICE_PROMPT}]
+            messages.extend(self._local_history)
         messages.append({"role": "user", "content": text})
         turn_start = len(messages) - 1
+        self._turn_think = bool(think)
+        self._turn_model = model
 
         # top_k / presence_penalty are llama.cpp extensions, and enable_thinking
         # is how the Qwen3 chat template gates its <think> block (needs --jinja).
         extra_body = {
             "top_k": LOCAL_LLM_TOP_K,
             "presence_penalty": LOCAL_LLM_PRESENCE,
-            "chat_template_kwargs": {"enable_thinking": LOCAL_LLM_THINK},
+            "chat_template_kwargs": {"enable_thinking": bool(think)},
         }
+        if think and LOCAL_THINK_BUDGET > 0 and not (LOCAL_LLM_THINK and not use_hard):
+            extra_body["reasoning_budget_tokens"] = LOCAL_THINK_BUDGET
+        if use_hard or (think and not LOCAL_LLM_THINK):
+            if think:
+                self.logger.info(f"Router: thinking on for this turn (hard), budget {LOCAL_THINK_BUDGET} tokens")
+            self._say_filler(LOCAL_THINK_FILLER)
 
         t0 = time.time()
         first_token_at = None
@@ -3955,7 +4033,7 @@ class VoiceAssistant:
         # turn or the server's prompt cache is useless (a changed schema diverges at token 3).
         # The router gates tool use with tool_choice instead: "none" makes the server parse
         # content only; the schema stays in the prompt.
-        tools = LOCAL_TOOLS
+        tools = None if use_hard else LOCAL_TOOLS
         tool_choice = self._router_tool_choice()
 
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
@@ -3972,7 +4050,7 @@ class VoiceAssistant:
                 messages.append({"role": "user", "content": LOCAL_TOOL_BUDGET_PROMPT})
 
             kwargs = dict(
-                model=LOCAL_LLM_MODEL, messages=messages, stream=True,
+                model=model, messages=messages, stream=True,
                 temperature=LOCAL_LLM_TEMP, top_p=LOCAL_LLM_TOP_P,
                 max_tokens=LOCAL_LLM_MAX_TOKENS, extra_body=extra_body)
             if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS and tools:
@@ -4026,6 +4104,13 @@ class VoiceAssistant:
                     # Expected: _abort_inflight shuts the socket down under the
                     # blocked read, which is what makes an abort instant.
                     self.logger.info(f"Local LLM stream aborted ({e})")
+                elif use_hard and first_token_at is None:
+                    # The hard backend did not answer: the turn is still whole, so take
+                    # it locally (the model's own reasoning) rather than fail it.
+                    self.logger.warning(f"Hard backend failed before answering ({e}); answering locally")
+                    self._hard_health = (time.monotonic(), False)
+                    self._router_used("local")
+                    return self._stream_local_llm(text, abort, allow_hard=False)
                 else:
                     self.logger.error(f"Local LLM stream failed: {e}")
                 return False
@@ -4106,9 +4191,14 @@ class VoiceAssistant:
             completed = True   # out of tool iterations but the turn still stands
 
         if first_token_at is not None:
+            detail = ""
+            if think:
+                detail += f", thought {len(self._thinking_text)} chars"
+            if use_hard:
+                detail += f", {model}"
             self.logger.info(
                 f"Local LLM: first token {first_token_at - t0:.2f}s, "
-                f"total {time.time() - t0:.2f}s")
+                f"total {time.time() - t0:.2f}s{detail}")
 
         if completed and not abort.is_set():
             if markup_suppressed and not self._assistant_text.strip():
@@ -4703,9 +4793,14 @@ class VoiceAssistant:
             return None
         return (str(last.get("user", "")), str(last.get("assistant", "")), time.time() - at)
 
+    def _router_active(self) -> bool:
+        """Whether the router has a say on this turn: it exists, and the backend in force is one
+        it was made for (ROUTER_BACKENDS). With Claude chosen, the judge is not consulted."""
+        return self._router is not None and getattr(self, "backend", "local") in ROUTER_BACKENDS
+
     def _router_judge(self, text, typed=False):
         """Ask the router about this turn. Never raises; None means no opinion."""
-        if self._router is None:
+        if not self._router_active():
             return None
         try:
             return self._router.judge(text, typed=typed, previous=self._router_previous())
@@ -4737,7 +4832,7 @@ class VoiceAssistant:
         there is no router, the text is empty, or this utterance already
         has one. Never raises and never blocks: the caller is the audio loop.
         """
-        if not ROUTER_PREFETCH or self._router is None or self._router_prefetch is not None:
+        if not ROUTER_PREFETCH or not self._router_active() or self._router_prefetch is not None:
             return False
         if not text or not text.strip():
             return False
@@ -4772,6 +4867,50 @@ class VoiceAssistant:
             pf.finished = time.monotonic()
             pf.done.set()
 
+    @staticmethod
+    def _router_prefix_ok(a, b) -> bool:
+        """Whether a prefetch judged on normalised transcript `a` stands for final transcript `b`.
+
+        The decoder lags the audio by up to a second, so the common "mismatch" is the final
+        transcript carrying a word or two more than the prefetch saw. A prefetch that is a
+        prefix of the final and covers most of it by characters, or falls short of it by at
+        most a couple of words, was judged on the same request.
+        """
+        if not a:
+            return False
+        if a == b:
+            return True
+        if not b.startswith(a):
+            return False
+        if len(a) >= ROUTER_PREFETCH_MIN_MATCH * len(b):
+            return True
+        return len(b.split()) - len(a.split()) <= ROUTER_PREFETCH_MAX_EXTRA_WORDS
+
+    def _router_prefetch_refresh(self, partial) -> bool:
+        """End of turn: judge again when the recogniser has produced words the prefetch did not
+        see. `partial` is the recogniser's transcript-so-far callable. This runs while the final
+        transcript is still being produced (0.6-1.6 s on this CPU, longer than a judgment
+        takes), so the second call is hidden the way the first was meant to be; the first call
+        is kept when it still covers what has been heard. Returns whether a new call was
+        started. Never raises."""
+        try:
+            text = partial()
+            pf = self._router_prefetch
+            if pf is None:
+                return self._router_prefetch_start(text)
+            if not text or not text.strip():
+                return False
+            a, b = self._router_norm(pf.raw), self._router_norm(text)
+            if self._router_prefix_ok(a, b):
+                return False
+            self.logger.info(
+                f"Router: prefetch refreshed at end of turn ({len(b.split()) - len(a.split()):+d} words)")
+            self._router_prefetch = None
+            return self._router_prefetch_start(text)
+        except Exception as e:
+            self.logger.warning(f"Router prefetch refresh skipped ({e})")
+            return False
+
     def _router_take_prefetch(self, final_text):
         """Claim this utterance's prefetch for `final_text`.
 
@@ -4794,7 +4933,7 @@ class VoiceAssistant:
             # The decoder lags the audio by up to a second, so the common "mismatch" is the
             # final transcript carrying one more word than the prefetch saw. A prefetch that
             # is a prefix covering most of the final words was judged on the same request.
-            if not a or not (a == b or (b.startswith(a) and len(a) >= ROUTER_PREFETCH_MIN_MATCH * len(b))):
+            if not self._router_prefix_ok(a, b):
                 self.logger.info("Router: prefetch mismatch, judging again")
                 # The abandoned request is still running on the single-slot server; let it
                 # finish so the judgment made now does not queue behind it and time out.
@@ -4851,16 +4990,115 @@ class VoiceAssistant:
         model.
         """
         v, self._router_verdict = self._router_verdict, None
+        if v is None:
+            return
+        try:
+            started = getattr(self, "_turn_started_at", None)
+            first = getattr(self, "_first_audio_at", None)
+            v.outcome.update({
+                "took_s": round(time.time() - started, 2) if started else None,
+                "first_audio_s": round(first - started, 2) if (started and first) else None,
+                "tool_calls": getattr(self, "_turn_tool_calls", 0),
+                "reply_chars": len(getattr(self, "_assistant_text", "") or ""),
+                "think": bool(getattr(self, "_turn_think", False)),
+                "thinking_chars": len(getattr(self, "_thinking_text", "") or ""),
+                "model": getattr(self, "_turn_model", "") or None,
+                "backend_pref": getattr(self, "backend", None),
+            })
+        except Exception as e:
+            self.logger.debug(f"Router: outcome not recorded ({e})")
+        reply = (getattr(self, "_assistant_text", "") or "").strip()
+        if ROUTER_REPLY_CHECK and self._router is not None and reply and v.backend in ("local", "hard"):
+            # Off the turn's thread: the check is a judgment on the same server (~0.5 s) and
+            # the microphone should not wait for it. The record is written when it is in.
+            def check_then_record():
+                try:
+                    res = self._router.check_reply(v, reply, timeout=ROUTER_TIMEOUT * 2)
+                    if res:
+                        v.outcome["check"] = {k: round(float(p), 3) for k, p in res.items()}
+                        self.logger.info("Router: reply check " + " ".join(
+                            f"{k}={p:.2f}" for k, p in v.outcome["check"].items()))
+                except Exception as e:
+                    self.logger.debug(f"Router: reply check failed ({e})")
+                self._router_record(v)
+            threading.Thread(target=check_then_record, name="router-check", daemon=True).start()
+            return
         self._router_record(v)
 
     def _router_marker(self) -> str:
-        """The risky-turn marker for this turn, or ""."""
+        """The risky marker for this turn, the caution marker for a local turn that is not clear
+        of the risky bar, or ""."""
         try:
             v = self._router_verdict
-            return ROUTER_RISKY_MARKER if v is not None and v.risky else ""
+            if v is None:
+                return ""
+            if v.risky:
+                return ROUTER_RISKY_MARKER
+            if getattr(v, "caution", False):
+                return ROUTER_CAUTION_MARKER
+            return ""
         except Exception as e:
             self.logger.warning(f"Router marker failed ({e})")
             return ""
+
+    # -- the hard lane: a bigger model elsewhere, or the local model's own reasoning ----------
+
+    def _hard_backend_ready(self) -> bool:
+        """Whether HARD_URL answers /health. Cached for HARD_HEALTH_TTL seconds so a dormant
+        backend costs one short probe every half minute, not a timeout per turn."""
+        if not HARD_URL:
+            return False
+        at, ok = self._hard_health
+        now = time.monotonic()
+        if now - at < HARD_HEALTH_TTL:
+            return ok
+        base = re.sub(r"/v1/?$", "", HARD_URL.rstrip("/"))
+        try:
+            with urllib.request.urlopen(base + "/health", timeout=0.5) as r:
+                ok = r.status == 200
+        except Exception:
+            ok = False
+        self._hard_health = (now, ok)
+        if not ok:
+            self.logger.info(f"Hard backend at {HARD_URL} is not answering; hard turns stay local")
+        return ok
+
+    def _hard_llm_client(self):
+        if self._hard_client is None:
+            from openai import OpenAI
+            self._hard_client = OpenAI(base_url=HARD_URL, api_key=LOCAL_LLM_API_KEY or "none",
+                                       timeout=HARD_TIMEOUT, max_retries=0)
+        return self._hard_client
+
+    @staticmethod
+    def _hard_voice_prompt() -> str:
+        """The local system prompt without its tools paragraph: the hard backend gets none."""
+        cut = LOCAL_VOICE_PROMPT.find("\n\nYou have three tools")
+        head = LOCAL_VOICE_PROMPT[:cut] if cut != -1 else LOCAL_VOICE_PROMPT
+        return head + ("\n\nYou have no tools on this turn: answer from what you know, "
+                       "and say so when you are not sure.")
+
+    @staticmethod
+    def _history_tail(history, turns):
+        """The last `turns` exchanges of a chat history, starting on a user message."""
+        if turns <= 0 or not history:
+            return []
+        starts = [i for i, m in enumerate(history) if m.get("role") == "user"]
+        if not starts:
+            return []
+        return list(history[starts[-turns] if len(starts) >= turns else starts[0]:])
+
+    def _say_filler(self, text):
+        """Speak a short phrase that is not part of the reply (it is not added to the
+        assistant's text, so the history and the ledger keep the real answer only)."""
+        q = self._sentence_queue
+        if not q or not text:
+            return
+        spoken = _prepare_for_speech(text)
+        if spoken:
+            q.put(spoken)
+            self._stream_transcript(text)
+            self.logger.info(f"→ TTS (filler): {text}")
 
     def _router_tool_choice(self) -> str:
         """tool_choice for the local model this turn: "auto" unless the router has a
@@ -4991,6 +5229,9 @@ class VoiceAssistant:
         self._dsh_error = ""
         self._first_audio_at = None
         self._turn_started_at = time.time()
+        self._turn_tool_calls = 0
+        self._turn_think = False
+        self._turn_model = ""
 
         sentence_q: queue.Queue = queue.Queue()
         self._sentence_queue = sentence_q
@@ -5448,9 +5689,15 @@ class VoiceAssistant:
                     self.smart_turn = None
                     continue
                 if prob >= need:
+                    ft, mt = getattr(self.smart_turn, "last_timing", (0.0, 0.0)) or (0.0, 0.0)
                     self.logger.info(
                         f"Turn complete (p={prob:.2f} >= {need:.2f} after "
-                        f"{silence_s:.1f}s silence, {dt * 1000:.0f}ms)")
+                        f"{silence_s:.1f}s silence, {dt * 1000:.0f}ms"
+                        f"{f' = features {ft * 1000:.0f} + model {mt * 1000:.0f}' if mt else ''})")
+                    # The final transcript takes longer to produce than a judgment does: judge
+                    # what has been heard by now if the first prefetch missed the last words.
+                    if can_prefetch:
+                        self._router_prefetch_refresh(partial)
                     hit_cap = False
                     break
                 self.logger.info(
@@ -5459,6 +5706,8 @@ class VoiceAssistant:
 
             if silence_s >= SILENCE_TIMEOUT:
                 self.logger.info(f"Silence timeout after {silence_s:.1f}s")
+                if can_prefetch:
+                    self._router_prefetch_refresh(partial)
                 hit_cap = False
                 break
         if hit_cap:

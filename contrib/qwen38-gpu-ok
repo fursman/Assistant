@@ -10,9 +10,10 @@
 # all skip cleanly instead of restart-looping on a 14 GB allocation failure.
 set -u
 
-# Measured resident size of Qwen3.8-27B UD-IQ4_XS with 16K q8_0 KV, no MTP, and 4 judge
-# sequences for the turn router (2026-09-16): 14537 MiB. Before that (MTP + 32K KV):
-# 32K q8_0 KV cache: 15341 MiB.
+# Measured resident size of Qwen3.8-27B UD-IQ4_XS with 16K q8_0 KV, no MTP, and 6 judge
+# sequences for the turn router (2026-09-16): 14837 MiB. MTP with 2 judge slots fit (15957 MiB)
+# but aborted inside the MTP draft path on a real turn (llama.cpp e70802a, --kv-unified), so
+# the unit runs without it. Before the judge (MTP + 32K KV): 15341 MiB.
 NEED_MIB=${QWEN38_NEED_MIB:-14700}
 
 command -v nvidia-smi >/dev/null 2>&1 || {
