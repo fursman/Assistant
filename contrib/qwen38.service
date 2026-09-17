@@ -1,5 +1,5 @@
 [Unit]
-Description=Qwen3.8-27B (llama-server, CUDA, prefill-only /judge for the turn router)
+Description=Qwen3.8-27B (llama-server, CUDA + MTP, prefill-only /judge for the turn router)
 Documentation=https://github.com/ggml-org/llama.cpp
 # A half-provisioned machine (llama.cpp built, weights not downloaded yet) must
 # leave the unit inactive rather than restart-looping on a missing file.
@@ -54,7 +54,8 @@ ExecStart=%h/llama.cpp/build/bin/llama-server \
     --ctx-size 16384 \
     --flash-attn on \
     --cache-type-k q8_0 --cache-type-v q8_0 \
-    --parallel 1 --judge-slots 6 --kv-unified \
+    --parallel 1 --judge-slots 1 --kv-unified \
+    --spec-type draft-mtp --spec-draft-n-max 2 \
     --jinja --reasoning-format auto --reasoning off \
     --ctx-checkpoints 0 \
     --cache-ram 0 \

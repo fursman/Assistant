@@ -10,11 +10,14 @@
 # all skip cleanly instead of restart-looping on a 14 GB allocation failure.
 set -u
 
-# Measured resident size of Qwen3.8-27B UD-IQ4_XS with 16K q8_0 KV, no MTP, and 6 judge
-# sequences for the turn router (2026-09-16): 14837 MiB. MTP with 2 judge slots fit (15957 MiB)
-# but aborted inside the MTP draft path on a real turn (llama.cpp e70802a, --kv-unified), so
-# the unit runs without it. Before the judge (MTP + 32K KV): 15341 MiB.
-NEED_MIB=${QWEN38_NEED_MIB:-14700}
+# Measured resident size of Qwen3.8-27B UD-IQ4_XS with 16K q8_0 KV, MTP speculative decoding
+# (n-max 2) and 1 judge sequence for the turn router (2026-09-16): 15539 MiB, ~845 MiB free on
+# a 16 GB card. Speculative decoding keeps three copies of every sequence's recurrent state
+# (150 MiB each on this hybrid model), which is why the judge gets ONE slot (six rounds for the
+# router's six questions, still ~0.7 s: the cost is prefill, not rounds). Two judge slots + MTP
+# left 427 MiB free and died of a CUDA out-of-memory on the first real turn; six slots without
+# MTP was 14837 MiB.
+NEED_MIB=${QWEN38_NEED_MIB:-15600}
 
 command -v nvidia-smi >/dev/null 2>&1 || {
     echo "skip: nvidia-smi not installed"; exit 1; }

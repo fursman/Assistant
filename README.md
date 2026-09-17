@@ -584,12 +584,13 @@ always silent.
 The questions are answered by a `/judge` route that lives inside the same llama-server
 process as the local model (`contrib/llama.cpp/`: a small patch against a pinned upstream
 commit plus one header, applied by `setup.sh`). One batched forward pass reads the answer
-logits for every question; nothing is generated. The unit runs with `--judge-slots 6
---kv-unified`, a 16k context and no MTP draft. Speculative decoding keeps three copies of
-every sequence's recurrent state, so six judge sequences and MTP do not fit together; two
-judge slots with MTP do fit (15.96 GB, decode 21 -> 32 tok/s, the six questions in three
-rounds at ~0.5 s) but aborted inside the MTP draft path on a real turn with the unified KV
-cache the judge needs (llama.cpp e70802a), so the unit stays without it.
+logits for every question; nothing is generated. The unit runs with `--judge-slots 1
+--kv-unified`, a 16k context and the MTP draft (`--spec-type draft-mtp`, decode 21 -> 32
+tok/s). Speculative decoding keeps three copies of every sequence's recurrent state (150 MiB
+each on this hybrid model), so the judge gets one slot and answers the router's six questions
+in six rounds; that is still ~0.7 s, because the cost is prefilling the questions, not the
+number of rounds. Resident size 15.5 GB of 16.4; two judge slots with MTP left 427 MiB free
+and died of a CUDA out-of-memory on the first real turn.
 
 The router runs for the local model's turns (`VOICE_ASSISTANT_ROUTER_BACKENDS`,
 default `local,dsh`). When Claude has been chosen it answers everything with its
