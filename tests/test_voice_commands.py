@@ -80,3 +80,32 @@ def test_shell_tool_runs_ordinary_commands():
     host = Host()
     assert host._run_shell_tool("echo hello").strip() == "hello"
     assert "[exit code 3]" in host._run_shell_tool("exit 3")
+
+
+# --- the status file the panels read ---------------------------------------------
+
+class StatusHost(va.VoiceAssistant):
+    def __init__(self, state_dir, backend):
+        self.logger = logging.getLogger("test-status")
+        self.state_dir = state_dir
+        self.backend = backend
+        self._status_state = "off"
+
+
+def test_status_payload_names_the_backend_and_its_model(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(va, "CLAUDE_MODEL", "fable")
+    monkeypatch.setattr(va, "CLAUDE_EFFORT", "xhigh")
+    monkeypatch.setattr(va, "LOCAL_LLM_MODEL", "qwen3.8-27b")
+    for backend in ("dsh", "local", "claude"):
+        host = StatusHost(tmp_path, backend)
+        host._set_status("ready")
+        d = json.loads((tmp_path / "status").read_text())
+        assert d["class"] == ["ready", backend] and d["backend"] == backend
+        assert d["model"] == "fable" and d["effort"] == "xhigh", "Claude's settings, for the Claude menu"
+        assert d["local_model"] == "Qwen3.8 27B"
+    host._set_status("thinking", backend="claude")
+    d = json.loads((tmp_path / "status").read_text())
+    assert d["backend"] == "claude" and d["class"] == ["thinking", "claude"]
+    assert va._local_model_label("qwen3.8-27b-opt") == "Qwen3.8 27B Opt"
+    assert va._local_model_label("") == ""

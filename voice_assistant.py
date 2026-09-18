@@ -1319,6 +1319,13 @@ def _local_llm_health(timeout: float = 1.0) -> str:
         return "down"
 
 
+def _local_model_label(alias: str = None) -> str:
+    """'qwen3.8-27b' -> 'Qwen3.8 27B': the local model's name as the panels show it."""
+    alias = (alias if alias is not None else LOCAL_LLM_MODEL) or ""
+    parts = [p for p in alias.replace("_", "-").split("-") if p]
+    return " ".join(p.upper() if re.fullmatch(r"\d+b", p, re.I) else p[:1].upper() + p[1:] for p in parts)
+
+
 def _local_llm_n_ctx(timeout: float = 1.0) -> int:
     """The context size llama-server was started with (0 when unknown)."""
     base = re.sub(r"/v1/?$", "", LOCAL_LLM_URL.rstrip("/"))
@@ -3643,16 +3650,21 @@ class VoiceAssistant:
         status_file = self.state_dir / "status"
         symbols = {"off": "◯", "ready": "●", "listening": "◉",
                    "thinking": "◈", "speaking": "◆"}
+        which = backend or self.backend
         payload = {
             "text": symbols.get(state, ""),
-            "class": [state, backend or self.backend],
-            "tooltip": f"Voice Assistant — {state} ({backend or self.backend})",
+            "class": [state, which],
+            "tooltip": f"Voice Assistant — {state} ({which})",
+            "backend": which,
             # Extra keys for the indicator's model menu. waybar ignores what it
             # does not know, so this stays a valid custom-module payload.
+            # `model`/`effort` are Claude's settings and mean something only when
+            # `backend` is claude; a local backend's model is `local_model`.
             "model": CLAUDE_MODEL,
             "effort": CLAUDE_EFFORT,
             "models": list(CLAUDE_MODELS),
             "efforts": list(CLAUDE_EFFORTS),
+            "local_model": _local_model_label(),
         }
         try:
             tmp = status_file.with_suffix(".tmp")

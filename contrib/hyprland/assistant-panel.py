@@ -30,6 +30,7 @@ STATES = {  # glyph + colour for the phase published in status.class[0]
     "thinking":  ("◈", "thinking",  YELLOW),
     "speaking":  ("◆", "speaking",  MAGENTA),
 }
+BACKENDS = {"claude": "Claude", "local": "Local", "dsh": "Harness"}
 ROLES = {  # colour + label + whether it is dimmed secondary text
     "you":       (BLUE,    "You",       False),
     "assistant": (WHITE,   "Assistant", False),
@@ -61,12 +62,18 @@ def render(cols, rows):
     turns  = read_json(TRANSCRIPT, {}).get("turns", [])
     cls    = status.get("class") or []
     phase  = cls[0] if len(cls) > 0 else "off"
-    backend= cls[1] if len(cls) > 1 else ""
-    model  = status.get("model", "")
-    effort = status.get("effort", "")
+    backend= status.get("backend") or (cls[1] if len(cls) > 1 else "")
+    # `model`/`effort` are Claude's settings; on a local backend the model is
+    # the local one and there is no effort to show.
+    if backend == "claude":
+        model  = str(status.get("model", "")).title()
+        effort = status.get("effort", "")
+    else:
+        model  = status.get("local_model", "")
+        effort = ""
     glyph, label, colour = STATES.get(phase, ("·", phase, WHITE))
     state = label or phase                       # "listening", or "ready"/"off"
-    ident = " ".join(p for p in (backend.title(), model.title()) if p)
+    ident = " ".join(p for p in (BACKENDS.get(backend, backend.title()), model) if p)
 
     left_plain  = f"Assistant · {state}"
     right_plain = ident + (f" · {effort}" if effort else "")
@@ -88,7 +95,7 @@ def render(cols, rows):
             body.append(f"  {col}{D if dim else ''}{ln}{R}")
         body.append("")
 
-    foot = f"{D}{GREY}  SUPER tap: mic   SUPER+M: model   SUPER+SHIFT+V: new{R}"
+    foot = f"{D}{GREY}  SUPER tap: mic   SUPER+M: backend   SUPER+SHIFT+V: new{R}"
     avail = rows - len(head) - 1
     body = body[-avail:] if avail > 0 else []
 
