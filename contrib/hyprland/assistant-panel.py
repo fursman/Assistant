@@ -108,17 +108,27 @@ def render(cols, rows):
     out.append(foot + EOL)
     sys.stdout.write("".join(out)); sys.stdout.flush()
 
+SELF = os.path.realpath(__file__)
+
+def mt(p):
+    try: return os.stat(p).st_mtime
+    except OSError: return 0.0
+
 def sig():
-    def mt(p):
-        try: return os.stat(p).st_mtime
-        except OSError: return 0.0
     return (mt(TRANSCRIPT), mt(STATUS), shutil.get_terminal_size())
 
 def main():
     sys.stdout.write(HIDE + CLR)
     last = None
+    born = mt(SELF)
     try:
         while True:
+            # The window lives for days; when this file is updated (git pull,
+            # setup.sh), start over with the new code instead of drawing the
+            # old layout until someone notices.
+            if mt(SELF) != born:
+                sys.stdout.write(SHOW + R)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
             s = sig()
             if s != last:
                 render(s[2].columns, s[2].lines); last = s

@@ -5127,7 +5127,7 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.debug(f"Router: outcome not recorded ({e})")
         reply = (getattr(self, "_assistant_text", "") or "").strip()
-        if ROUTER_REPLY_CHECK and self._router is not None and reply and v.backend in ("local", "hard"):
+        if ROUTER_REPLY_CHECK and self._router is not None and reply and v.backend in ("local", "hard", "dsh"):
             # Off the turn's thread: the check is a judgment on the same server (~0.5 s) and
             # the microphone should not wait for it. The record is written when it is in.
             def check_then_record():
