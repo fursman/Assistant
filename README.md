@@ -133,7 +133,7 @@ detached and a few seconds later, so the reply finishes first.
 ## Features
 
 - **Semantic end of turn** — an 8.7 MB audio classifier, not a silence timer.
-  ~0.4 s of dead air after you stop instead of ~2.7 s, and it holds through a
+  ~0.45 s of dead air after you stop instead of ~2.7 s, and it holds through a
   mid-sentence pause instead of cutting you off.
 - **Two backends, chosen automatically** — the local model when this machine can
   hold it, Claude otherwise, with a per-query fallback either way.
@@ -435,11 +435,11 @@ comes down as the pause lengthens**:
 
 | silence so far | probability needed to end the turn |
 |---|---|
-| 0.35 s | 0.90 |
-| 0.70 s | 0.75 |
-| 1.10 s | 0.60 |
-| 1.60 s | 0.50 |
-| 2.50 s | ends regardless |
+| 0.45 s | 0.90 |
+| 0.70 s | 0.70 |
+| 1.10 s | 0.40 |
+| 1.60 s | 0.20 |
+| 2.00 s | ends regardless |
 
 That shape is the point. A mid-sentence breath is short, so early on the model
 has to be nearly certain before it cuts you off; a pause that keeps going is
@@ -451,15 +451,56 @@ Measured on 650 real human utterances from the project's own test set: **92.9%
 accurate** (7.9% false-complete, 6.3% false-incomplete), 60–120 ms per call on
 this CPU. v3.0 scores 82.5% on the same data — v3.2 is the one to use.
 
-The effect on a turn: **~2.7 s of dead air after the last word becomes ~0.4 s**,
+The effect on a turn: **~2.7 s of dead air after the last word becomes ~0.45 s**,
 while mid-sentence pauses of 0.3, 0.5 and 0.8 s all survive (measured). A false
 trigger, which used to cost a full silence timeout, resolves in about the same
 0.4 s, because silence scores 0.99 "complete" and the empty transcript is
 discarded.
 
-If it still cuts you off, raise the early bars:
-`VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS="0.5:0.95,0.9:0.8,1.4:0.6,1.9:0.5"`.
+Silence is timed from the end of the last 32 ms speech window, in samples,
+so a checkpoint fires within one 64 ms read of the time it names. It used to be
+counted in 0.2 s chunks, where one speech window anywhere in a chunk made the
+whole chunk speech: the nominal 0.35 s checkpoint really came 0.4–0.57 s after
+the last word, and adding up 0.2 s floats moved the 1.6 s checkpoint to 1.8 s
+and the 2.5 s timeout to 2.6 s. Each smart-turn call is also started 0.12 s
+before its checkpoint (`VOICE_ASSISTANT_SMART_TURN_LEAD`), on the audio heard
+so far, so its 60–120 ms is spent waiting anyway; its score hardly moves with a
+few more tenths of silence (measured on 538 real clips with 0–1.8 s of trailing
+silence or fan-like noise).
+
+**How the schedule was chosen (2026-09-22).** In 354 logged turns, 59% ended
+at the first checkpoint, but **20% sat through every checkpoint to the
+timeout**, and those were finished sentences ("Cool.", "It is damp out
+today."). smart-turn scored p≈0.01 on them all the way down. Why is not known
+yet (see saved turns below). So the later bars come down and the timeout moves
+to 2.0 s: replayed on the log, 22 more turns end early, and 3 of the 45 pauses
+you went on from would have been cut.
+
+The first checkpoint is where cut-offs happen, and it did not move. A pause
+*between* two sentences scores as high as the end of a turn (0.98+), so no
+probability bar tells them apart; only time does. Replayed with real Silero
+and smart-turn on 150 multi-sentence clips from pipecat's test set:
+
+| first checkpoint | clips ended at a pause between sentences |
+|---|---|
+| old code, "0.35 s" | 59% |
+| 0.30 s | 69% |
+| 0.40 s | 64% |
+| **0.45 s** | **59%** |
+
+So 0.45 s cuts you off no more often than before. If you would rather have
+snappier turns and more cut-offs, start the schedule at 0.30:
+`VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS="0.30:0.90,0.70:0.70,1.10:0.40,1.60:0.20"`.
+If it cuts you off, raise the early bars:
+`VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS="0.6:0.95,0.9:0.8,1.4:0.6,1.9:0.5"`.
 A false "unfinished" only costs the wait to the next checkpoint.
+
+**Saved turns.** `VOICE_ASSISTANT_SAVE_TURNS=1` keeps every recorded turn as a
+16 kHz WAV in `~/.local/state/voice-assistant/turns/`, plus one line in
+`turns.jsonl` with what smart-turn said at each checkpoint, what ended the turn
+and the transcript. Only the newest 300 are kept (`_SAVE_TURNS_KEEP`). It is off
+by default because it is a recording of everything you say to the assistant;
+it is the way to find out why some finished turns score "unfinished".
 
 Set `VOICE_ASSISTANT_SMART_TURN=0` to go back to the timeout alone.
 
@@ -486,10 +527,21 @@ per sentence: measured 85 ms of silence at every sentence boundary before, 0 ms
 now, first word at ~30 ms instead of ~150 ms, and aborting fades out in 5 ms
 instead of cutting the waveform mid-cycle.
 
-The first unit of a reply is allowed to end at a comma, because waiting for a
-full stop put seconds between the model's first token and the first sound. A
-short prebuffer (`VOICE_ASSISTANT_TTS_PREBUFFER`, 0.35 s, bounded by a 1.2 s
-deadline) absorbs a thermal dip without stalling the reply.
+**Speech is streamed.** Pocket's audio is played as it is decoded, 80 ms at a
+time, instead of after the whole sentence has been made: from the moment a
+sentence is handed to the synthesiser to the first sound went from 1.4 s
+(median of 210 turns, 2.8 s at p90) to ~0.17 s plus the prebuffer. Pocket
+cannot be cancelled mid-sentence, so a sentence cut short by a barge-in is
+finished in the background, and the next one waits for it rather than running
+beside it (`VOICE_ASSISTANT_TTS_STREAM=0` synthesises whole sentences again).
+
+The first unit of a reply is allowed to end at the first comma with four
+words before it, because waiting for a full stop put seconds between the
+model's first token and the first sound. A short prebuffer
+(`VOICE_ASSISTANT_TTS_PREBUFFER`, 0.35 s, bounded by a 1.2 s deadline) absorbs
+a thermal dip without stalling the reply. Every spoken reply logs
+`Playback: N gaps mid-reply, M device underruns`; a gap is the queue running
+dry because synthesis fell behind.
 
 After playback the mic is held shut for `VOICE_ASSISTANT_TTS_TAIL_GATE` (0.35 s)
 to swallow the room's tail rather than transcribe the assistant's own voice.
@@ -601,6 +653,12 @@ in six rounds; that is still ~0.7 s, because the cost is prefilling the question
 number of rounds. Resident size 15.5 GB of 16.4; two judge slots with MTP left 427 MiB free
 and died of a CUDA out-of-memory on the first real turn.
 
+Each question costs ~0.1 s on the server (measured: six 740 ms, three 425 ms). The
+DeepSeek Harness only acts on the junk and risky/caution decisions (no tool gating, hard
+lane or routing), so on that backend only `addressed`, `intelligible` and `risky` are
+asked (`VOICE_ASSISTANT_ROUTER_DSH_QUESTIONS`; empty asks all six, for collecting full
+labels). Each question is scored on its own, so the three keep their calibration.
+
 The router runs for the local model's turns (`VOICE_ASSISTANT_ROUTER_BACKENDS`,
 default `local,dsh`). When Claude has been chosen it answers everything with its
 own judgment and the judge is not consulted at all: no extra wait, no misroute.
@@ -668,7 +726,7 @@ probabilities, the decisions, the latency, and which backend actually
 answered -- so the turns can be relabelled and the calibration refitted.
 
 For spoken turns the call overlaps the end-of-turn wait instead of following
-it: at the first smart-turn checkpoint (0.35 s of silence) the streaming
+it: at the first smart-turn checkpoint (0.45 s of silence) the streaming
 transcript so far goes to the judge in the background, and when the final
 transcript turns out to be the same words the verdict is already in
 (`Router: verdict prefetched during end-of-turn (640 ms early)`), so the
@@ -932,7 +990,7 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_DROP` | `1` | ignore spoken turns the verdict calls junk |
 | `VOICE_ASSISTANT_ROUTER_TIMEOUT` | `1.5` | seconds before the router has no opinion |
 | `VOICE_ASSISTANT_ROUTER_PREFETCH` | `1` | judge a spoken turn as soon as it is complete, from the streaming transcript, while the final transcript is produced |
-| `VOICE_ASSISTANT_ROUTER_PREFETCH_EARLY` | `0` | also judge at the first silence checkpoint (0.35 s); off because the decoder lagged the last words on every real turn and the call queued behind it |
+| `VOICE_ASSISTANT_ROUTER_PREFETCH_EARLY` | `0` | also judge at the first silence checkpoint (0.45 s); off because the decoder lagged the last words on every real turn and the call queued behind it |
 | `VOICE_ASSISTANT_ROUTER_PREFETCH_TIMEOUT` | `3.0` | seconds a prefetched call may take; the turn itself waits at most `ROUTER_TIMEOUT` for it |
 | `VOICE_ASSISTANT_ROUTER_THR_DROP` | `0.8` | junk probability at which a spoken turn is dropped |
 | `VOICE_ASSISTANT_ROUTER_THR_WEB` / `_SHELL` | `0.2` / `0.2` | probability at which a tool is offered |
@@ -941,6 +999,7 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL` / `_WEB` | `1.01` / `1.01` | tool probability past which a non-simple turn goes to Claude; above 1 = never (the default). `0.6` sends confident tool tasks to Claude |
 | `VOICE_ASSISTANT_ROUTER_THR_HARD` | `0.3` | `simple` at or below this, with no tool wanted, is a hard question |
 | `VOICE_ASSISTANT_ROUTER_THR_CAUTION` | `0.1` | `risky` from here up (below the risky bar) adds the caution marker on a local turn |
+| `VOICE_ASSISTANT_ROUTER_DSH_QUESTIONS` | `addressed,intelligible,risky` | the questions asked when the DeepSeek Harness answers; empty = all six |
 | `VOICE_ASSISTANT_ROUTER_BACKENDS` | `local,dsh` | backends the router runs for; add `claude` to route simple turns away from Claude as before |
 | `VOICE_ASSISTANT_ROUTER_PREFETCH_MAX_EXTRA_WORDS` | `2` | a prefetch that is a prefix of the final transcript is reused when the final adds at most this many words |
 | `VOICE_ASSISTANT_ROUTER_THINK` | `1` | thinking on demand for hard local turns |
@@ -982,9 +1041,12 @@ win over both.
 | `VOICE_ASSISTANT_VAD_START` / `_STOP` | `0.5` / `0.35` | Silero speech thresholds |
 | `VOICE_ASSISTANT_VAD_WINDOWS` | `3` | 32 ms windows before a turn starts |
 | `VOICE_ASSISTANT_SMART_TURN` | `1` | semantic end-of-turn detection |
-| `VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS` | `0.35:0.90,…` | `silence:probability` pairs; raise to be cut off less |
+| `VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS` | `0.45:0.90,0.70:0.70,1.10:0.40,1.60:0.20` | `silence:probability` pairs; raise to be cut off less |
+| `VOICE_ASSISTANT_SMART_TURN_LEAD` | `0.12` | seconds before each checkpoint that smart-turn is asked |
 | `VOICE_ASSISTANT_SMART_TURN_THREADS` | `4` | ONNX threads for the classifier |
-| `VOICE_ASSISTANT_SILENCE_TIMEOUT` | `2.5` | ends the turn regardless |
+| `VOICE_ASSISTANT_SILENCE_TIMEOUT` | `2.0` | ends the turn regardless |
+| `VOICE_ASSISTANT_SAVE_TURNS` | `0` | keep each turn's audio and end-of-turn record (see End of turn) |
+| `VOICE_ASSISTANT_SAVE_TURNS_DIR` / `_KEEP` | `~/.local/state/voice-assistant/turns` / `300` | where, and how many |
 
 ### Speaking
 
@@ -998,6 +1060,7 @@ win over both.
 | `VOICE_ASSISTANT_TTS_THREADS` | physical cores | ONNX threads for synthesis |
 | `VOICE_ASSISTANT_TTS_PREBUFFER` | `0.35` | seconds queued before the first word plays |
 | `VOICE_ASSISTANT_TTS_PREBUFFER_WAIT` | `1.2` | deadline on that wait |
+| `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
 | `VOICE_ASSISTANT_TTS_TAIL_GATE` | `0.35` | silence held after playback before the mic is trusted |
 | `VOICE_ASSISTANT_LISTEN_CHIME` | `1` | chime when the mic goes live again after a reply |
 
@@ -1024,7 +1087,8 @@ and synthesis are all local, always. In local mode the only outbound traffic is
 `web_search` / `fetch_page`, and only when the model chooses to use them. Model
 weights are downloaded once, on first run.
 
-Nothing is recorded until you press the key. There is no wake word, which is a
+Nothing is recorded until you press the key, and nothing is kept on disk
+unless you turn on `VOICE_ASSISTANT_SAVE_TURNS`. There is no wake word, which is a
 deliberate trade: you give up "hey computer" and get a microphone that is
 provably idle the rest of the time.
 
@@ -1056,17 +1120,19 @@ a GPU.
 ## Troubleshooting
 
 **It cuts me off mid-sentence.** Raise the early checkpoints:
-`VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS="0.5:0.95,0.9:0.8,1.4:0.6,1.9:0.5"`. A
+`VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS="0.6:0.95,0.9:0.8,1.4:0.6,1.9:0.5"`. A
 false "unfinished" only costs the wait to the next checkpoint.
 
-**It waits too long after I stop.** Lower them, or check that smart-turn loaded
-at all — without it you get the flat `VOICE_ASSISTANT_SILENCE_TIMEOUT` (2.5 s).
-`voice-assistant-ctl logs` says which.
+**It waits too long after I stop.** Lower them (the first one trades speed for
+cut-offs between sentences, see End of turn), or check that smart-turn loaded
+at all — without it you get the flat `VOICE_ASSISTANT_SILENCE_TIMEOUT` (2.0 s).
+`voice-assistant-ctl logs` says which. `VOICE_ASSISTANT_SAVE_TURNS=1` keeps the
+turns it got wrong for a closer look.
 
 **Speech is chunky and stop-start.** Synthesis is slower than realtime on this
 machine. Confirm the engine is `pocket`, not `kokoro`, and check whether the CPU
-is thermally throttling. Raising `VOICE_ASSISTANT_TTS_PREBUFFER` buys a little
-headroom.
+is thermally throttling (`Playback: N gaps mid-reply` in the log counts it).
+Raising `VOICE_ASSISTANT_TTS_PREBUFFER` buys a little headroom.
 
 **It mishears the same name every time.** Add it to
 `~/.config/voice-assistant/vocabulary.txt`. If that does not take, the miss is

@@ -44,7 +44,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -66,6 +66,8 @@ ROUTER_QUESTIONS: List[Tuple[str, str]] = [
 ]
 QUESTION_IDS = [q for q, _ in ROUTER_QUESTIONS]
 REQUIRED_QUESTIONS = ("addressed", "intelligible", "needs_web", "needs_shell", "risky", "simple")
+# What Verdict.junk / Verdict.drop read: asked on every call, whatever else is left out.
+JUNK_QUESTIONS = ("addressed", "intelligible")
 OPTIONS = ["yes", "no"]
 
 # How the dataset was built: a previous exchange counts only when it happened
@@ -201,21 +203,27 @@ class Verdict:
     def drop(self) -> bool:
         return (not self.typed) and self.junk >= self.thresholds["drop_junk"]
 
+    def _over(self, qid: str, threshold: str) -> bool:
+        """p(qid) at or past a threshold; False for a question that was not asked
+        (see TurnRouter.judge(only=...))."""
+        p = self.probs.get(qid)
+        return p is not None and p >= self.thresholds[threshold]
+
     @property
     def needs_web(self) -> bool:
-        return self.probs["needs_web"] >= self.thresholds["needs_web"]
+        return self._over("needs_web", "needs_web")
 
     @property
     def needs_shell(self) -> bool:
-        return self.probs["needs_shell"] >= self.thresholds["needs_shell"]
+        return self._over("needs_shell", "needs_shell")
 
     @property
     def risky(self) -> bool:
-        return self.probs["risky"] >= self.thresholds["risky"]
+        return self._over("risky", "risky")
 
     @property
     def simple(self) -> bool:
-        return self.probs["simple"] >= self.thresholds["simple_local"]
+        return self._over("simple", "simple_local")
 
     @property
     def followup(self) -> bool:
@@ -231,8 +239,8 @@ class Verdict:
         """A real tool task rather than a quick question: not simple, and the web or shell
         probability is past the escalation bar. Claude Code does those better; a question that
         merely glances at the machine ("are you up?", p(shell) 0.3) is not one of them."""
-        return (not self.simple) and (self.probs["needs_shell"] >= self.thresholds["escalate_shell"]
-                                      or self.probs["needs_web"] >= self.thresholds["escalate_web"])
+        return (not self.simple) and (self._over("needs_shell", "escalate_shell")
+                                      or self._over("needs_web", "escalate_web"))
 
     @property
     def route(self) -> str:
@@ -244,14 +252,15 @@ class Verdict:
     def hard(self) -> bool:
         """Stays local, wants no tool, and is not a simple question: the model's own reasoning (or
         a bigger model) is worth the wait."""
+        simple = self.probs.get("simple")
         return (self.route == "local" and not self.needs_web and not self.needs_shell
-                and self.probs["simple"] <= self.thresholds["hard"])
+                and simple is not None and simple <= self.thresholds["hard"])
 
     @property
     def caution(self) -> bool:
         """Below the risky bar but not clear of it, on a turn that stays local."""
         return (self.route == "local" and not self.risky
-                and self.probs["risky"] >= self.thresholds["caution"])
+                and self._over("risky", "caution"))
 
     @property
     def tools(self) -> List[str]:
@@ -377,21 +386,33 @@ class TurnRouter:
             return False
 
     def request_body(self, text: str, typed: bool = False,
-                     previous: Optional[Tuple[str, str, float]] = None) -> dict:
+                     previous: Optional[Tuple[str, str, float]] = None,
+                     only: Optional[Sequence[str]] = None) -> dict:
+        questions = self._questions
+        if only is not None:
+            want = set(only) | set(JUNK_QUESTIONS)
+            questions = [q for q in questions if q["id"] in want]
         return {"mode": "chat", "system": ROUTER_SYSTEM,
                 "context": build_context(text, typed=typed, previous=previous),
                 "separator": "\n\n", "enable_thinking": False, "top_k": 0,
-                "questions": self._questions}
+                "questions": questions}
 
     def judge(self, text: str, typed: bool = False,
               previous: Optional[Tuple[str, str, float]] = None,
-              timeout: Optional[float] = None) -> Optional[Verdict]:
+              timeout: Optional[float] = None,
+              only: Optional[Sequence[str]] = None) -> Optional[Verdict]:
         """One verdict, or None when the router has no opinion (disabled, down,
         slow, or answering something other than what was asked). `timeout`
-        overrides the router's own for this call (a prefetch may take longer)."""
+        overrides the router's own for this call (a prefetch may take longer).
+
+        `only` asks a subset of the rubric (the junk questions are always
+        asked). Each question is scored on its own, so the ones asked keep
+        their calibration; the server answers them one after another at ~0.1 s
+        each, so a caller that reads three of six saves ~0.3 s. Decisions that
+        need a question left out come out False."""
         if not self.enabled or not text or not text.strip():
             return None
-        body = self.request_body(text, typed=typed, previous=previous)
+        body = self.request_body(text, typed=typed, previous=previous, only=only)
         t0 = time.monotonic()
         try:
             r = self.session.post(self.url, json=body, timeout=self.timeout if timeout is None else timeout)
@@ -404,7 +425,7 @@ class TurnRouter:
             return None
         try:
             data = r.json()
-            probs, raw, mass = self._parse(data)
+            probs, raw, mass = self._parse(data, [q["id"] for q in body["questions"]])
         except Exception as e:
             self._debug(f"router: unusable answer ({e.__class__.__name__}: {e})")
             return None
@@ -449,10 +470,11 @@ class TurnRouter:
         context = verdict.context + "\n\nAssistant's reply:\n" + strip_markers(reply)[:1200]
         return self.judge_raw(REPLY_CHECK_SYSTEM, context, REPLY_CHECK_QUESTIONS, timeout=timeout)
 
-    def _parse(self, data: dict):
+    def _parse(self, data: dict, asked: Optional[Sequence[str]] = None):
         by_id = {q.get("id"): q for q in data["questions"]}
         probs, raw, mass = {}, {}, {}
-        for qid in self.calibration:  # the rubric actually asked (from the calibration file)
+        # the rubric actually asked (from the calibration file), or the part of it a caller wanted
+        for qid in (self.calibration if asked is None else [q for q in self.calibration if q in asked]):
             q = by_id[qid]
             opts = {o["text"]: o for o in q["options"]}
             ly, ln = float(opts["yes"]["logprob"]), float(opts["no"]["logprob"])

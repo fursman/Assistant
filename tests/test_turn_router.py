@@ -524,3 +524,37 @@ def test_record_carries_the_outcome(router, tmp_path):
     row = json.loads((tmp_path / "router.jsonl").read_text().strip())
     assert row["backend"] == "local" and row["outcome"] == {"took_s": 1.2, "check": {"answered": 0.9}}
     assert row["decisions"]["hard"] is False and row["decisions"]["caution"] is False
+
+
+# --- a subset of the rubric (the DeepSeek Harness asks three) ----------------------------
+
+def test_judge_only_asks_the_subset_and_decides_without_the_rest(router):
+    r, state = router
+    state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.97, "needs_web": 0.9,
+                                    "needs_shell": 0.9, "risky": 0.12, "simple": 0.1})
+    v = r.judge("what is using all my disk space", only=("risky",))
+    _, body = state.requests[-1]
+    assert [q["id"] for q in body["questions"]] == ["addressed", "intelligible", "risky"], \
+        "the junk questions are always asked, in rubric order"
+    assert set(v.probs) == {"addressed", "intelligible", "risky"}
+    # the server answered all six; only what was asked is read
+    assert v.probs["risky"] == pytest.approx(0.12, abs=1e-6)
+    assert not v.needs_web and not v.needs_shell and not v.simple and not v.hard
+    assert v.tools == [] and v.route == "local" and v.caution
+    d = v.decisions()
+    assert d["drop"] is False and d["hard"] is False
+    assert v.log_line().startswith("Router: addressed=0.99 intelligible=0.97 risky=0.12 -> route=local")
+    json.loads(v.to_json())
+
+    state.body = judge_response(r, {"addressed": 0.99, "intelligible": 0.99, "risky": 0.8})
+    assert r.judge("reboot it now", only=("risky",)).route == "claude"
+    state.body = judge_response(r, {"addressed": 0.05, "intelligible": 0.5})
+    assert r.judge("mumble", only=("risky",)).drop
+
+
+def test_judge_without_only_asks_the_whole_rubric(router):
+    r, state = router
+    state.body = judge_response(r, {})
+    r.judge("hello")
+    _, body = state.requests[-1]
+    assert [q["id"] for q in body["questions"]] == QUESTION_IDS

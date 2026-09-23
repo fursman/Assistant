@@ -36,6 +36,7 @@ Thinking streams as 🧠 notifications; reply sentences reach TTS as they arrive
 
 import asyncio
 import collections
+import concurrent.futures
 import difflib
 import html
 import importlib.util
@@ -55,7 +56,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import wave  # used by chime generation
+import wave  # chimes, and saved turns (VOICE_ASSISTANT_SAVE_TURNS)
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
@@ -91,11 +92,20 @@ CHUNK_SIZE = 1024            # PortAudio callback size: 64 ms
 AUDIO_FORMAT = pyaudio.paInt16
 
 VAD_CHUNK_DURATION = 0.2     # idle listening granularity
-RECORD_CHUNK_DURATION = 0.2  # recording granularity == end-of-turn resolution
-# Hard fallback only. smart-turn normally ends the turn ~0.3 s after the last
+# Recording granularity. Silence is timed per 32 ms Silero window (see
+# SpeechDetector.scan), so this only sets how often the checkpoints are looked
+# at. It used to be 0.2 s with "any window active = the whole chunk is
+# speech", which put the nominal 0.35 s checkpoint 0.4-0.57 s after the last
+# word, and summing 0.2 s floats moved the 1.6 s checkpoint to 1.8 s and the
+# 2.5 s timeout to 2.6 s.
+RECORD_CHUNK_DURATION = 0.064
+# Hard fallback only. smart-turn normally ends the turn ~0.45 s after the last
 # word; this is what happens when the model is unavailable or keeps saying
 # "unfinished" (a trailing "and...", a mid-sentence pause that never resolves).
-SILENCE_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_SILENCE_TIMEOUT", "2.5"))
+# In 354 logged turns 20% ended here, almost all finished sentences, and of 45
+# pauses the speaker went on from, 2 lasted past 1.8 s: 2.0 s trades those two
+# for 0.6 s off every turn smart-turn misjudges.
+SILENCE_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_SILENCE_TIMEOUT", "2.0"))
 MAX_RECORD_DURATION = 60
 
 # Silero VAD, with hysteresis. A single 32 ms window over 0.3 used to start a
@@ -126,6 +136,22 @@ VAD_START_WINDOWS = int(os.getenv("VOICE_ASSISTANT_VAD_WINDOWS", "3"))  # 3 x 32
 #
 # A clearly finished sentence scores 0.98-0.99, so it still ends at the first
 # checkpoint. A false "unfinished" only costs the wait to the next one.
+#
+# Retuned 2026-09-22 on 354 logged turns: a fifth of all turns (finished
+# ones) sat through every checkpoint to the timeout, so the later bars come
+# down; replayed on the log that ends 22 more turns early and would have cut
+# 3 of the 45 pauses the speaker went on from.
+#
+# The first checkpoint is where cutting people off lives. A pause BETWEEN
+# two sentences scores as high as the end of a turn (0.98+), so no bar
+# separates them; only time does. Checkpoints are now timed from the last
+# speech window, where the old 0.2 s chunks put a nominal 0.35 s at 0.4-0.57 s.
+# Replayed on 150 real multi-sentence clips (pipecat smart-turn v3.2 test
+# set, real Silero and smart-turn): an honest 0.30 s ended 69% of them at an
+# inner pause against the old code's 59%; 0.40 s 64%; 0.45 s 59%. So 0.45 s:
+# no more cut-offs than before, and the speed comes from the early smart-turn
+# call, the lower later bars and the shorter timeout. For snappier turns at
+# the cost of more cut-offs between sentences, start the schedule at 0.30.
 SMART_TURN = os.getenv("VOICE_ASSISTANT_SMART_TURN", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 SMART_TURN_MODEL = os.getenv(
@@ -149,11 +175,30 @@ def _parse_checkpoints(spec: str):
             out.append((float(secs), float(prob) if prob.strip() else 0.5))
         except ValueError:
             continue
-    return sorted(out) or [(0.35, 0.9), (0.7, 0.75), (1.1, 0.6), (1.6, 0.5)]
+    return sorted(out) or list(_DEFAULT_CHECKPOINTS)
 
 
+_DEFAULT_CHECKPOINTS = ((0.45, 0.90), (0.70, 0.70), (1.10, 0.40), (1.60, 0.20))
 SMART_TURN_CHECKPOINTS = _parse_checkpoints(os.getenv(
-    "VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS", "0.35:0.90,0.70:0.75,1.10:0.60,1.60:0.50"))
+    "VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS",
+    ",".join(f"{t:.2f}:{p:.2f}" for t, p in _DEFAULT_CHECKPOINTS)))
+# smart-turn takes 60-120 ms a call on this CPU, and that used to be spent
+# after the checkpoint was reached. The call is now started this long before
+# each checkpoint on the audio heard so far and its answer read at the
+# checkpoint; its score barely moves with a few more tenths of silence
+# (measured on 538 real clips with 0-1.8 s of trailing silence or noise).
+SMART_TURN_LEAD = float(os.getenv("VOICE_ASSISTANT_SMART_TURN_LEAD", "0.12"))
+
+# Opt-in: keep each recorded turn (16 kHz WAV + a JSON line of what the
+# end-of-turn logic saw and what was transcribed) so misjudged turns can be
+# replayed. Off by default: it is a recording of everything said to the
+# assistant. The newest SAVE_TURNS_KEEP are kept.
+SAVE_TURNS = os.getenv("VOICE_ASSISTANT_SAVE_TURNS", "0").strip().lower() \
+    in ("1", "true", "yes", "on")
+SAVE_TURNS_DIR = Path(os.getenv(
+    "VOICE_ASSISTANT_SAVE_TURNS_DIR",
+    str(Path.home() / ".local/state/voice-assistant/turns")))
+SAVE_TURNS_KEEP = int(os.getenv("VOICE_ASSISTANT_SAVE_TURNS_KEEP", "300"))
 
 # --- STT -------------------------------------------------------------------
 # "moonshine" (default) or "whisper".
@@ -246,6 +291,9 @@ TTS_VOICES = os.getenv("VOICE_ASSISTANT_TTS_VOICES", "voices-v1.0.bin")
 # bounded by a deadline so a slow first clause cannot stall the reply.
 TTS_PREBUFFER_SECONDS = float(os.getenv("VOICE_ASSISTANT_TTS_PREBUFFER", "0.35"))
 TTS_PREBUFFER_MAX_WAIT = float(os.getenv("VOICE_ASSISTANT_TTS_PREBUFFER_WAIT", "1.2"))
+# Play synthesised audio as it is decoded, for engines that can (Pocket).
+TTS_STREAM = os.getenv("VOICE_ASSISTANT_TTS_STREAM", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
 # Silence held after playback before the mic is trusted again, to swallow the
 # room's tail rather than transcribe the assistant's own voice. This used to
 # be "wait for three quiet chunks", which threw away the user's reply whenever
@@ -360,6 +408,11 @@ LOCAL_MAX_TOOL_ITERS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS", "5"
 ROUTER_ENABLED = os.getenv("VOICE_ASSISTANT_ROUTER", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 # The server with the /judge endpoint: the local model's own, unless told otherwise.
+# The questions asked when the DeepSeek Harness answers: it acts on nothing
+# else, and each question is ~0.1 s on the server. Empty = the whole rubric
+# (for collecting full labels on harness turns).
+ROUTER_DSH_ONLY = tuple(q for q in os.getenv(
+    "VOICE_ASSISTANT_ROUTER_DSH_QUESTIONS", "addressed,intelligible,risky").replace(" ", "").split(",") if q)
 ROUTER_URL = os.getenv("VOICE_ASSISTANT_ROUTER_URL", "").strip() \
     or re.sub(r"/v1/?$", "", LOCAL_LLM_URL.rstrip("/"))
 # Move a turn between the local model and Claude on the verdict.
@@ -384,7 +437,7 @@ ROUTER_PREFETCH_MIN_MATCH = float(os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH_MIN
 # exactly as before. Typed input never prefetches.
 ROUTER_PREFETCH = os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH", "1").strip().lower() \
     not in ("0", "false", "no", "off")
-# Also judge at the first silence checkpoint (0.35 s), before the turn is known to be over.
+# Also judge at the first silence checkpoint (0.45 s), before the turn is known to be over.
 # Off by default: on real turns the decoder lagged the last words every time, so that early
 # call was wasted and the end-of-turn call then queued behind it on the single judge slot.
 ROUTER_PREFETCH_EARLY = os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH_EARLY", "0").strip().lower() \
@@ -1465,6 +1518,19 @@ def _write_env_setting(key: str, value: str):
 # End-of-turn model
 # ---------------------------------------------------------------------------
 
+def _tail(frames, n):
+    """The last `n` samples of a list of chunks, without joining the rest:
+    smart-turn only looks at the final 8 s of a turn that may be 60 s long."""
+    out, have = [], 0
+    for f in reversed(frames):
+        out.append(f)
+        have += len(f)
+        if have >= n:
+            break
+    x = np.concatenate(out[::-1]) if out else np.zeros(0, dtype=np.float32)
+    return x[-n:]
+
+
 class SmartTurnDetector:
     """pipecat smart-turn v3: "did that sound like a finished turn?"
 
@@ -1727,6 +1793,10 @@ class SpeechDetector:
     def __init__(self, model):
         self.model = model
         self._run = 0
+        # Samples short of a whole window, carried to the next call. Without
+        # this each 0.2 s read (3200 samples) lost its last 128 to the model,
+        # which is stateful and was being shown audio with holes in it.
+        self._carry = np.zeros(0, dtype=np.float32)
 
     def reset(self):
         try:
@@ -1734,14 +1804,36 @@ class SpeechDetector:
         except Exception:
             pass
         self._run = 0
+        self._carry = np.zeros(0, dtype=np.float32)
 
     def probabilities(self, audio):
+        """One probability per whole 512-sample window, windows contiguous
+        across calls."""
+        x = np.asarray(audio, dtype=np.float32).ravel()
+        if self._carry.size:
+            x = np.concatenate([self._carry, x])
+        n = x.size // self._WINDOW
+        self._carry = x[n * self._WINDOW:].copy()
         out = []
-        n = len(audio) - self._WINDOW + 1
-        for i in range(0, max(0, n), self._WINDOW):
-            chunk = torch.from_numpy(np.ascontiguousarray(audio[i:i + self._WINDOW]))
+        for i in range(n):
+            chunk = torch.from_numpy(np.ascontiguousarray(x[i * self._WINDOW:(i + 1) * self._WINDOW]))
             out.append(self.model(chunk, SAMPLE_RATE).item())
         return out
+
+    def scan(self, audio):
+        """(samples judged, where speech last ended within them or None).
+
+        What the recorder times silence with: the silence after this call is
+        `judged - end` when speech was heard in it, else it grows by `judged`.
+        Speech is held with the lower stop threshold (hysteresis), as in
+        active().
+        """
+        probs = self.probabilities(audio)
+        end = None
+        for i, p in enumerate(probs):
+            if p >= VAD_STOP_THRESHOLD:
+                end = (i + 1) * self._WINDOW
+        return len(probs) * self._WINDOW, end
 
     def onset(self, audio) -> bool:
         """True when speech has been present long enough to start recording."""
@@ -1824,6 +1916,10 @@ class PcmPlayer:
         self._last = 0.0
         self._cycles = 0
         self.underruns = 0
+        # Times the queue ran out while it was being played: once at the end
+        # of every reply, and once more for every gap where synthesis fell
+        # behind playback mid-reply.
+        self.dry = 0
         self.latency = 0.0
         self._stream = None
 
@@ -1874,6 +1970,7 @@ class PcmPlayer:
                 n = min(frames, self._fade_n)
                 out[:n] = self._last * self._ramp[:n]
                 pos = n
+            had = bool(self._q)
             while pos < frames and self._q:
                 chunk = self._q[0]
                 take = min(frames - pos, len(chunk))
@@ -1884,6 +1981,8 @@ class PcmPlayer:
                     self._q.popleft()
                 else:
                     self._q[0] = chunk[take:]
+            if had and not self._q:
+                self.dry += 1
             self._last = float(out[-1]) if frames else 0.0
             self._cv.notify_all()
         return out.tobytes(), pyaudio.paContinue
@@ -2204,6 +2303,40 @@ class ClaudeSession:
 # ---------------------------------------------------------------------------
 # DeepSeek Harness backend
 # ---------------------------------------------------------------------------
+
+def _dedupe(items):
+    seen, out = set(), []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _dsh_tool_summary(label, args) -> str:
+    """One short line for a harness tool call: the tool and its main argument."""
+    main = ""
+    if isinstance(args, dict):
+        for key in ("command", "cmd", "query", "url", "path", "file_path"):
+            if args.get(key):
+                main = str(args[key])
+                break
+        if not main and args:
+            main = json.dumps(args, ensure_ascii=False)
+    main = re.sub(r"\s+", " ", main).strip()
+    if len(main) > 80:
+        main = main[:77] + "..."
+    return f"{label} {main}".strip()
+
+
+def _dsh_retry_note(ran) -> str:
+    """Appended to a prompt retried after the context overflowed mid-turn."""
+    calls = _dedupe(ran)
+    listed = "; ".join(calls[:20]) + ("; ..." if len(calls) > 20 else "")
+    return ("\n\n[Note: your first attempt at this request ran out of context after "
+            f"{len(ran)} tool calls ({listed}). Their output is gone. Re-run only what you "
+            "need, keep outputs short, and if the user asks, say that you did use tools.]")
+
 
 class DshSession:
     """One DeepSeek Harness (`dsh`) runtime kept alive across turns.
@@ -2664,6 +2797,12 @@ class VoiceAssistant:
     def __init__(self):
         self.is_active = False
         self.is_processing = False
+        # True while _record_until_silence runs. A turn is not "processing"
+        # until the recording ends, and a typed question or an unsolicited
+        # reply that started in that window used to run beside the voice turn
+        # it had cut the microphone out from under.
+        self._recording = False
+        self._loop = None
         self._abort_event = threading.Event()
 
         # Backend
@@ -3357,12 +3496,53 @@ class VoiceAssistant:
             voice = str(saved)
         state = model.get_state_for_audio_prompt(voice)
         sample_rate = model.sample_rate
+        # Five INFO lines per sentence ("starting timer now!", ...) were more
+        # than half of the service's journal.
+        logging.getLogger("pocket_tts").setLevel(logging.WARNING)
 
         class _PocketAdapter:
+            """create() for a whole clip, stream() for audio as it is decoded.
+
+            The model is not thread-safe, so every synthesis holds one lock.
+            A stream abandoned part-way (barge-in) cannot be cancelled -- its
+            generation thread runs to the end of the text regardless -- so it
+            is drained in the background, still holding the lock, and the
+            next synthesis waits for it instead of running beside it.
+            """
+
+            def __init__(self):
+                self._lock = threading.Lock()
+
             def create(self, text, voice=None, speed=None):
-                audio = model.generate_audio(state, text)
+                with self._lock:
+                    audio = model.generate_audio(state, text)
                 samples = audio.numpy() if hasattr(audio, "numpy") else np.asarray(audio)
                 return np.asarray(samples, dtype=np.float32).squeeze(), sample_rate
+
+            def stream(self, text, voice=None, speed=None):
+                self._lock.acquire()
+                gen = model.generate_audio_stream(state, text)
+                finished = False
+                try:
+                    for chunk in gen:
+                        samples = chunk.numpy() if hasattr(chunk, "numpy") else np.asarray(chunk)
+                        yield np.asarray(samples, dtype=np.float32).reshape(-1), sample_rate
+                    finished = True
+                finally:
+                    if finished:
+                        self._lock.release()
+                    else:
+                        lock = self._lock
+
+                        def drain():
+                            try:
+                                for _ in gen:
+                                    pass
+                            except Exception:
+                                pass
+                            finally:
+                                lock.release()
+                        threading.Thread(target=drain, name="tts-drain", daemon=True).start()
 
         self.kokoro = _PocketAdapter()
         self.tts_rate = sample_rate
@@ -3842,9 +4022,12 @@ class VoiceAssistant:
                 return m.end()
         if not first_unit:
             return None
-        m = _CLAUSE_END.search(text)
-        if m and len(text[:m.end()].split()) >= 4:
-            return m.end()
+        # The first clause break with four words before it. Only the first
+        # break was ever tried, so an opening "Ah," or "Yes --" hid every
+        # later one and 15% of first units waited for a full stop instead.
+        for m in _CLAUSE_END.finditer(text):
+            if len(text[:m.end()].split()) >= 4:
+                return m.end()
         # No clause break yet. Only split a long opening sentence, and only
         # where a speaker would draw breath: cutting after "on the" sounds
         # worse than the delay it saves.
@@ -4406,6 +4589,7 @@ class VoiceAssistant:
             # Every command the model runs is in the log, as for the native loop.
             self.logger.warning(f"dsh tool {name}: {json.dumps(args)[:300]}")
             self._notify_tool_use(label, json.dumps(args))
+            stats["ran"].append(_dsh_tool_summary(label, args))
             # Loop guards (see DSH_MAX_TOOL_CALLS).
             stats["tool_calls"] += 1
             key = name + "\0" + str(data.get("arguments") or "")
@@ -4431,7 +4615,7 @@ class VoiceAssistant:
         elif kind in ("agent/error", "agent/request-error", "llm/retry-started"):
             self.logger.warning(f"dsh {kind}: {json.dumps(data)[:300]}")
 
-    def _stream_dsh(self, text, abort, _retry=False) -> bool:
+    def _stream_dsh(self, text, abort, _retry=False, _ran=()) -> bool:
         """One turn on the DeepSeek Harness. Same contract as _stream_local_llm:
         appends to _assistant_text, flushes sentences, surfaces tools and
         thinking as notifications, returns True if the turn completed."""
@@ -4440,7 +4624,10 @@ class VoiceAssistant:
             return False
         session = self._dsh
         stats = {"first": None, "prompt_tokens": 0, "finish": None, "end": None, "error": "",
-                 "tool_calls": 0, "calls": {}, "cut": None}
+                 "tool_calls": 0, "calls": {}, "cut": None, "ran": []}
+        # A retry after a context overflow is told what the lost attempt
+        # already did (see below); the record keeps it for later turns.
+        prompt = text + _dsh_retry_note(_ran) if _ran else text
         t0 = time.time()
         self._dsh_turn_active = True
 
@@ -4456,7 +4643,7 @@ class VoiceAssistant:
             return True
 
         try:
-            session.turn(text, lambda ev: self._dsh_event(ev, stats))
+            session.turn(prompt, lambda ev: self._dsh_event(ev, stats))
         except Exception as e:
             if stats["cut"]:
                 return cut_short()
@@ -4491,9 +4678,15 @@ class VoiceAssistant:
                 # The prompt outgrew the window mid-turn. Rotation normally
                 # happens after a successful turn, so without this every later
                 # turn failed the same way until the service was restarted.
-                self.logger.warning("dsh: prompt outgrew the context -- rotating and retrying once")
+                # The tool work that filled the context is lost with the
+                # session. Said plainly in the retry, or the model starts
+                # over from nothing and then tells the user it never ran any
+                # tools (seen 2026-09-19 after 28 calls).
+                self.logger.warning(
+                    f"dsh: prompt outgrew the context after {len(stats['ran'])} tool calls "
+                    "-- rotating and retrying once")
                 session.rotate()
-                return self._stream_dsh(text, abort, _retry=True)
+                return self._stream_dsh(text, abort, _retry=True, _ran=tuple(stats["ran"]))
             self.logger.error(f"DeepSeek Harness turn ended in error: {stats['error']}")
             self._dsh_error = stats["error"][:160]
             return False
@@ -4508,7 +4701,11 @@ class VoiceAssistant:
                 self._assistant_text = reply
         # The transcript is ours (see DshSession): it is what a respawned or
         # rotated runtime learns the conversation from.
-        session.remember(text, reply or "(acted, said nothing)", backend="dsh")
+        ran = list(_ran) + stats["ran"]
+        record = reply or "(acted, said nothing)"
+        if _ran:
+            record = f"[Ran: {'; '.join(_dedupe(ran))[:600]}] {record}"
+        session.remember(text, record, backend="dsh")
         if session.needs_rotation():
             # Synchronous, here: the reply is already queued for speech, and a
             # rotation in a thread could race the next turn's spawn.
@@ -4542,8 +4739,31 @@ class VoiceAssistant:
         # that something arrived unprompted.
         self._append_transcript("assistant", _strip_markdown(text))
         self._notify(f"🔔 {_strip_markdown(text)}", title="Assistant", transient=True)
-        if self.is_active and not self.is_processing:
-            threading.Thread(target=self._say, args=(text,), daemon=True).start()
+        loop = self._loop
+        if loop is not None and self.is_active:
+            asyncio.run_coroutine_threadsafe(self._speak_unsolicited(text), loop)
+
+    async def _speak_unsolicited(self, text):
+        """Speak an unprompted reply as a turn of its own: the microphone is
+        shut while it plays (or it hears itself), and nothing else starts
+        until it is done. Skipped when a turn is already under way; the
+        transcript and the popup still carry it."""
+        if not self.is_active or self.is_processing or self._recording:
+            self.logger.info("Unsolicited reply not spoken: a turn is under way")
+            return
+        loop = asyncio.get_running_loop()
+        self.is_processing = True
+        self.capture.mute(True)
+        try:
+            await loop.run_in_executor(None, self._say, text)
+        finally:
+            if TTS_TAIL_GATE > 0:
+                await asyncio.sleep(TTS_TAIL_GATE)
+            self.capture.flush()
+            self.capture.mute(False)
+            self.vad.reset()
+            self.is_processing = False
+            self._set_status("ready" if self.is_active else "off")
 
     def set_claude_setting(self, model=None, effort=None, force=False) -> dict:
         """Change the Claude model or effort level, mid-conversation.
@@ -4922,6 +5142,10 @@ class VoiceAssistant:
             return None
         try:
             kw = {} if timeout is None else {"timeout": timeout}
+            # The harness reads only the junk and risky/caution decisions (no
+            # tool gating, hard lane or routing), so it is asked those alone.
+            if ROUTER_DSH_ONLY and getattr(self, "backend_pref", None) == "dsh":
+                kw["only"] = ROUTER_DSH_ONLY
             return self._router.judge(text, typed=typed, previous=self._router_previous(), **kw)
         except Exception as e:
             self.logger.warning(f"Router failed ({e}); proceeding without it")
@@ -4930,7 +5154,7 @@ class VoiceAssistant:
     # -- prefetch: judging the spoken turn during the end-of-turn wait --------
     #
     # The router's 0.7-0.9 s used to sit squarely between the last word and
-    # the first token of the reply. But the end of a turn is at least 0.35 s
+    # the first token of the reply. But the end of a turn is at least 0.45 s
     # of silence away from the last word, and the streaming recogniser has
     # usually decoded the whole utterance by then, so the question can be
     # asked while that wait runs. The answer is used only when the final
@@ -5351,6 +5575,8 @@ class VoiceAssistant:
         self._turn_tool_calls = 0
         self._turn_think = False
         self._turn_model = ""
+        player = getattr(self, "player", None)
+        self._playback_mark = (player.dry, player.underruns) if player is not None else None
 
         sentence_q: queue.Queue = queue.Queue()
         self._sentence_queue = sentence_q
@@ -5457,6 +5683,7 @@ class VoiceAssistant:
         # starts before the model has even been asked, so a deadline set here
         # would always have expired by the time there was anything to hold back.
         deadline = None
+        stream = getattr(self.kokoro, "stream", None) if TTS_STREAM else None
         while True:
             try:
                 sentence = sentence_q.get(timeout=0.2)
@@ -5471,24 +5698,35 @@ class VoiceAssistant:
                 if staged and not released:
                     self._release_staged(staged)
                 return
+            # Streamed: each piece is played (or staged) as soon as it is
+            # decoded. A whole unit used to be synthesised before any of it
+            # was heard -- a median 1.4 s from the first unit to sound.
+            pieces = None
             try:
-                samples, sr = self.kokoro.create(
-                    sentence, voice=TTS_VOICE, speed=TTS_SPEED)
-                samples = _resample_to(samples, sr, self.player.rate)
+                pieces = (stream(sentence, voice=TTS_VOICE, speed=TTS_SPEED) if stream
+                          else iter([self.kokoro.create(sentence, voice=TTS_VOICE, speed=TTS_SPEED)]))
+                for samples, sr in pieces:
+                    if abort.is_set():
+                        break
+                    samples = _resample_to(samples, sr, self.player.rate)
+                    if released:
+                        self.player.write(samples)
+                        continue
+                    if deadline is None:
+                        deadline = time.time() + TTS_PREBUFFER_MAX_WAIT
+                    staged.append(samples)
+                    staged_seconds += len(samples) / self.player.rate
+                    if staged_seconds >= TTS_PREBUFFER_SECONDS or time.time() >= deadline:
+                        released = self._release_staged(staged)
             except Exception as e:
                 self.logger.error(f"TTS error on sentence: {e}")
                 continue
+            finally:
+                close = getattr(pieces, "close", None)
+                if close is not None:
+                    close()
             if abort.is_set():
                 return
-            if released:
-                self.player.write(samples)
-                continue
-            if deadline is None:
-                deadline = time.time() + TTS_PREBUFFER_MAX_WAIT
-            staged.append(samples)
-            staged_seconds += len(samples) / self.player.rate
-            if staged_seconds >= TTS_PREBUFFER_SECONDS or time.time() >= deadline:
-                released = self._release_staged(staged)
 
     def _release_staged(self, staged) -> bool:
         for s in staged:
@@ -5509,8 +5747,21 @@ class VoiceAssistant:
             tts_thread.join(timeout=90)
         if drain:
             self.player.drain(timeout=120)
+            self._log_playback()
         else:
             self.player.abort()
+
+    def _log_playback(self):
+        """One line per spoken reply: whether synthesis kept ahead of playback.
+        A gap is the queue running dry mid-reply (the last one is the end)."""
+        start = getattr(self, "_playback_mark", None)
+        if start is None or self._first_audio_at is None:
+            return
+        dry, underruns = start
+        gaps = max(0, self.player.dry - dry - 1)
+        xruns = self.player.underruns - underruns
+        msg = f"Playback: {gaps} gap{'s' if gaps != 1 else ''} mid-reply, {xruns} device underruns"
+        (self.logger.warning if gaps or xruns else self.logger.info)(msg)
 
     def _speak_error(self, sentence_q, tts_thread, message):
         """Errors are spoken and shown, like any other reply.
@@ -5735,11 +5986,19 @@ class VoiceAssistant:
         trailing silence it is asked whether what it heard sounds finished. A
         fixed timeout remains as the fallback, and is all there is when the
         model could not be loaded.
+
+        Silence is counted in samples from the end of the last speech window,
+        not in chunks: the checkpoints mean what they say, and no float sum
+        drifts past them. Each smart-turn call is started SMART_TURN_LEAD
+        before its checkpoint so its 60-120 ms is spent waiting anyway.
         """
         frames = []
         had_speech = pre_audio is not None
-        silence_s = 0.0
+        silent = 0                   # samples of silence since speech last ended
         next_check = 0
+        pending = None               # (checkpoint index, Future) of an early smart-turn call
+        checks = []                  # what smart-turn said, for the log and a saved turn
+        ended_by = "cap"
         feed = getattr(self.stt, "feed", None)
         begin = getattr(self.stt, "begin_utterance", None)
         # The router is asked about the transcript so far while the silence
@@ -5749,6 +6008,9 @@ class VoiceAssistant:
         can_prefetch = (ROUTER_PREFETCH and partial is not None
                         and self._router is not None and bool(SMART_TURN_CHECKPOINTS))
         prefetch_due = can_prefetch and ROUTER_PREFETCH_EARLY
+        at = [int(round(t * SAMPLE_RATE)) for t, _ in SMART_TURN_CHECKPOINTS]
+        lead = int(round(max(0.0, SMART_TURN_LEAD) * SAMPLE_RATE))
+        timeout = int(round(SILENCE_TIMEOUT * SAMPLE_RATE))
         if begin is not None:
             begin()
         if pre_audio is not None:
@@ -5757,10 +6019,9 @@ class VoiceAssistant:
                 feed(pre_audio, SAMPLE_RATE)
 
         max_chunks = int(MAX_RECORD_DURATION / RECORD_CHUNK_DURATION)
-        hit_cap = True
         for _ in range(max_chunks):
             if not self.is_active or self._abort_event.is_set():
-                hit_cap = False
+                ended_by = "abort"
                 break
             chunk = self.capture.read(RECORD_CHUNK_DURATION, timeout=2.0)
             if chunk is None:
@@ -5769,69 +6030,80 @@ class VoiceAssistant:
                 # listen loop reopens the stream once this turn is answered.
                 self.logger.warning(
                     f"Mic went quiet mid-recording — ending turn ({self.capture.describe()})")
-                hit_cap = False
+                ended_by = "mic"
                 break
             frames.append(chunk)
             if feed is not None:
                 feed(chunk, SAMPLE_RATE)
 
-            if self.vad.active(chunk):
+            judged, speech_end = self.vad.scan(chunk)
+            if speech_end is not None:
                 had_speech = True
-                silence_s = 0.0
+                silent = judged - speech_end
                 next_check = 0     # new speech invalidates earlier verdicts
+                pending = None     # and any call made on the audio before it
                 prefetch_due = can_prefetch and ROUTER_PREFETCH_EARLY
+            elif not had_speech:
                 continue
-            if not had_speech:
-                continue
-            silence_s += RECORD_CHUNK_DURATION
+            else:
+                silent += judged
+            silence_s = silent / SAMPLE_RATE
 
             # The first checkpoint of this pause: hand the router what has
             # been heard so far, before smart-turn is asked and whatever it
             # says. One per utterance (the method refuses a second), and only
             # a thread start happens here.
-            if prefetch_due and silence_s >= SMART_TURN_CHECKPOINTS[0][0]:
+            if prefetch_due and silent >= at[0]:
                 prefetch_due = False
                 try:
                     self._router_prefetch_start(partial())
                 except Exception as e:
                     self.logger.warning(f"Router prefetch skipped ({e})")
 
-            if (self.smart_turn is not None
-                    and next_check < len(SMART_TURN_CHECKPOINTS)
-                    and silence_s >= SMART_TURN_CHECKPOINTS[next_check][0]):
-                _at, need = SMART_TURN_CHECKPOINTS[next_check]
-                next_check += 1
+            if (self.smart_turn is not None and pending is None
+                    and next_check < len(at) and silent >= at[next_check] - lead):
+                pending = (next_check, self._eot_executor().submit(
+                    self.smart_turn.predict, _tail(frames, SmartTurnDetector.N_SAMPLES)))
+
+            if pending is not None and silent >= at[pending[0]]:
+                idx, fut = pending
+                pending = None
+                next_check = idx + 1
+                need = SMART_TURN_CHECKPOINTS[idx][1]
                 try:
-                    prob, dt = self.smart_turn.predict(np.concatenate(frames))
+                    prob, dt = fut.result(timeout=5.0)
                 except Exception as e:
-                    self.logger.warning(f"Smart Turn failed ({e}); silence timeout only")
+                    self.logger.warning(f"Smart Turn failed ({e!r}); silence timeout only")
                     self.smart_turn = None
                     continue
+                checks.append((round(silence_s, 3), round(prob, 4), need))
                 if prob >= need:
                     ft, mt = getattr(self.smart_turn, "last_timing", (0.0, 0.0)) or (0.0, 0.0)
                     self.logger.info(
                         f"Turn complete (p={prob:.2f} >= {need:.2f} after "
-                        f"{silence_s:.1f}s silence, {dt * 1000:.0f}ms"
+                        f"{silence_s:.2f}s silence, {dt * 1000:.0f}ms"
                         f"{f' = features {ft * 1000:.0f} + model {mt * 1000:.0f}' if mt else ''})")
                     # The final transcript takes longer to produce than a judgment does: judge
                     # what has been heard by now if the first prefetch missed the last words.
                     if can_prefetch:
                         self._router_prefetch_refresh(partial)
-                    hit_cap = False
+                    ended_by = "smart-turn"
                     break
                 self.logger.info(
                     f"Turn sounds unfinished (p={prob:.2f} < {need:.2f} at "
-                    f"{silence_s:.1f}s), waiting")
+                    f"{silence_s:.2f}s), waiting")
 
-            if silence_s >= SILENCE_TIMEOUT:
-                self.logger.info(f"Silence timeout after {silence_s:.1f}s")
+            if silent >= timeout:
+                self.logger.info(f"Silence timeout after {silence_s:.2f}s")
                 if can_prefetch:
                     self._router_prefetch_refresh(partial)
-                hit_cap = False
+                ended_by = "timeout"
                 break
-        if hit_cap:
+        if ended_by == "cap":
             self.logger.warning(
                 f"Recording hit the {MAX_RECORD_DURATION}s cap — answering what was heard")
+        self._last_eot = {"ended_by": ended_by, "checks": checks,
+                          "silence_s": round(silent / SAMPLE_RATE, 3)}
         if self.capture.overflows or self.capture.dropped:
             self.logger.warning(
                 f"Mic buffer trouble: {self.capture.overflows} overflow flags, "
@@ -5840,6 +6112,45 @@ class VoiceAssistant:
         if not frames:
             return np.zeros(SAMPLE_RATE, dtype=np.float32)
         return np.concatenate(frames)
+
+    def _eot_executor(self):
+        """One worker for smart-turn calls: they never overlap each other."""
+        ex = getattr(self, "_eot_pool", None)
+        if ex is None:
+            ex = self._eot_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="smart-turn")
+        return ex
+
+    def _save_turn(self, audio, transcript):
+        """VOICE_ASSISTANT_SAVE_TURNS: the turn's audio and what was made of
+        it, for replaying misjudged turns. Off the caller's thread; never
+        raises."""
+        if not SAVE_TURNS or audio is None or len(audio) == 0:
+            return
+        meta = dict(getattr(self, "_last_eot", None) or {})
+        meta.update({"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "transcript": transcript or "",
+                     "seconds": round(len(audio) / SAMPLE_RATE, 2),
+                     "checkpoints": SMART_TURN_CHECKPOINTS, "timeout": SILENCE_TIMEOUT})
+
+        def work():
+            try:
+                SAVE_TURNS_DIR.mkdir(parents=True, exist_ok=True)
+                stem = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+                pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2")
+                with wave.open(str(SAVE_TURNS_DIR / f"{stem}.wav"), "wb") as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(SAMPLE_RATE)
+                    f.writeframes(pcm.tobytes())
+                meta["wav"] = f"{stem}.wav"
+                with open(SAVE_TURNS_DIR / "turns.jsonl", "a") as f:
+                    f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                wavs = sorted(SAVE_TURNS_DIR.glob("*.wav"))
+                for old in wavs[:max(0, len(wavs) - SAVE_TURNS_KEEP)]:
+                    old.unlink(missing_ok=True)
+            except Exception as e:
+                self.logger.warning(f"Could not save the turn ({e})")
+        threading.Thread(target=work, name="save-turn", daemon=True).start()
 
     def _transcribe(self, audio_data):
         try:
@@ -5949,9 +6260,9 @@ class VoiceAssistant:
         # rather than refusing: a voice turn is seconds, and the caller is a
         # terminal that can hold.
         deadline = time.monotonic() + max(0.0, wait)
-        while self.is_processing and time.monotonic() < deadline:
+        while (self.is_processing or self._recording) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
-        if self.is_processing:
+        if self.is_processing or self._recording:
             return {"ok": False, "error": "the assistant is still busy with another turn"}
 
         self.is_processing = True
@@ -5991,6 +6302,7 @@ class VoiceAssistant:
 
     async def _listen_loop(self):
         loop = asyncio.get_running_loop()
+        self._loop = loop
         for sig, handler in ((signal.SIGUSR1, self._toggle),
                              (signal.SIGUSR2, self._new_session)):
             # asyncio's own signal handling: the callback runs on the event
@@ -6029,6 +6341,10 @@ class VoiceAssistant:
 
             chunk = await loop.run_in_executor(
                 None, self.capture.read, VAD_CHUNK_DURATION, 1.0)
+            if self.is_processing:
+                # A typed turn took the floor while this chunk was being read.
+                prev_chunk = None
+                continue
             if chunk is None:
                 if self.is_active and self.capture.stalled():
                     # Without this a dead stream meant voice mode looked on
@@ -6056,11 +6372,20 @@ class VoiceAssistant:
                 pre_audio = (np.concatenate([prev_chunk, chunk])
                              if prev_chunk is not None else chunk)
                 prev_chunk = None
-                full_audio = await loop.run_in_executor(
-                    None, self._record_until_silence, pre_audio)
+                self._recording = True
+                try:
+                    full_audio = await loop.run_in_executor(
+                        None, self._record_until_silence, pre_audio)
+                finally:
+                    self._recording = False
                 if not self.is_active or self._abort_event.is_set():
                     # Toggled off mid-recording: no notification, no query, and
                     # the waybar state stays "off".
+                    continue
+                if self.is_processing:
+                    # Everything that starts a turn waits for _recording, so
+                    # this should not happen; if it does, one turn at a time.
+                    self.logger.warning("Another turn started during the recording — dropping it")
                     continue
                 self.is_processing = True
                 self._set_status("thinking")
@@ -6077,6 +6402,7 @@ class VoiceAssistant:
         self.capture.mute(True)
         try:
             transcription = await loop.run_in_executor(None, self._transcribe, audio_data)
+            self._save_turn(audio_data, transcription)
             if not transcription:
                 self.logger.info("Empty transcript — ignoring")
                 return

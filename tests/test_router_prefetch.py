@@ -73,6 +73,10 @@ class FakeVAD:
         self.i += 1
         return v
 
+    def scan(self, chunk):
+        # a speech chunk is speech to its last sample
+        return len(chunk), (len(chunk) if self.active(chunk) else None)
+
 
 class FakeSTT:
     is_streaming = True
@@ -145,6 +149,7 @@ def loop_env(monkeypatch):
     monkeypatch.setattr(va, "SILENCE_TIMEOUT", 2.5)
     monkeypatch.setattr(va, "MAX_RECORD_DURATION", 10)
     monkeypatch.setattr(va, "ROUTER_TIMEOUT", 1.5)
+    monkeypatch.setattr(va, "SMART_TURN_LEAD", 0.0)
 
 
 def _record(host, vad_pattern, partial_text, probs):

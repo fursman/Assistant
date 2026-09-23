@@ -384,10 +384,14 @@ VOICE_ASSISTANT_SMART_TURN=1
 # "<silence seconds>:<probability needed to end the turn>". The bar comes down
 # as the pause lengthens, so a mid-sentence breath does not end your turn but a
 # pause that keeps going does. Raise the early numbers if it still cuts you off;
-# a false "unfinished" only costs the wait to the next checkpoint.
-VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS=0.35:0.90,0.70:0.75,1.10:0.60,1.60:0.50
+# a false "unfinished" only costs the wait to the next checkpoint. Left to the
+# code's defaults (shown) so a retuned schedule reaches existing installs.
+#VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS=0.45:0.90,0.70:0.70,1.10:0.40,1.60:0.20
 # Ends the turn regardless, when smart-turn keeps saying "unfinished".
-VOICE_ASSISTANT_SILENCE_TIMEOUT=2.5
+#VOICE_ASSISTANT_SILENCE_TIMEOUT=2.0
+# Keep each turn's audio and what the end-of-turn logic made of it, to see
+# why a turn was cut off or waited (~/.local/state/voice-assistant/turns).
+#VOICE_ASSISTANT_SAVE_TURNS=1
 ENVEOF
 fi
 
