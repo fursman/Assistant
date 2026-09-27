@@ -347,7 +347,7 @@ CLAUDE_PERSISTENT = os.getenv("VOICE_ASSISTANT_CLAUDE_PERSISTENT", "1").strip().
 LOCAL_LLM_URL = os.getenv("VOICE_ASSISTANT_LOCAL_URL", "http://127.0.0.1:8081/v1")
 LOCAL_LLM_MODEL = os.getenv("VOICE_ASSISTANT_LOCAL_MODEL", "qwen3.8-27b")
 LOCAL_LLM_API_KEY = os.getenv("VOICE_ASSISTANT_LOCAL_API_KEY", "none")
-LOCAL_LLM_MAX_TOKENS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOKENS", "512"))
+LOCAL_LLM_MAX_TOKENS = int(os.getenv("VOICE_ASSISTANT_LOCAL_MAX_TOKENS", "2048"))
 LOCAL_LLM_HISTORY_TURNS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_TURNS", "24"))
 # When the history is over budget, keep this fraction of the caps (see _trim_local_history).
 LOCAL_HISTORY_KEEP = float(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_KEEP", "0.6"))
@@ -470,8 +470,12 @@ ROUTER_PREFETCH_MAX_EXTRA_WORDS = int(os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH
 # filler so the wait is not silence.
 ROUTER_THINK = os.getenv("VOICE_ASSISTANT_ROUTER_THINK", "1").strip().lower() \
     not in ("0", "false", "no", "off")
-LOCAL_THINK_BUDGET = int(os.getenv("VOICE_ASSISTANT_LOCAL_THINK_BUDGET", "512"))
+LOCAL_THINK_BUDGET = int(os.getenv("VOICE_ASSISTANT_LOCAL_THINK_BUDGET", "8192"))
 LOCAL_THINK_FILLER = os.getenv("VOICE_ASSISTANT_LOCAL_THINK_FILLER", "Let me think about that.")
+# Qwen's recommended sampling for thinking mode (the LOCAL_LLM_TEMP/TOP_P defaults are its
+# non-thinking values). Used on turns where the reasoning is on.
+LOCAL_THINK_TEMP = float(os.getenv("VOICE_ASSISTANT_LOCAL_THINK_TEMP", "0.6"))
+LOCAL_THINK_TOP_P = float(os.getenv("VOICE_ASSISTANT_LOCAL_THINK_TOP_P", "0.95"))
 # After a local turn, the same engine is asked whether the reply answered the question, states
 # something likely wrong, or should have used a tool. Raw answers, recorded with the verdict for
 # review; they decide nothing until there are labels behind them.
@@ -4350,10 +4354,16 @@ class VoiceAssistant:
                 nudge_at = len(messages)
                 messages.append({"role": "user", "content": LOCAL_TOOL_BUDGET_PROMPT})
 
+            # max_tokens counts the reasoning too, so a thinking turn gets its budget on top
+            # of the reply's: otherwise a budget as large as the cap leaves the answer
+            # nothing.
             kwargs = dict(
                 model=model, messages=messages, stream=True,
-                temperature=LOCAL_LLM_TEMP, top_p=LOCAL_LLM_TOP_P,
-                max_tokens=LOCAL_LLM_MAX_TOKENS, extra_body=extra_body)
+                temperature=LOCAL_THINK_TEMP if think else LOCAL_LLM_TEMP,
+                top_p=LOCAL_THINK_TOP_P if think else LOCAL_LLM_TOP_P,
+                max_tokens=LOCAL_LLM_MAX_TOKENS
+                + int(extra_body.get("reasoning_budget_tokens", 0)),
+                extra_body=extra_body)
             if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS and tools:
                 kwargs["tools"] = tools
                 if tool_choice != "auto":

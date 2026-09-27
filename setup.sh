@@ -353,10 +353,13 @@ VOICE_ASSISTANT_LLM_FALLBACK=1
 # --- local backend (ignored when the backend resolves to claude) ---
 VOICE_ASSISTANT_LOCAL_URL=http://127.0.0.1:8081/v1
 VOICE_ASSISTANT_LOCAL_MODEL=qwen3.8-27b
-VOICE_ASSISTANT_LOCAL_MAX_TOKENS=512
+VOICE_ASSISTANT_LOCAL_MAX_TOKENS=2048
 VOICE_ASSISTANT_LOCAL_HISTORY_TURNS=12
 # Qwen3.8 reasons by default; for voice that is pure latency, so it is off.
 VOICE_ASSISTANT_LOCAL_THINK=0
+# Reasoning tokens a turn the router calls hard may spend, on top of the reply cap.
+# About 35 tok/s, so the full budget is a wait of roughly four minutes.
+VOICE_ASSISTANT_LOCAL_THINK_BUDGET=8192
 
 # --- tool access for the local model ---
 # 1 = the model can run arbitrary shell commands (parity with the Claude

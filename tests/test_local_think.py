@@ -185,6 +185,8 @@ def test_plain_turn_does_not_think(env):
     assert "reasoning_budget_tokens" not in kw["extra_body"]
     assert kw["model"] == va.LOCAL_LLM_MODEL and "tools" in kw
     assert _queued(host._sentence_queue) == [], "no filler on an ordinary turn"
+    assert kw["max_tokens"] == va.LOCAL_LLM_MAX_TOKENS
+    assert (kw["temperature"], kw["top_p"]) == (va.LOCAL_LLM_TEMP, va.LOCAL_LLM_TOP_P)
     assert host._turn_think is False
     assert host._assistant_text == "Forty-two."
 
@@ -204,6 +206,8 @@ def test_hard_turn_thinks_under_a_budget_and_says_so(env):
     assert kw["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
     assert kw["extra_body"]["reasoning_budget_tokens"] == 512
     assert kw["model"] == va.LOCAL_LLM_MODEL and "tools" in kw, "same model, same tools"
+    assert kw["max_tokens"] == va.LOCAL_LLM_MAX_TOKENS + 512, "the budget sits on top of the reply's"
+    assert (kw["temperature"], kw["top_p"]) == (va.LOCAL_THINK_TEMP, va.LOCAL_THINK_TOP_P)
     filler = _queued(host._sentence_queue)
     assert len(filler) == 1 and "think" in filler[0].lower()
     assert host._turn_think is True

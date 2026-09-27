@@ -682,7 +682,7 @@ calibrated probabilities make the decisions, each switchable on its own:
 | **drop** | `1 - min(addressed, intelligible) >= 0.8`, spoken input only | the turn is ignored like any other rejected transcript: no reply, no chime |
 | **tools** | `web >= 0.2`, `shell >= 0.2` | the local model is offered only `web_search`/`fetch_page`, only `run_shell`, both, or no tool schema at all |
 | **route** | `risky >= 0.3` | the turn goes to Claude when the CLI is installed; everything else stays local, tool calls included. The local model has the same tools, and a Claude round trip is 25-75 s. Escalating confident tool tasks (not simple, and `shell`/`web` past a bar) is available with `VOICE_ASSISTANT_ROUTER_THR_ESCALATE_SHELL` / `_WEB` and off by default |
-| **hard** | stays local, no tool wanted, `simple <= 0.3` | thinking on demand: the model's reasoning is switched on for this turn only under `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` tokens (512), after a spoken "Let me think about that." When `VOICE_ASSISTANT_HARD_URL` names a bigger model elsewhere and its `/health` answers, the turn goes there instead, with the last few exchanges and no tools; if it fails before answering, the local model takes the turn |
+| **hard** | stays local, no tool wanted, `simple <= 0.3` | thinking on demand: the model's reasoning is switched on for this turn only under `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` tokens (8192), after a spoken "Let me think about that." When `VOICE_ASSISTANT_HARD_URL` names a bigger model elsewhere and its `/health` answers, the turn goes there instead, with the last few exchanges and no tools; if it fails before answering, the local model takes the turn |
 | **caution** | stays local, `0.1 <= risky < 0.3` | a softer marker asks the model to confirm before changing anything |
 
 A turn the router calls **risky** (`>= 0.3`) also gets a marker in front of the
@@ -956,7 +956,7 @@ optional.
 | `VOICE_ASSISTANT_LOCAL_MODEL` | `qwen3.8-27b` | model name sent to that endpoint |
 | `VOICE_ASSISTANT_LOCAL_API_KEY` | `none` | if your endpoint wants one |
 | `VOICE_ASSISTANT_LOCAL_UNIT` | `qwen38.service` | the unit to start when switching to local |
-| `VOICE_ASSISTANT_LOCAL_MAX_TOKENS` | `512` | reply cap |
+| `VOICE_ASSISTANT_LOCAL_MAX_TOKENS` | `2048` | reply cap, per model call; a turn with tools makes several |
 | `VOICE_ASSISTANT_LOCAL_TIMEOUT` | `120` | seconds one completion may take |
 | `VOICE_ASSISTANT_LOCAL_HISTORY_TURNS` | `12` | conversation turns kept |
 | `VOICE_ASSISTANT_LOCAL_HISTORY_CHARS` | `24000` | and the character bound on them |
@@ -1003,7 +1003,8 @@ optional.
 | `VOICE_ASSISTANT_ROUTER_BACKENDS` | `local,dsh` | backends the router runs for; add `claude` to route simple turns away from Claude as before |
 | `VOICE_ASSISTANT_ROUTER_PREFETCH_MAX_EXTRA_WORDS` | `2` | a prefetch that is a prefix of the final transcript is reused when the final adds at most this many words |
 | `VOICE_ASSISTANT_ROUTER_THINK` | `1` | thinking on demand for hard local turns |
-| `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` | `512` | reasoning tokens a hard turn may spend (llama.cpp closes the think block there) |
+| `VOICE_ASSISTANT_LOCAL_THINK_BUDGET` | `8192` | reasoning tokens a hard turn may spend (llama.cpp closes the think block there), on top of `VOICE_ASSISTANT_LOCAL_MAX_TOKENS`, so the answer keeps its full allowance |
+| `VOICE_ASSISTANT_LOCAL_THINK_TEMP` / `_TOP_P` | `0.6` / `0.95` | sampling on thinking turns (Qwen's thinking-mode values) |
 | `VOICE_ASSISTANT_LOCAL_THINK_FILLER` | `Let me think about that.` | spoken while a hard turn thinks |
 | `VOICE_ASSISTANT_ROUTER_REPLY_CHECK` | `1` | judge each local reply (answered / unsupported / needed a tool) and record the raw answers |
 | `VOICE_ASSISTANT_HARD_URL` / `_MODEL` | empty | an OpenAI-compatible server for hard questions (llama-server on another machine); empty = off |
