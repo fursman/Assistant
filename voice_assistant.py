@@ -4558,6 +4558,30 @@ class VoiceAssistant:
             return self._dsh.start()
         return True
 
+    def _dsh_chunk(self, chunk: dict, stats: dict):
+        """One piece of a harness reply: text to speak, thinking, usage or the
+        finish reason. Fed live (harness <= 0.1.2) or replayed from a finished
+        step (>= 0.1.5), see _dsh_event."""
+        ctype = chunk.get("type")
+        if ctype == "text-delta":
+            text = chunk.get("text") or ""
+            if text:
+                if stats["first"] is None:
+                    stats["first"] = time.time()
+                self._assistant_text += text
+                self._flush_sentences(final=False)
+        elif ctype == "reasoning-delta":
+            self._thinking_text += chunk.get("text") or chunk.get("reasoning") or ""
+            self._maybe_notify_thinking()
+        elif ctype == "usage":
+            u = chunk.get("usage") or {}
+            # inputTokens is only the uncached part; the prompt is both.
+            stats["prompt_tokens"] = max(
+                stats["prompt_tokens"],
+                int(u.get("inputTokens") or 0) + int(u.get("cacheReadTokens") or 0))
+        elif ctype == "finish":
+            stats["finish"] = (chunk.get("reason") or {}).get("kind")
+
     def _dsh_event(self, ev: dict, stats: dict):
         """One session event from the harness, mapped onto the shared turn
         state so the TTS pipeline and the notifications downstream are the
@@ -4565,26 +4589,40 @@ class VoiceAssistant:
         kind = ev.get("type")
         data = ev.get("data") or {}
         if kind == "assistant/chunk":
-            chunk = data.get("chunk") or {}
-            ctype = chunk.get("type")
-            if ctype == "text-delta":
-                text = chunk.get("text") or ""
-                if text:
-                    if stats["first"] is None:
-                        stats["first"] = time.time()
-                    self._assistant_text += text
-                    self._flush_sentences(final=False)
-            elif ctype == "reasoning-delta":
-                self._thinking_text += chunk.get("text") or chunk.get("reasoning") or ""
-                self._maybe_notify_thinking()
-            elif ctype == "usage":
-                u = chunk.get("usage") or {}
-                # inputTokens is only the uncached part; the prompt is both.
-                stats["prompt_tokens"] = max(
-                    stats["prompt_tokens"],
-                    int(u.get("inputTokens") or 0) + int(u.get("cacheReadTokens") or 0))
-            elif ctype == "finish":
-                stats["finish"] = (chunk.get("reason") or {}).get("kind")
+            # Harness <= 0.1.2: every piece of the reply streams as its own event.
+            stats["streamed"] = True
+            self._dsh_chunk(data.get("chunk") or {}, stats)
+        elif kind == "assistant/message" and not stats.get("streamed"):
+            # Harness >= 0.1.5 streams nothing: a step arrives whole, as one
+            # assistant/message whose data.stream holds the chunks it was built
+            # from, with the text deltas batched into "text-chunks" entries per
+            # content block. Replay them through the same handling. Without
+            # this every reply was empty and the assistant said "Done.".
+            block_types, spoken = {}, set()
+            for entry in data.get("stream") or []:
+                etype = entry.get("type")
+                if etype == "text-chunks":
+                    index = entry.get("index")
+                    text = "".join(entry.get("texts") or [])
+                    if block_types.get(index, "text") == "reasoning":
+                        self._dsh_chunk({"type": "reasoning-delta", "text": text}, stats)
+                    elif text:
+                        spoken.add(index)
+                        self._dsh_chunk({"type": "text-delta", "text": text}, stats)
+                elif etype == "chunk":
+                    chunk = entry.get("chunk") or {}
+                    ctype = chunk.get("type")
+                    if ctype == "block-start":
+                        block_types[chunk.get("index")] = chunk.get("blockType")
+                    elif ctype == "block-end":
+                        # The finished block repeats its text: use it only when
+                        # no text-chunks entry carried that block.
+                        block = chunk.get("block") or {}
+                        if block.get("type") == "text" and chunk.get("index") not in spoken:
+                            self._dsh_chunk({"type": "text-delta",
+                                             "text": block.get("text") or ""}, stats)
+                    else:
+                        self._dsh_chunk(chunk, stats)
         elif kind == "tool/call":
             name = str(data.get("name") or "")
             try:

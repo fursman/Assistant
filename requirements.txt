@@ -36,7 +36,7 @@ openai>=1.0.0
 # DeepSeek Harness backend: DeepSeek's open-source agent runtime, driven as a
 # subprocess over JSON-RPC. The wheel bundles the `dsh` runtime (~260 MB
 # unpacked), so no Node.js is needed. Pre-release pin: nothing stable yet.
-deepseek-harness-sdk>=0.1.2rc1
+deepseek-harness-sdk>=0.1.5rc1
 
 # Model downloads in setup.sh (the `hf` CLI).
 huggingface_hub>=0.30.0

@@ -41,7 +41,7 @@ dependencies = [
     "kokoro-onnx>=0.4.0",
     "onnxruntime>=1.16.0",
     "openai>=1.0.0",
-    "deepseek-harness-sdk>=0.1.2rc1",
+    "deepseek-harness-sdk>=0.1.5rc1",
     "huggingface_hub>=0.30.0",
     "requests>=2.28.0",
 ]
