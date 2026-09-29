@@ -23,7 +23,15 @@ ENV_FILE="$HOME/.config/voice-assistant/env"
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 [[ -x "$REPO_DIR/.venv/bin/python" ]] || REPO_DIR="$HOME/voice-assistant"
 ASSISTANT="voice-assistant.service"
-SERVER="qwen38.service"
+# The model server unit and its alias come from the env file, so a machine can
+# serve a different local model (e.g. Flash-Next on a 24 GB card) under its own
+# unit. Same keys the assistant reads: VOICE_ASSISTANT_LOCAL_UNIT / _MODEL.
+env_value() {
+    [[ -r "$ENV_FILE" ]] || return 0
+    grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true
+}
+SERVER="$(env_value VOICE_ASSISTANT_LOCAL_UNIT)"; SERVER="${SERVER:-qwen38.service}"
+MODEL_NAME="$(env_value VOICE_ASSISTANT_LOCAL_MODEL)"; MODEL_NAME="${MODEL_NAME:-qwen3.8-27b}"
 HEALTH="http://127.0.0.1:8081/health"
 MIN_VRAM=15000
 
@@ -142,7 +150,7 @@ case "${1:-status}" in
         err "$SERVER is not installed on this machine — run ./setup.sh"
         exit 1
     fi
-    info "Starting $SERVER (loads ~15.3 GB onto the dGPU)"
+    info "Starting $SERVER ($MODEL_NAME onto the dGPU)"
     systemctl --user enable --now "$SERVER" &>/dev/null || systemctl --user start "$SERVER"
     info "Waiting for the model to load (~5 s warm, ~35 s cold)..."
     if wait_ready 300; then
@@ -157,7 +165,7 @@ case "${1:-status}" in
     was=$(current_backend)
     set_backend auto
     [[ "$was" == "claude" ]] && restart_assistant
-    ok "Voice assistant answers with the LOCAL Qwen3.8-27B (run_shell tool, offline)"
+    ok "Voice assistant answers with the LOCAL $MODEL_NAME (run_shell tool, offline)"
     ;;
 
   dsh)
@@ -169,7 +177,7 @@ case "${1:-status}" in
         err "deepseek-harness-sdk is not installed — run ./setup.sh (or: .venv/bin/pip install deepseek-harness-sdk)"
         exit 1
     fi
-    info "Starting $SERVER (loads ~15.3 GB onto the dGPU)"
+    info "Starting $SERVER ($MODEL_NAME onto the dGPU)"
     systemctl --user enable --now "$SERVER" &>/dev/null || systemctl --user start "$SERVER"
     info "Waiting for the model to load (~5 s warm, ~35 s cold)..."
     if wait_ready 300; then
@@ -188,7 +196,7 @@ case "${1:-status}" in
         set_backend dsh
         restart_assistant
     fi
-    ok "Voice assistant answers with the DEEPSEEK HARNESS on the local Qwen3.8-27B (bash, editor, web tools)"
+    ok "Voice assistant answers with the DEEPSEEK HARNESS on the local $MODEL_NAME (bash, editor, web tools)"
     ;;
 
   claude)
