@@ -237,8 +237,13 @@ class VoiceIndicator extends PanelMenu.Button {
             style_class: 'voice-label',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        this._box.add_child(this._icon);
+        // Word first, robot second: the indicator sits at the left end of the
+        // panel's right box, so the robot stays flush against its neighbours
+        // and the word, when there is one, grows out to the left of it where
+        // there is only empty bar. The box is not fixed-width, so nothing is
+        // reserved for the word when there is none.
         this._box.add_child(this._label);
+        this._box.add_child(this._icon);
         this.add_child(this._box);
 
         // Header: what is happening and who is answering, then three buttons.

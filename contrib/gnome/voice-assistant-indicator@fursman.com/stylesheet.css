@@ -2,15 +2,13 @@
    colour. No filled pill: GNOME's own red recording pill lives in the same
    corner and this should not be mistaken for it. Colours are Adwaita's light
    variants, which read on the dark top bar. */
-/* Fixed width, so the button never resizes. The label goes from empty to
-   "listening" to "thinking" and back, and letting the box follow that made the
-   whole indicator jump left and right on every phase change. Wide enough for
-   the longest word; the icon stays put and the text appears in space that was
-   already reserved. */
+/* No fixed width: the box is just the robot until there is a word, and the
+   word is laid out to the LEFT of the robot (see extension.js). Because the
+   indicator is at the left end of the panel's right box, the robot never
+   moves when the word appears or changes; only empty bar is taken up. */
 .voice-indicator {
     padding: 0 4px;
     spacing: 6px;
-    width: 96px;
 }
 
 .voice-icon {
