@@ -780,6 +780,10 @@ is on, so it reaches for `hyprctl` or `gsettings` as appropriate;
 Bare SUPER is GNOME's activities key, which is why the toggle is a two-modifier
 chord there, bound in both orders as `<Super>Alt_L` and `<Alt>Super_L`; GNOME's
 own SUPER+M (the notification list) is moved off, and stays on SUPER+V.
+On Ubuntu, `setup.sh` also takes the dock off the screen edge: it auto-hides
+(intellihide off, so it hides even over an empty desktop) and slides up when
+the pointer presses against the bottom edge. Skipped where dash-to-dock is not
+installed.
 
 **Any other desktop:** bind `voice-assistant-ctl toggle` and
 `voice-assistant-ctl new-session` to whatever you like. That is the whole

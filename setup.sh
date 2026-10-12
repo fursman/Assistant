@@ -169,9 +169,24 @@ install_gnome_integration() {
     gnome_keybinding voice-swap-model "Voice assistant: swap model" "<Super>m" \
         "$HOME/.local/bin/assistant --swap"
 
+    # Ubuntu's dock (dash-to-dock) is a fixed strip by default and steals a
+    # row of every screen. Make it hide itself and slide up only when the
+    # pointer presses against the bottom edge. Intellihide off so it hides
+    # even on an empty desktop. Skipped quietly where the schema is absent
+    # (stock GNOME without the extension).
+    local dock=org.gnome.shell.extensions.dash-to-dock
+    if gsettings list-schemas | grep -qx "$dock"; then
+        log_info "Hiding the dock until the pointer hits the bottom edge..."
+        gsettings set "$dock" dock-fixed false
+        gsettings set "$dock" intellihide false
+        gsettings set "$dock" autohide true
+        gsettings set "$dock" require-pressure-to-show true
+    fi
+
     DESKTOP_NOTES=(
         "Keys: SUPER+ALT toggles voice mode, SUPER+SHIFT+V starts a new"
         "      conversation, SUPER+M swaps the model (all active now)."
+        "Dock: auto-hidden; push the pointer into the bottom edge to show it."
     )
     if [[ "$changed" == 1 ]]; then
         DESKTOP_NOTES+=(
