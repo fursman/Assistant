@@ -825,8 +825,14 @@ NOTIFY_TRANSIENT_SECONDS = float(os.getenv("VOICE_ASSISTANT_NOTIFY_TRANSIENT", "
 # turn is still in the list to read at leisure. Raise these if you would rather
 # read the banners than glance at them; the cost is measured in lag.
 NOTIFY_THROTTLE_SECONDS = 1.0
+# All of that is GNOME's queue. swaync (Hyprland) stacks banners instead, so a
+# new one appears at once whatever is still on screen, and the expiry is only
+# the dwell time. At 1 s the popups read as a flicker there; 2 s is readable
+# and costs no lag. GNOME keeps the 1 s tie to the throttle.
+_NOTIFY_EXPIRE_DEFAULT_MS = (int(NOTIFY_THROTTLE_SECONDS * 1000)
+                             if "gnome" in DESKTOP.lower() else 2000)
 NOTIFY_EXPIRE_MS = int(os.getenv("VOICE_ASSISTANT_NOTIFY_EXPIRE",
-                                 str(int(NOTIFY_THROTTLE_SECONDS * 1000))))
+                                 str(_NOTIFY_EXPIRE_DEFAULT_MS)))
 
 
 # Lines that set the command up rather than being the point of it.

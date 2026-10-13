@@ -1074,7 +1074,7 @@ win over both.
 | variable | default | meaning |
 |---|---|---|
 | `VOICE_ASSISTANT_DESKTOP` | detected | `hyprland`, `gnome`, … |
-| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` | ms a notification stays up. This is also the lag before the next one can show, so raising it puts the banner behind reality |
+| `VOICE_ASSISTANT_NOTIFY_EXPIRE` | `1000` on GNOME, `2000` elsewhere | ms a notification stays up. GNOME queues banners, so there it is also the lag before the next one can show and raising it puts the banner behind reality; swaync stacks them, so it is only dwell time |
 | `VOICE_ASSISTANT_NOTIFY_TRANSIENT` | `4` | seconds before a status notification closes itself; errors never do |
 | `VOICE_ASSISTANT_TRANSCRIPT_TURNS` | `200` | entries kept in the transcript file; every tool call is one, so a tool-heavy turn must not evict the speech around it |
 | `VOICE_ASSISTANT_SOCKET` | under `~/.local/state` | control socket `assistant` connects to |
