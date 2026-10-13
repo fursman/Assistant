@@ -15,6 +15,16 @@ Type=simple
 # configuration. Optional: the leading "-" means the service still starts if
 # the file is absent, and the built-in defaults apply.
 EnvironmentFile=-%h/.config/voice-assistant/env
+# Wait for the graphical session. default.target comes up at login BEFORE the
+# compositor does (Hyprland ~16 s later on Blade17, ~5 s on Block), and the
+# desktop, WAYLAND_DISPLAY and the Hyprland socket are discovered once, at
+# startup, and written into the model's system prompt -- so a boot-time start
+# ran the whole session as "an unidentified desktop" with no notifications.
+# Ready = a Wayland socket exists and the session has exported
+# XDG_CURRENT_DESKTOP to the user manager (Hyprland and GNOME both do), or 10 s
+# after the socket without it. Headless: gives up after 120 s and starts anyway.
+ExecStartPre=/bin/sh -c 'n=0; up=0; while [ $$n -lt 120 ]; do for s in "$$XDG_RUNTIME_DIR"/wayland-[0-9]*; do case "$$s" in *.lock) ;; *) [ -S "$$s" ] && up=$$((up+1)) && break ;; esac; done; if [ $$up -gt 0 ]; then systemctl --user show-environment | grep -q "^XDG_CURRENT_DESKTOP=" && exit 0; [ $$up -ge 10 ] && exit 0; fi; n=$$((n+1)); sleep 1; done; echo "no graphical session after 120 s; starting without one"'
+TimeoutStartSec=180
 ExecStart=%h/.local/bin/voice-assistant
 Restart=on-failure
 RestartSec=5
