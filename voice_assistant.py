@@ -4868,7 +4868,10 @@ class VoiceAssistant:
 
         Replacing the process mid-answer would cut the reply off, so a request
         that lands while a turn is in flight is remembered and applied when the
-        turn ends (see _stream_claude_persistent). `force` is that later apply.
+        turn ends (see _stream_claude_persistent). `force` is for a caller that
+        knows no reply is in flight although is_processing is set: that later
+        apply, and a spoken command, which runs inside its own turn before
+        anything has been asked.
         """
         global CLAUDE_MODEL, CLAUDE_EFFORT
         if model:
@@ -6535,8 +6538,14 @@ class VoiceAssistant:
             # query goes anywhere, since it changes who answers it.
             want_model, want_effort = _parse_claude_request(transcription)
             if want_model or want_effort:
+                self.logger.info(f"Voice command: claude -> {want_model or '-'}, "
+                                 f"{want_effort or '-'} effort ({transcription})")
+                # force: is_processing is set, but for this turn, which has not
+                # asked anything yet, so there is no reply to cut off. Without
+                # it every spoken change waited for the end of the next Claude
+                # reply, while the confirmation already claimed it was in place.
                 res = await loop.run_in_executor(
-                    None, self.set_claude_setting, want_model, want_effort)
+                    None, self.set_claude_setting, want_model, want_effort, True)
                 if not res.get("ok"):
                     await loop.run_in_executor(
                         None, self._say, f"Sorry, {res.get('error', 'that did not work')}.")

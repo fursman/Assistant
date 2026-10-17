@@ -4,10 +4,14 @@ it runs in (_run_shell_tool).
 
     .venv/bin/python -m pytest tests
 """
+import asyncio
+import json
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -131,3 +135,51 @@ def test_status_payload_names_the_backend_and_its_model(tmp_path, monkeypatch):
     assert d["backend"] == "claude" and d["class"] == ["thinking", "claude"]
     assert va._local_model_label("qwen3.8-27b-opt") == "Qwen3.8 27B Opt"
     assert va._local_model_label("") == ""
+
+
+# --- a spoken model/effort change --------------------------------------------------
+
+class SpokenHost(va.VoiceAssistant):
+    """Just enough of the assistant for _process_audio to take a spoken command."""
+    def __init__(self, state_dir, heard):
+        self.logger = logging.getLogger("test-spoken")
+        self.state_dir = state_dir
+        self.backend = "claude"
+        self._status_state = "thinking"
+        self.is_active = True
+        self.is_processing = True        # the audio loop sets it before the turn starts
+        self._abort_event = threading.Event()
+        self._claude = None
+        self._claude_pending_model = self._claude_pending_effort = None
+        self.capture = self.vad = SimpleNamespace(
+            mute=lambda *a: None, flush=lambda: None, reset=lambda: None)
+        self.heard, self.said = heard, []
+
+    def _transcribe(self, audio): return self.heard
+    def _save_turn(self, audio, transcript): pass
+    def _say(self, text): self.said.append(text)
+    def _append_transcript(self, role, text): pass
+    def _notify(self, *a, **k): pass
+    def _router_finish(self): pass
+    def _play_chime_async(self, name): pass
+
+
+def test_a_spoken_effort_change_applies_at_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(va, "CLAUDE_MODEL", "opus")
+    monkeypatch.setattr(va, "CLAUDE_EFFORT", "max")
+    monkeypatch.setattr(va, "TTS_TAIL_GATE", 0)
+    written = []
+    monkeypatch.setattr(va, "_write_env_setting", lambda key, value: written.append((key, value)))
+    host = SpokenHost(tmp_path, "Set the effort to high.")
+    asyncio.run(host._process_audio([]))
+    # It used to be deferred to the end of the next Claude reply -- the turn's
+    # own is_processing looked like a reply in flight -- while the user heard
+    # "Already on opus at high effort." and the panel still said max.
+    assert host.said == ["Switched to high effort."]
+    assert va.CLAUDE_EFFORT == "high" and written == [("VOICE_ASSISTANT_EFFORT", "high")]
+    assert host._claude_pending_effort is None
+    assert json.loads((tmp_path / "status").read_text())["effort"] == "high", "what the panel draws"
+    # The menus and the CLI can land mid-reply; those still wait for its end.
+    host.is_processing = True
+    res = host.set_claude_setting("fable")
+    assert res["deferred"] and va.CLAUDE_MODEL == "opus" and host._claude_pending_model == "fable"
