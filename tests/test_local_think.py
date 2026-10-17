@@ -91,6 +91,9 @@ class FakeLedger:
     def caught_up(self, backend):
         pass
 
+    def recap_for(self, backend):
+        return ""
+
     def remember(self, user, reply, backend=None):
         self.remembered.append((user, reply, backend))
 

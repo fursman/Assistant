@@ -2814,6 +2814,10 @@ class DshSession:
                     "What was said, oldest first -- context for you, not a request; the "
                     "\"Assistant\" lines were not yours. Carry on from it naturally, and do "
                     "not repeat or summarise it.]\n")
+        # The replies come without the commands and searches behind them; a model
+        # that took them as its own learnt to describe a lookup instead of making one.
+        head += ("[Only what was said is shown, not the tools that were run. To find "
+                 "something out now, use your own tools.]\n")
         return head + "".join(kept) + "\n[Now the user says:]\n"
 
     # -- files -------------------------------------------------------------
@@ -4805,12 +4809,15 @@ class VoiceAssistant:
             self.logger.error(f"Local LLM client init failed: {e}")
             return False
 
-        # Exchanges the other backends answered since this one's last turn,
-        # as ordinary history turns: the natural form for a chat API.
-        for x in self._ledger().unseen("local"):
-            self._local_history.append({"role": "user", "content": x["user"]})
-            self._local_history.append({"role": "assistant", "content": x["assistant"]})
-        self._ledger().caught_up("local")
+        # Exchanges the other backends answered since this one's last turn, as
+        # a labelled recap in front of this turn's message (the form dsh and
+        # Claude get). Not as assistant turns: Claude's replies arrive without
+        # the tool calls behind them ("Let me check. ... Found it: ..."), and a
+        # history of those taught the model to say it ran a command instead of
+        # calling run_shell -- 0 of 3 replays on block called a tool, 4 of 4
+        # with the recap. The recap stays in the saved user turn, so the
+        # history prefix (and the server's prompt cache) is stable.
+        recap = self._ledger().recap_for("local")
 
         v = self._router_verdict
         hard = bool(v is not None and getattr(v, "hard", False))
@@ -4837,7 +4844,7 @@ class VoiceAssistant:
             think = llm.think or (hard and ROUTER_THINK)
             messages = [{"role": "system", "content": _tier_prompt(LOCAL_VOICE_PROMPT, llm)}]
             messages.extend(self._local_history)
-        messages.append({"role": "user", "content": text})
+        messages.append({"role": "user", "content": recap + text})
         turn_start = len(messages) - 1
         self._turn_think = bool(think)
         self._turn_model = model
