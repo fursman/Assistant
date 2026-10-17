@@ -1016,6 +1016,40 @@ and pick the Claude model or effort -- the same set the GNOME menu offers.
 kitty; `setup.sh` installs them, and the SUPER+A binding ships in
 `contrib/hyprland/hyprland-voice-assistant.conf`.
 
+### Jabra call buttons
+
+With a Jabra speakerphone plugged in over USB, its call buttons switch voice
+mode: **green** turns it on, **red** turns it off, **mute** toggles. The Jabra
+shows the state -- its green lights while voice mode is on, blinking while it
+hears you speak, flashing red while it thinks and answers, the red ring while
+it is off, which also mutes its
+microphone -- and goes back to its own idle light whenever the assistant is not
+running. The green blink is the Jabra's own incoming-call flash, without the
+ringtone; the red flash is timed by the helper. The volume buttons are untouched.
+
+A separate little helper does it: `contrib/jabra/jabra-buttons.py`, installed
+as `~/.local/bin/voice-assistant-jabra` and run by
+`voice-assistant-jabra.service`. It toggles voice mode with the same SIGUSR1 as
+the hotkey and follows the status file, so the lights stay right however voice
+mode is switched. Two things about the hardware shape it:
+
+- **The buttons are raw HID.** The kernel makes no key events of them -- Jabra
+  declares the telephony fields constant -- so the helper reads `/dev/hidraw*`,
+  and `contrib/jabra/70-jabra-hidraw.rules` lets the logged-in user open a
+  Jabra's (USB vendor `0b0e`). `setup.sh` installs the rule when a Jabra is
+  plugged in; by hand:
+  ```bash
+  sudo install -m 644 contrib/jabra/70-jabra-hidraw.rules /etc/udev/rules.d/
+  sudo udevadm control --reload && sudo udevadm trigger -s hidraw -c change
+  ```
+- **The Jabra is kept "in a call".** Out of a call a Speak 510 reports none of
+  its call buttons: green does nothing, and mute only mutes its own microphone.
+  So the helper holds it off-hook the whole time and shows "off" as a muted
+  call. Red hangs up, and the helper puts it straight back in.
+
+Report layouts come from the device's own HID descriptor rather than a table,
+but only the Speak 510 has been tried.
+
 ## Configuration
 
 `~/.config/voice-assistant/env` is read by the service. Everything below is
@@ -1306,6 +1340,7 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 | `voices/` | Saved Pocket voices and their reference clips |
 | `contrib/gnome/` | GNOME Shell indicator extension |
 | `contrib/hyprland/` | Hyprland key bindings |
+| `contrib/jabra/` | Jabra call buttons as the voice switch: helper, user unit, udev rule |
 | `contrib/qwen38.service` | Model server unit (installed when the GPU qualifies) |
 | `contrib/qwen38-gpu-ok` | VRAM guard, so one unit file is safe on every machine |
 | `contrib/qwen38-sleep*` | Unload/reload the model around suspend |

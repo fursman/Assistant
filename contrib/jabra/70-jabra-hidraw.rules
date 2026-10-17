@@ -1,0 +1,8 @@
+# Jabra (GN Netcom, USB vendor 0b0e): let the logged-in user read the call
+# buttons, which the voice assistant uses as on/off (answer = on, hang up = off).
+# The kernel does not turn them into key events -- Jabra marks the telephony
+# fields constant -- so they arrive only as raw HID reports on /dev/hidraw*.
+# uaccess has to be tagged before 73-seat-late.rules, hence the 70.
+#   sudo install -m 644 70-jabra-hidraw.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger -s hidraw -c change
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b0e", TAG+="uaccess"

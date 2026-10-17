@@ -1,0 +1,16 @@
+[Unit]
+Description=Jabra call buttons as the voice assistant's on/off switch
+Documentation=https://github.com/fursman/Assistant
+# Not tied to voice-assistant.service: it follows the assistant's pid and status
+# files, so either one can restart without the other, and it waits quietly for
+# a Jabra to be plugged in.
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/voice-assistant-jabra
+Restart=on-failure
+RestartSec=5
+SyslogIdentifier=voice-assistant-jabra
+
+[Install]
+WantedBy=default.target

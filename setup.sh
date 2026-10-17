@@ -706,6 +706,7 @@ install -m 0755 assistant ~/.local/bin/assistant
 install -m 0755 contrib/hyprland/assistant-panel.py     ~/.local/bin/assistant-panel
 install -m 0755 contrib/hyprland/assistant-panel-toggle ~/.local/bin/assistant-panel-toggle
 install -m 0755 contrib/hyprland/assistant-menu         ~/.local/bin/assistant-menu
+install -m 0755 contrib/jabra/jabra-buttons.py          ~/.local/bin/voice-assistant-jabra
 
 # ── Systemd Service ──────────────────────────────────────────────────────
 
@@ -713,6 +714,20 @@ log_info "Installing systemd user service..."
 cp voice-assistant.service "$UNIT_DIR/"
 systemctl --user daemon-reload
 systemctl --user enable voice-assistant.service
+
+# A Jabra's call buttons as the voice switch -- only with one plugged in by
+# USB (bus 0003; the udev rule matches USB only), as the rule that lets the
+# helper read its buttons needs sudo.
+if grep -qsi '^HID_ID=0003:0*b0e:' /sys/class/hidraw/hidraw*/device/uevent; then
+    log_info "Jabra found: its call buttons will switch voice mode"
+    sudo install -m 0644 contrib/jabra/70-jabra-hidraw.rules /etc/udev/rules.d/ \
+        && sudo udevadm control --reload && sudo udevadm trigger -s hidraw -c change \
+        || log_warning "Jabra udev rule not installed (sudo needed)"
+    cp contrib/jabra/voice-assistant-jabra.service "$UNIT_DIR/"
+    systemctl --user daemon-reload
+    systemctl --user enable voice-assistant-jabra.service
+    systemctl --user restart voice-assistant-jabra.service
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────
 
