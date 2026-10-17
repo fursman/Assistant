@@ -1227,6 +1227,20 @@ def _prepare_for_speech(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# A reply that cites the web ends with a "Sources:" heading and a list of links.
+# Read aloud, that list is a minute of titles and URLs, so speech stops at the
+# heading; the transcript and notifications still carry it.
+_SOURCES_HEADING = re.compile(
+    r"(?mi)^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?(?:sources|references)(?:\*\*)?[ \t]*:?"
+    r"[ \t]*(?:\*\*)?[ \t]*$")
+
+
+def _unspoken_from(text: str, start: int = 0):
+    """Where the part not to be spoken begins (a sources heading), or None."""
+    m = _SOURCES_HEADING.search(text, start)
+    return m.start() if m else None
+
+
 def _strip_markdown(text: str) -> str:
     """Remove common markdown so notifications read cleanly."""
     text = re.sub(r"```[\s\S]*?```", "[code block]", text)
@@ -4063,8 +4077,11 @@ class VoiceAssistant:
         """Queue whatever complete units have arrived since the last call."""
         if not self._sentence_queue:
             return
+        stop = _unspoken_from(self._assistant_text, self._assistant_spoken_pos)
+        if stop is None:
+            stop = len(self._assistant_text)
         while True:
-            remaining = self._assistant_text[self._assistant_spoken_pos:]
+            remaining = self._assistant_text[self._assistant_spoken_pos:stop]
             if not remaining.strip():
                 break
             first_unit = self._assistant_spoken_pos == 0
@@ -4096,14 +4113,16 @@ class VoiceAssistant:
                     self.logger.info(f"→ TTS: {unit[:80]}")
 
         if final:
-            remaining = self._assistant_text[self._assistant_spoken_pos:].strip()
+            remaining = self._assistant_text[self._assistant_spoken_pos:stop].strip()
             if remaining:
-                self._assistant_spoken_pos = len(self._assistant_text)
                 spoken = _prepare_for_speech(remaining)
                 if spoken:
                     self._sentence_queue.put(spoken)
                     self._stream_transcript(remaining)
                     self.logger.info(f"→ TTS (final): {remaining[:80]}")
+            # The sources list: shown, never spoken.
+            self._stream_transcript(self._assistant_text[max(stop, self._assistant_spoken_pos):])
+            self._assistant_spoken_pos = len(self._assistant_text)
 
     # ------------------------------------------------------------------
     # Local LLM backend (llama-server / any OpenAI-compatible /v1)
@@ -4816,6 +4835,9 @@ class VoiceAssistant:
         loop = asyncio.get_running_loop()
         self.is_processing = True
         self.capture.mute(True)
+        stop = _unspoken_from(text)
+        if stop is not None:
+            text = text[:stop]
         try:
             await loop.run_in_executor(None, self._say, text)
         finally:
