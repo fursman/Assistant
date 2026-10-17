@@ -1250,6 +1250,20 @@ def _open_fence(text: str):
     return None
 
 
+# How a key name is said; anything not listed is said as written.
+_KEY_WORDS = {"ctrl": "Control", "ctl": "Control", "cmd": "Command", "opt": "Option",
+              "esc": "Escape", "del": "Delete", "pgup": "Page Up", "pgdn": "Page Down",
+              "bksp": "Backspace", "ins": "Insert"}
+_KEY_COMBO = re.compile(
+    r"\b(?:Super|Ctrl|Ctl|Control|Shift|Alt|Cmd|Command|Opt|Option|Meta|Win|Hyper|Fn)"
+    r"(?:\s*\+\s*[A-Za-z0-9]+)+\b", re.IGNORECASE)
+
+
+def _say_key_combo(m) -> str:
+    return " ".join(_KEY_WORDS.get(k.lower(), k)
+                    for k in re.split(r"\s*\+\s*", m.group(0)))
+
+
 def _prepare_for_speech(text: str) -> str:
     """Strip markdown and normalize text for natural TTS pronunciation.
 
@@ -1277,6 +1291,11 @@ def _prepare_for_speech(text: str) -> str:
     # Bare URLs and emoji are noise when read aloud
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[\U0001f300-\U0001f9ff\U00002600-\U000027bf\U0000fe00-\U0000feff]", "", text)
+
+    # Key combos: "Super+Ctrl+V" came out as babble ("brisk brisk"), the
+    # synthesiser having no idea what to do with "+" or "Ctrl". Only chains
+    # that start with a modifier, so "C++" and "2+2" are left alone.
+    text = _KEY_COMBO.sub(_say_key_combo, text)
 
     # "input/output" -> "input or output", but NOT inside a path
     # (/home/user/notes.txt) or a ratio of digits (24/7). Both sides must be

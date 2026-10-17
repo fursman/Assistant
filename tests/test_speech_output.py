@@ -293,3 +293,10 @@ def test_log_playback_reports_gaps_but_not_the_end(caplog):
         host._log_playback()
     assert "Playback: 3 gaps mid-reply, 1 device underruns" in caplog.text
     assert caplog.records[-1].levelno == logging.WARNING
+
+
+def test_key_combos_are_said_as_key_names():
+    say = va._prepare_for_speech
+    assert say("Press Super+Ctrl+V now.") == "Press Super Control V now."
+    assert say("Cmd + Shift + V pastes.") == "Command Shift V pastes."
+    assert "C++" in say("C++ is fine.")
