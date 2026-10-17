@@ -422,6 +422,46 @@ VOICE_ASSISTANT_SMART_TURN=1
 ENVEOF
 fi
 
+# A model server elsewhere on the LAN, offered when none is configured. Only
+# asked about at a terminal; otherwise the line to add is printed. A setting
+# already in the env file is never replaced.
+if grep -qE '^VOICE_ASSISTANT_NETWORK_URL=.+' "$ENV_FILE"; then
+    log_info "Network model: $(grep -E '^VOICE_ASSISTANT_NETWORK_URL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
+else
+    log_info "Looking for a model server on the LAN (ports ${VOICE_LLM_DISCOVER_PORTS:-8080 8081})..."
+    mapfile -t FOUND < <("$SCRIPT_DIR/voice-llm" discover 2>/dev/null || true)
+    if (( ${#FOUND[@]} == 0 )); then
+        log_info "  none found (set VOICE_ASSISTANT_NETWORK_URL in $ENV_FILE to add one)"
+    else
+        for i in "${!FOUND[@]}"; do
+            read -r url model host <<< "${FOUND[$i]}"
+            [[ "$host" == "-" ]] && host=""     # no reverse DNS for it
+            log_info "  $((i + 1))) $url  $model${host:+  ($host)}"
+        done
+        pick=""
+        if [[ -t 0 ]]; then
+            read -r -p "Use 1 as the network model? [y/N, or another number] " ans || ans=""
+            [[ "$ans" =~ ^[Yy] ]] && pick=1
+            [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#FOUND[@]} )) && pick=$ans
+        fi
+        read -r url model host <<< "${FOUND[$(( ${pick:-1} - 1 ))]}"
+        if [[ -n "$pick" ]]; then
+            {
+                echo
+                echo "# Found on the LAN by setup.sh (voice-llm discover)."
+                echo "VOICE_ASSISTANT_NETWORK_URL=$url"
+                grep -qE '^VOICE_ASSISTANT_NETWORK_MODEL=.+' "$ENV_FILE" \
+                    || echo "VOICE_ASSISTANT_NETWORK_MODEL=$model"
+            } >> "$ENV_FILE"
+            log_success "Network model: $model at $url"
+        else
+            log_info "  to use it, add to $ENV_FILE:"
+            log_info "    VOICE_ASSISTANT_NETWORK_URL=$url"
+            log_info "    VOICE_ASSISTANT_NETWORK_MODEL=$model"
+        fi
+    fi
+fi
+
 # ── Models ───────────────────────────────────────────────────────────────
 
 # Pre-download exactly the STT model the env file selects. Getting this wrong

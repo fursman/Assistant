@@ -190,6 +190,7 @@ voice-llm network                # the model at VOICE_ASSISTANT_NETWORK_URL
 voice-llm dsh                    # the local model, driven by the DeepSeek Harness
 voice-llm claude                 # force Claude and stop the server (frees the GPU)
 voice-llm logs                   # the model server's own log
+voice-llm discover               # model servers on the LAN, for VOICE_ASSISTANT_NETWORK_URL
 ```
 
 Say **"new conversation"** (or "start over", "forget everything", "fresh start")
@@ -256,7 +257,14 @@ Three tiers, by where the model runs:
   (`VOICE_ASSISTANT_NETWORK_URL` / `_MODEL`). No URL, no network tier. Without
   a model name the assistant asks the server (`/v1/models`). It gets the same
   tools, prompt and history handling as the local tier, and is told its own
-  model name and address when asked who it is.
+  model name and address when asked who it is. When none is configured,
+  `setup.sh` looks for one (`voice-llm discover`): ports 8080 and 8081 on
+  this machine's /24 (`VOICE_LLM_DISCOVER_PORTS` to change), 0.3 s connect
+  timeouts in parallel, so about a second and a half; a host counts when its
+  `/v1/models` names a model, and this machine is left out. It lists what it
+  found and, at a terminal, asks before adding the first (or another by
+  number) to the env file; otherwise it prints the lines to add. A URL
+  already set is never replaced.
 - **hosted** — the Claude Code CLI (`claude`; "hosted" is accepted as a name).
 
 The backend is `auto` by default:
