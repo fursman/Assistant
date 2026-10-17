@@ -7,6 +7,7 @@
     assistant --backend network      # or local, claude (hosted), dsh, auto
     assistant --model fable          # or opus, sonnet, haiku
     assistant --effort xhigh         # or low, medium, high, max
+    assistant --voice-only on        # or off, toggle: ignore voices but yours
     assistant --status
     assistant --new                  # start a fresh conversation
 
@@ -90,6 +91,9 @@ def main():
     p.add_argument("--backend", choices=("local", "network", "claude", "hosted", "dsh", "auto"),
                    help="select a backend explicitly (hosted = claude; dsh = the local "
                         "model under the DeepSeek Harness)")
+    p.add_argument("--voice-only", choices=("on", "off", "toggle"),
+                   help="ignore every voice but yours (needs a learned voiceprint; "
+                        "until then everyone is heard)")
     p.add_argument("--status", action="store_true", help="show what is running")
     p.add_argument("--new", action="store_true", help="start a fresh conversation")
     p.add_argument("--json", action="store_true", help="print the raw reply")
@@ -97,6 +101,8 @@ def main():
 
     if args.model or args.effort:
         r = request({"cmd": "claude", "model": args.model, "effort": args.effort})
+    elif args.voice_only:
+        r = request({"cmd": "voice_only", "value": args.voice_only})
     elif args.swap or args.backend:
         r = request({"cmd": "backend", "value": args.backend or "toggle"})
     elif args.status:
@@ -130,6 +136,10 @@ def main():
             print(f"network    {r['network_llm']}")
         print(f"dsh        {r.get('dsh', 'unknown')}")
         print(f"voice      {voice}{'  (busy)' if r['busy'] else ''}")
+        if "voice_only" in r:
+            vp = r.get("voiceprint")
+            print(f"voice-only {'on' if r['voice_only'] else 'off'}"
+                  f"{f'  (voiceprint {vp})' if vp else ''}")
         print(f"session    {r['session']}")
     else:
         note = r.get("note") or ""

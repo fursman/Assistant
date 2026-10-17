@@ -1,0 +1,42 @@
+#!/bin/bash
+# hyprlock label: the phrase that unlocks this lock by voice (voiceprint.py).
+#
+#   label { text = cmd[update:1000] ~/.local/bin/voice-unlock-phrase ... }
+#
+# One phrase per hyprlock process. The assistant deletes the file after every
+# attempt, and the next refresh draws a new one, so nothing said once works
+# twice. Prints nothing when voice unlock is not set up.
+state="$HOME/.local/state/voice-assistant"     # the assistant's, not XDG_STATE_HOME
+status=$(cat "$state/voice-unlock" 2>/dev/null) || exit 0
+pid=$(pidof -s hyprlock) || exit 0
+
+if grep -q '"class": \["off"' "$state/status" 2>/dev/null; then
+    echo "Voice unlock: voice mode is off"
+    exit 0
+fi
+case "$status" in
+    ready) ;;
+    learning*) echo "Voice unlock: still learning your voice (${status#learning })"; exit 0 ;;
+    *) exit 0 ;;
+esac
+
+{ read -r owner phrase < "$state/unlock-phrase"; } 2>/dev/null
+if [ "$owner" != "$pid" ] || [ -z "$phrase" ]; then
+    # Short, common, unlike each other when transcribed.
+    words=(apple anchor banjo basket beacon bicycle blanket bottle bridge bucket
+           butter cabin camel candle canyon carpet castle cellar cherry circus
+           cobalt comet copper cotton coyote crayon crystal dragon eagle engine
+           falcon feather forest fossil garden garlic ginger glacier goblet granite
+           guitar hammer harbor helmet hollow honey island jacket jungle kettle
+           ladder lantern lemon lizard magnet maple marble meadow mirror monkey
+           muffin napkin needle nickel orange orchard otter oyster paddle panda
+           parrot pebble pepper pickle pillow pirate planet pocket potato puzzle
+           rabbit radio raven ribbon river rocket saddle salmon sandal silver
+           spider spoon squirrel statue summit sunset tiger tomato tractor trumpet
+           tulip turtle valley velvet violin walnut whistle window winter zebra)
+    phrase=$(shuf --random-source=/dev/urandom -n 4 -e "${words[@]}" | paste -sd' ')
+    umask 077
+    printf '%s %s\n' "$pid" "$phrase" > "$state/unlock-phrase.tmp" &&
+        mv "$state/unlock-phrase.tmp" "$state/unlock-phrase"
+fi
+echo "Or say: “$phrase”"

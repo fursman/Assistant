@@ -200,6 +200,23 @@ SAVE_TURNS_DIR = Path(os.getenv(
     str(Path.home() / ".local/state/voice-assistant/turns")))
 SAVE_TURNS_KEEP = int(os.getenv("VOICE_ASSISTANT_SAVE_TURNS_KEEP", "300"))
 
+# Opt-in: unlock hyprlock by voice (voiceprint.py). The lock screen shows a
+# random phrase (contrib/voice-unlock); saying it in the user's own voice
+# unlocks. The voiceprint is learned from ordinary turns while unlocked; only
+# their embeddings are kept, never the audio.
+VOICE_UNLOCK = os.getenv("VOICE_ASSISTANT_VOICE_UNLOCK", "0").strip().lower() \
+    in ("1", "true", "yes", "on")
+# Voice-only: a turn in anyone else's voice (the TV, other people in the room)
+# is dropped without a sound, like a locked screen's. Uses the same voiceprint
+# but needs no lock screen, so a laptop can have it without the unlock. This
+# is where it starts; a toggle (`assistant --voice-only`, SUPER+CTRL+V, "only
+# listen to me") writes its choice back to the env file.
+VOICE_ONLY = os.getenv("VOICE_ASSISTANT_VOICE_ONLY", "0").strip().lower() \
+    in ("1", "true", "yes", "on")
+# Only the start of a turn is embedded: a minute-long one would cost 1.5 s of
+# CPU before the answer could begin, and the first seconds say who it is.
+VOICE_ONLY_MAX_SECONDS = float(os.getenv("VOICE_ASSISTANT_VOICE_ONLY_MAX_SECONDS", "8"))
+
 # --- STT -------------------------------------------------------------------
 # "moonshine" (default) or "whisper".
 #
@@ -661,6 +678,45 @@ def _detect_desktop():
 
 
 DESKTOP = _detect_desktop()
+
+# Speaking to the assistant counts as being at the computer: voice mode coming
+# on, and every time it hears speech, ends the screensaver and wakes a blanked
+# screen, as a nudge of the mouse would -- a lock screen stays locked. It is
+# done as input because that is what the idle timers watch: a tap of Shift
+# from a virtual keyboard (wtype) on Hyprland and Sway, Mutter's own idle
+# reset on GNOME. Elsewhere it does nothing.
+WAKE_SCREEN = os.getenv("VOICE_ASSISTANT_WAKE_SCREEN", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# Also run this (a shell command) on wake, for a screensaver the idle daemon has
+# lost track of. hypridle's own resume is unreliable for a screensaver that is a
+# window: mapping that window counts as activity, so hypridle "resumes" (and runs
+# its stop command) before the window exists, then ignores every later keypress.
+# e.g. VOICE_ASSISTANT_WAKE_CMD="$HOME/.local/bin/screensaver stop"
+WAKE_CMD = os.getenv("VOICE_ASSISTANT_WAKE_CMD", "").strip()
+
+
+def _wake_screen():
+    """Reset the desktop's idle time, as user input would. Fire and forget."""
+    if not WAKE_SCREEN:
+        return
+    _refresh_session_env()
+    if "Hyprland" in DESKTOP or "Sway" in DESKTOP:
+        cmd = ["wtype", "-P", "Shift_L", "-p", "Shift_L"]
+    elif "GNOME" in DESKTOP:
+        cmd = ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
+               "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
+               "--method", "org.gnome.Mutter.IdleMonitor.ResetIdletime"]
+    else:
+        return
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass                    # wtype not installed
+    if WAKE_CMD:
+        subprocess.Popen(["bash", "-c", WAKE_CMD], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
 
 LOCAL_TOOLS = [{
@@ -1600,6 +1656,32 @@ def _parse_backend_request(text: str):
             return value
         if re.search(rf"\b(?:use|try)\b.*\b(?:{use_names or names})\b", s):
             return value
+    return None
+
+
+# Voice-only on/off, as whole sentences: "listen to everyone" inside a longer
+# one ("I want you to listen to everyone's opinion first") is not a command.
+_VOICE_ONLY_ON = re.compile(
+    r"(?:only (?:listen|respond|answer) to me|listen (?:only )?to me only"
+    r"|listen only to me|ignore (?:everyone|everybody|anyone) else"
+    r"|ignore other (?:voices|people)"
+    r"|(?:turn on|switch on|enable|start|use) (?:the )?voice only(?: mode)?"
+    r"|voice only(?: mode)?(?: on)?)(?: from now on| now)?")
+_VOICE_ONLY_OFF = re.compile(
+    r"(?:listen to (?:everyone|everybody|anyone|other people)(?: again)?"
+    r"|(?:turn off|switch off|disable|stop) (?:the )?voice only(?: mode)?"
+    r"|voice only(?: mode)? off|stop ignoring (?:everyone|everybody|other voices|other people))"
+    r"(?: from now on| now)?")
+
+
+def _parse_voice_only_request(text: str):
+    """'on' or 'off' for a spoken voice-only toggle ("only listen to me",
+    "listen to everyone again"), else None."""
+    s = re.sub(r" please$", "", _normalize_command(text))
+    if _VOICE_ONLY_ON.fullmatch(s):
+        return "on"
+    if _VOICE_ONLY_OFF.fullmatch(s):
+        return "off"
     return None
 
 
@@ -2999,6 +3081,12 @@ class VoiceAssistant:
         self._turn_think = False
         self._turn_model = ""
 
+        # Who is speaking (voiceprint.py): loaded by _setup_voiceprint.
+        self.voice_only = VOICE_ONLY
+        self.voice_unlock = None
+        self._voiceprint = None
+        self._embedder = None
+
         # Per-turn streaming state
         self._sentence_queue: Optional[queue.Queue] = None
         self._thinking_text = ""
@@ -3595,11 +3683,195 @@ class VoiceAssistant:
                         f"Smart Turn unavailable ({e}) — "
                         f"falling back to a {SILENCE_TIMEOUT}s silence timeout")
 
+            if VOICE_UNLOCK or self.voice_only:
+                self._setup_voiceprint()
+            if self.voice_unlock is None:
+                # A lock screen still offering a phrase from an earlier run
+                # would invite an unlock nothing is listening for.
+                try:
+                    import voiceprint
+                    voiceprint.write_status(None)
+                except Exception:
+                    pass
             self._setup_tts()
             self._warmup()
         except Exception as e:
             self.logger.error(f"Error loading models: {e}")
             sys.exit(1)
+
+    # One loader for both features, so turning voice-only on for the first
+    # time cannot race a second load.
+    _voiceprint_lock = threading.Lock()
+
+    def _setup_voiceprint(self):
+        """The speaker embedder and the stored voiceprint, shared by the voice
+        unlock and voice-only: loaded at start when either is on, otherwise on
+        the first voice-only toggle. Its failure costs those two and nothing
+        else. Returns whether it is loaded."""
+        with self._voiceprint_lock:
+            if getattr(self, "_voiceprint", None) is not None:
+                return True
+            try:
+                import voiceprint
+                embedder = voiceprint.SpeakerEmbedder().load(self.logger)
+                vp = voiceprint.Voiceprint()
+            except Exception as e:
+                self.logger.warning(f"Voiceprint unavailable ({e}): no voice unlock, no voice-only")
+                # Not claimed as on (status, menus) while it cannot judge; the
+                # next toggle tries the load again.
+                self.voice_only = False
+                return False
+            self._embedder, self._voiceprint = embedder, vp
+            if VOICE_UNLOCK:
+                self.voice_unlock = voiceprint.VoiceUnlock(embedder, vp, self.logger)
+                voiceprint.write_status(vp.status_line())
+            self.logger.info(
+                f"Voiceprint {vp.status_line()} ({vp.count} samples): voice unlock "
+                f"{'on' if VOICE_UNLOCK else 'off'} (threshold {voiceprint.THRESHOLD}), "
+                f"voice-only {'on' if self.voice_only else 'off'} "
+                f"(threshold {voiceprint.VOICE_ONLY_THRESHOLD})")
+            return True
+
+    def _voice_only_screening(self) -> bool:
+        """Voice-only is on and the voiceprint knows the user well enough to
+        judge. Until then every turn goes through and is learned from, so
+        turning it on early never shuts the user out."""
+        vp = getattr(self, "_voiceprint", None)
+        return bool(getattr(self, "voice_only", False) and vp is not None and vp.ready)
+
+    def _turns_screened(self) -> bool:
+        """Whether a turn may yet be dropped for its voice: voice-only is
+        judging, or the screen is locked with voice unlock on. Such a turn
+        wakes the screen only once it gets through (_process_audio), so a TV
+        talking in the room cannot keep the machine from idling and locking."""
+        if self._voice_only_screening():
+            return True
+        if VOICE_UNLOCK:
+            import voiceprint
+            return voiceprint.hyprlock_pid() is not None
+        return False
+
+    def _speaker_embedding(self, audio):
+        """The first VOICE_ONLY_MAX_SECONDS of a turn, embedded; None on failure."""
+        try:
+            return self._embedder.embed(audio[:int(VOICE_ONLY_MAX_SECONDS * SAMPLE_RATE)])
+        except Exception as e:
+            self.logger.warning(f"Speaker embedding failed ({e})")
+            return None
+
+    def _speaker_turn(self, audio, transcription, emb=None):
+        """Who is speaking decides a turn before anything else does.
+
+        While hyprlock is up (voice unlock on), no turn reaches a model: one
+        that asks to unlock is answered here (returns the line to speak),
+        anything else is dropped without a sound (returns ""), so whoever
+        talks near a locked machine gets nothing out of it. Unlocked, with
+        voice-only on, a turn in someone else's voice is dropped the same way.
+        A turn that gets through returns None and may become a voiceprint
+        sample. `emb` is the turn's embedding when the caller has it."""
+        import voiceprint
+        vu = self.voice_unlock
+        if vu is not None or VOICE_UNLOCK:
+            pid = voiceprint.hyprlock_pid()
+            if pid is not None:
+                if vu is None:
+                    # On, but its model would not load: no unlock, and still
+                    # nothing for whoever talks to the locked machine.
+                    self.logger.info(f"Locked: ignored (voice unlock unavailable): {transcription}")
+                    return ""
+                if not voiceprint.is_unlock_attempt(
+                        transcription, voiceprint.current_phrase(pid)):
+                    self.logger.info(f"Locked: ignored (not an unlock attempt): {transcription}")
+                    return ""
+                return vu.attempt(audio, transcription, pid)
+        vp = self._voiceprint
+        if vp is None:
+            return None
+        if self.voice_only:
+            if not vp.ready:
+                self.logger.info(f"Voice-only: let through, still learning the voice "
+                                 f"({vp.count}/{voiceprint.ENROLL_MIN})")
+            else:
+                if emb is None:
+                    emb = self._speaker_embedding(audio)
+                if emb is None:
+                    # Fail open: a broken embedder must not make the assistant deaf.
+                    self.logger.warning("Voice-only: let through, no embedding")
+                    return None
+                seconds = len(audio) / SAMPLE_RATE
+                ok, score, bar = voiceprint.voice_only_verdict(vp, emb, seconds)
+                short = " (short turn)" if seconds < voiceprint.ENROLL_MIN_SECONDS else ""
+                self.logger.info(
+                    f"Voice-only: voice {score:.2f} vs {bar:.2f}{short} "
+                    f"{'ok' if ok else 'IGNORED'}" + ("" if ok else f": {transcription}"))
+                if not ok:
+                    return ""
+        self._voiceprint_sample(audio, transcription, emb)
+        return None
+
+    def _voiceprint_sample(self, audio, transcription, emb=None):
+        """Learn from one turn that got through, off the caller's thread.
+        Voiceprint.consider leaves out a voice unlike the rest."""
+        import voiceprint
+        vp = self._voiceprint
+        if vp.full or len(audio) < voiceprint.ENROLL_MIN_SECONDS * SAMPLE_RATE:
+            return
+        if _normalize_command(transcription) in _HALLUCINATION_PATTERNS:
+            return
+        if self._last_tts_text and _text_similarity(transcription, self._last_tts_text) > 0.6:
+            return
+
+        def work():
+            try:
+                e = emb if emb is not None else self._speaker_embedding(audio)
+                if e is None:
+                    return
+                added, score = vp.consider(e)
+                self.logger.info(
+                    f"Voiceprint: {'added' if added else 'skipped'} a sample "
+                    f"(score {score:.2f}), {vp.count}/{voiceprint.ENROLL_SAMPLES}")
+                if added and VOICE_UNLOCK:
+                    voiceprint.write_status(vp.status_line())
+            except Exception as e:
+                self.logger.warning(f"Voiceprint sample failed ({e})")
+        threading.Thread(target=work, name="voiceprint", daemon=True).start()
+
+    def set_voice_only(self, value="toggle") -> dict:
+        """Voice-only 'on' | 'off' | 'toggle', for the control socket, the
+        hotkey and the spoken command. The first 'on' may load the voiceprint
+        model (a second, or a 26 MB download on a new machine), so call it off
+        the event loop. Written back to the env file like the backend choice,
+        so it survives a restart."""
+        import voiceprint
+        value = str(value).strip().lower()
+        if value == "toggle":
+            want = not self.voice_only
+        elif value in ("on", "off", "1", "0"):
+            want = value in ("on", "1")
+        else:
+            return {"ok": False, "error": f"unknown voice-only setting {value!r}"}
+        if want and not self._setup_voiceprint():
+            return {"ok": False, "error": "the voiceprint model would not load"}
+        changed = want != self.voice_only
+        self.voice_only = want
+        _write_env_setting("VOICE_ASSISTANT_VOICE_ONLY", "1" if want else "0")
+        vp = self._voiceprint
+        ready = vp is not None and vp.ready
+        note = ""
+        if want and not ready:
+            note = (f"(still learning your voice, {vp.count} of {voiceprint.ENROLL_MIN}: "
+                    "listening to everyone until then)")
+        label = "Only your voice" if want else "Listening to everyone"
+        self.logger.info(f"Voice-only {'on' if want else 'off'}"
+                         + (f", voiceprint {vp.status_line()}" if vp is not None else ""))
+        # Into the transcript too: a turn that got no answer reads very
+        # differently once you know voice-only had just been turned on.
+        self._append_transcript("system", f"Voice-only: {'on' if want else 'off'}")
+        self._notify(f"👤 {label}" + (f"\n{note}" if note else ""), title="Voice-only",
+                     transient=True, timeout_ms=5000 if note else 3000, slot="voice-only")
+        self._set_status(getattr(self, "_status_state", None) or "off")
+        return {"ok": True, "voice_only": want, "ready": ready, "changed": changed,
+                "label": label, "note": note}
 
     def _setup_tts(self):
         """Load a CPU TTS engine.
@@ -4030,6 +4302,8 @@ class VoiceAssistant:
         except OSError:
             pass
 
+    _status_write_lock = threading.Lock()
+
     def _set_status(self, state, backend=None):
         """Publish the phase for whatever is drawing it.
 
@@ -4066,11 +4340,19 @@ class VoiceAssistant:
             "models": list(CLAUDE_MODELS),
             "efforts": list(CLAUDE_EFFORTS),
             "local_model": _local_model_label(llm.model),
+            # Also a class, so a bar can style it without reading the JSON.
+            "voice_only": bool(getattr(self, "voice_only", False)),
         }
+        if payload["voice_only"]:
+            payload["class"].append("voice-only")
+            payload["tooltip"] += ", only your voice"
         try:
-            tmp = status_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload))
-            os.replace(tmp, status_file)
+            # Written from executor threads as well as the loop (a switch,
+            # voice-only), and the .tmp is shared.
+            with self._status_write_lock:
+                tmp = status_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps(payload))
+                os.replace(tmp, status_file)
         except OSError:
             pass
 
@@ -6237,6 +6519,7 @@ class VoiceAssistant:
             self._notify("🎤 Voice Mode ON", timeout_ms=2000, transient=True)
             self._set_status("ready")
             self._play_chime_async("listening")
+            _wake_screen()
             # Spawn now, so a throttled CLI boot happens while the user is
             # still speaking rather than after their question. In a thread:
             # the health probe and the spawn must not sit on the event loop.
@@ -6579,12 +6862,19 @@ class VoiceAssistant:
                     "dsh": ("running" if self._dsh is not None and self._dsh.alive
                             else "installed" if self._dsh_available else "not installed"),
                     "voice_active": self.is_active, "busy": self.is_processing,
+                    "voice_only": self.voice_only,
+                    "voiceprint": (self._voiceprint.status_line()
+                                   if self._voiceprint is not None else None),
                     "session": self._session_id}
         if cmd == "backend":
             # Off the loop too: the toggle may probe nvidia-smi, systemd and
             # both servers before it knows where it is going.
             return await asyncio.get_running_loop().run_in_executor(
                 None, self._switch_backend, str(req.get("value", "toggle")))
+        if cmd == "voice_only":
+            # Off the loop: the first 'on' may have the voiceprint model to load.
+            return await asyncio.get_running_loop().run_in_executor(
+                None, self.set_voice_only, str(req.get("value", "toggle")))
         if cmd == "claude":
             return self.set_claude_setting(req.get("model"), req.get("effort"))
         if cmd == "new_session":
@@ -6714,6 +7004,8 @@ class VoiceAssistant:
 
             if self.vad.onset(chunk):
                 self._set_status("listening")
+                if not self._turns_screened():
+                    _wake_screen()
                 self.logger.info("Speech detected, recording...")
                 # The previous chunk carries the start of the word that
                 # triggered the detector.
@@ -6749,6 +7041,12 @@ class VoiceAssistant:
         # and an unbounded queue while a 60 s reply plays would be a leak.
         self.capture.mute(True)
         try:
+            # Voice-only's embedding alongside the transcript, so the check
+            # adds no time of its own. Never raises (None on failure).
+            speaker = (loop.run_in_executor(None, self._speaker_embedding, audio_data)
+                       if self._voice_only_screening() else None)
+            # Its onset did not wake the screen: that waits for the verdict.
+            screened = self._turns_screened()
             transcription = await loop.run_in_executor(None, self._transcribe, audio_data)
             self._save_turn(audio_data, transcription)
             if not transcription:
@@ -6756,6 +7054,20 @@ class VoiceAssistant:
                 return
             if not self.is_active or abort.is_set():
                 return
+
+            if getattr(self, "_voiceprint", None) is not None or VOICE_UNLOCK:
+                emb = await speaker if speaker is not None else None
+                line = await loop.run_in_executor(
+                    None, self._speaker_turn, audio_data, transcription, emb)
+                if line is not None:     # an unlock attempt, or silence
+                    if line:
+                        if screened:
+                            _wake_screen()
+                        await loop.run_in_executor(None, self._say, line)
+                        spoke = True
+                    return
+                if screened:
+                    _wake_screen()       # it got through
 
             command = _normalize_command(transcription)
             if command in _NEW_SESSION_PHRASES:
@@ -6765,6 +7077,28 @@ class VoiceAssistant:
                              timeout_ms=4000, transient=True)
                 await loop.run_in_executor(None, self._say, "Starting a new conversation.")
                 spoke = True     # so the "your turn" chime plays on the way out
+                return
+
+            # "only listen to me", "listen to everyone". Past the check above,
+            # so with voice-only on only the user can turn it off.
+            want_voice_only = _parse_voice_only_request(transcription)
+            if want_voice_only:
+                self.logger.info(f"Voice command: voice-only {want_voice_only} ({transcription})")
+                before = self.voice_only
+                res = await loop.run_in_executor(None, self.set_voice_only, want_voice_only)
+                if not res.get("ok"):
+                    line = f"Sorry, {res.get('error', 'that did not work')}."
+                elif res["voice_only"] and not res["ready"]:
+                    line = ("I'm still learning your voice, so I'll listen to everyone "
+                            "until I know it.")
+                elif res["voice_only"]:
+                    line = ("I'm already only listening to you." if before
+                            else "Okay, I'll only listen to you.")
+                else:
+                    line = ("I'm already listening to everyone." if not before
+                            else "Okay, I'll listen to everyone.")
+                await loop.run_in_executor(None, self._say, line)
+                spoke = True
                 return
 
             # "switch to claude", "go back to the local model". A backend switch is

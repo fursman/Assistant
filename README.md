@@ -212,6 +212,7 @@ echo "summarise this" | assistant          # reads stdin when given no words
 assistant --speak "and read that one out"  # typed questions are silent by default
 assistant --status                         # model, local server, voice state, session
 assistant --new                            # start a fresh conversation
+assistant --voice-only on                  # ignore voices but yours (off, toggle)
 assistant --json                           # the raw reply, for scripting
 ```
 
@@ -540,6 +541,49 @@ it is the way to find out why some finished turns score "unfinished".
 
 Set `VOICE_ASSISTANT_SMART_TURN=0` to go back to the timeout alone.
 
+**Voice unlock.** `VOICE_ASSISTANT_VOICE_UNLOCK=1` lets you unlock hyprlock by
+voice (`voiceprint.py`). The lock screen shows a random four-word phrase. Saying
+it unlocks the screen only if the words match and the voice matches yours. The
+voiceprint is learned from your ordinary turns while the screen is unlocked:
+speaker embeddings from a 26 MB WeSpeaker model, downloaded on first use. It
+stores the numbers in `~/.local/state/voice-assistant/voiceprint.npz` and
+never the audio. A turn that sounds like someone else is left out. Voice unlock
+is ready after 8 turns and stops learning at 20. Every attempt gets a new
+phrase, so a recording of an earlier unlock does not work, and an attempt is
+the phrase and little else (at most 3 more words, under 10 s), so a recording
+of your voice cannot carry someone else reading it. After 5 tries in a
+voice that isn't yours, voice unlock is off until that lock ends. Every attempt
+is logged with its score. While the screen is locked, nothing else gets
+through: anything that isn't close to the phrase on screen (saying "unlock"
+alone is not) is dropped without a sound and never reaches a model, and that
+holds even if the voiceprint model fails to load. To set up the lock screen, install
+`contrib/voice-unlock/voice-unlock-phrase` in `~/.local/bin` and add a hyprlock
+label with `text = cmd[update:1000] ~/.local/bin/voice-unlock-phrase`. Treat
+it as a convenience at home, not security: a convincing clone of your voice
+reading the phrase would pass. To start the voiceprint over, delete
+`voiceprint.npz`.
+
+**Voice-only.** For a laptop in a shared room, or a TV that talks: with
+voice-only on, a turn in a voice that isn't yours is dropped without a sound,
+like a locked screen's, and never reaches a model. Turn it on and off with
+**SUPER+CTRL+V**, `assistant --voice-only on|off|toggle`, the indicator menus,
+or by saying **"only listen to me"** / **"listen to everyone"** (with it on,
+only you can turn it off). It starts from `VOICE_ASSISTANT_VOICE_ONLY` (default
+`0`) and each toggle writes its choice back to the env file, so it survives a
+restart. It uses the same voiceprint as voice unlock and loads it whenever
+either is on, but it does not need voice unlock: that stays off unless you set
+it. Until the voiceprint is ready (8 turns), voice-only lets everything
+through and keeps learning, and says so when you turn it on; after that only
+turns that pass are learned from. A turn passes at a score of 0.45
+(`VOICE_ASSISTANT_VOICE_ONLY_THRESHOLD`), lower than the unlock's 0.6 because
+a mistake costs a repeated sentence, not an open screen: your own turns have
+scored 0.54–0.91, other people 0.1–0.2, TTS voices through a speaker about 0.
+A turn under 1.5 s ("yes", "stop") scores lower even in your voice, so it is
+held to 0.35 instead and only a clearly different voice is dropped. Only the
+first 8 s are judged, alongside transcription, so the check adds no delay.
+Every decision is logged (`Voice-only: voice 0.71 vs 0.45 ok`). The status
+file carries `"voice_only": true` and a `voice-only` class for the bar.
+
 ## Speech synthesis
 
 **[Pocket TTS](https://github.com/kyutai-labs/pocket-tts)** (kyutai, ~100M) is
@@ -810,6 +854,7 @@ is on, so it reaches for `hyprctl` or `gsettings` as appropriate;
 | Toggle voice mode | **SUPER** (tap alone) | **SUPER+ALT** (either order) |
 | New conversation | **SUPER+SHIFT+V** | **SUPER+SHIFT+V** |
 | Swap backend | **SUPER+M** | **SUPER+M** |
+| Voice-only on/off | **SUPER+CTRL+V** | **SUPER+CTRL+V** |
 | Status | waybar module | top-bar indicator (Shell extension) |
 | Installed by | `contrib/hyprland/hyprland-voice-assistant.conf` | `setup.sh` (gsettings + `contrib/gnome/`) |
 
@@ -877,7 +922,8 @@ change, in waybar's custom-module format so it can be used verbatim:
 States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and the
 second class is `claude`, `local`, `network` or `dsh` (the network tier is
 `network` under either harness). The payload also carries `tier` and `label`
-("Network · qwen3.8-flash-next"), which the indicator and panel show. (`waybar-status` is a symlink to the
+("Network · qwen3.8-flash-next"), which the indicator and panel show, and
+`voice_only` (true adds a third class, `voice-only`). (`waybar-status` is a symlink to the
 same file, for configs written against the old name.)
 
 ### GNOME indicator
@@ -1120,6 +1166,13 @@ win over both.
 | `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
 | `VOICE_ASSISTANT_TTS_TAIL_GATE` | `0.35` | silence held after playback before the mic is trusted |
 | `VOICE_ASSISTANT_LISTEN_CHIME` | `1` | chime when the mic goes live again after a reply |
+| `VOICE_ASSISTANT_WAKE_SCREEN` | `1` | voice mode coming on and hearing speech end the screensaver and wake the screen, like a mouse nudge (Shift via `wtype` on Hyprland/Sway, Mutter idle reset on GNOME); a lock screen stays locked. With voice-only judging, or locked with voice unlock on, a turn wakes it only once it gets through, so a TV cannot keep the machine from locking |
+| `VOICE_ASSISTANT_VOICE_UNLOCK` | `0` | unlock hyprlock by saying the phrase it shows, in your voice (see Voice unlock) |
+| `VOICE_ASSISTANT_VOICE_UNLOCK_THRESHOLD` / `_ATTEMPTS` | `0.6` / `5` | voice score needed (same speaker about 0.7–0.85), tries in a voice that isn't yours before voice unlock turns off for that lock |
+| `VOICE_ASSISTANT_VOICEPRINT_MIN` / `_SAMPLES` | `8` / `20` | turns before voice unlock is ready, and before it stops learning |
+| `VOICE_ASSISTANT_VOICE_ONLY` | `0` | ignore every voice but yours (see Voice-only); toggles write it back |
+| `VOICE_ASSISTANT_VOICE_ONLY_THRESHOLD` | `0.45` | voice score a turn needs with voice-only on; turns under 1.5 s need 0.35 |
+| `VOICE_ASSISTANT_WAKE_CMD` | (unset) | extra shell command run on the same wake, e.g. `$HOME/.local/bin/screensaver stop` for a screensaver window the idle daemon has lost track of |
 
 ### Desktop
 
@@ -1146,7 +1199,9 @@ and synthesis are all local, always. In local mode the only outbound traffic is
 weights are downloaded once, on first run.
 
 Nothing is recorded until you press the key, and nothing is kept on disk
-unless you turn on `VOICE_ASSISTANT_SAVE_TURNS`. There is no wake word, which is a
+unless you turn on `VOICE_ASSISTANT_SAVE_TURNS`. With voice unlock or voice-only
+on, the disk also keeps a voiceprint: numbers describing your voice, not
+recordings. There is no wake word, which is a
 deliberate trade: you give up "hey computer" and get a microphone that is
 provably idle the rest of the time.
 
@@ -1311,7 +1366,7 @@ optional local model.
 |---|---|
 | indicator header | `Listening · Claude · fable · xhigh`, plus copy, new conversation, on/off |
 | left click | the transcript, full height, selectable, code blocks clickable |
-| right click | toggle, new conversation, swap backend, Model and Effort submenus |
+| right click | toggle, new conversation, swap backend, voice-only, Model and Effort submenus |
 | notifications | status only: tool calls, model changes, voice mode; all transient except errors |
 | status file | phase and backend for waybar; also model, effort and the valid choices |
 | `voice-assistant-ctl status` | service, process, phase, backend, Claude model and effort, session |
@@ -1324,6 +1379,8 @@ optional local model.
   short sentence; "use fable to explain the encoder" is a request, not a switch.
 - **"set the effort to extra high"** -- or low, medium, high, max. Needs the
   word effort, thinking or reasoning.
+- **"only listen to me"** / **"listen to everyone"** -- voice-only on and off.
+  The whole sentence has to be the command.
 - Tap the toggle key mid-reply to abort it.
 
 ### Things the code will not tell you

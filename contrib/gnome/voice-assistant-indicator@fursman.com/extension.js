@@ -159,6 +159,7 @@ function readStatus() {
         }
     }
     let model = null, effort = null, models = [], efforts = [], label = null;
+    let voiceOnly = false;
     if (text) {
         try {
             const d = JSON.parse(text);
@@ -169,11 +170,12 @@ function readStatus() {
             effort = d.effort ?? null;
             models = Array.isArray(d.models) ? d.models : [];
             efforts = Array.isArray(d.efforts) ? d.efforts : [];
+            voiceOnly = d.voice_only === true;
         } catch (e) {
             // handled above
         }
     }
-    return {state, backend, pid, model, effort, models, efforts, label};
+    return {state, backend, pid, model, effort, models, efforts, label, voiceOnly};
 }
 
 function readTranscript() {
@@ -347,6 +349,11 @@ class VoiceIndicator extends PanelMenu.Button {
         swap.connect('activate', () => spawn([ASSISTANT_BIN, '--swap']));
         this.menu.addMenuItem(swap);
 
+        this._voiceOnlyItem = new PopupMenu.PopupMenuItem('Only listen to my voice');
+        this._voiceOnlyItem.connect('activate',
+            () => spawn([ASSISTANT_BIN, '--voice-only', 'toggle']));
+        this.menu.addMenuItem(this._voiceOnlyItem);
+
         // Claude's model and effort. Only meaningful on the Claude backend, so
         // both are hidden otherwise rather than offering a setting that would
         // sit unused until you switched back.
@@ -365,7 +372,7 @@ class VoiceIndicator extends PanelMenu.Button {
         this._startItem = start;
         // Everything that is hidden in the transcript view. The model and
         // effort submenus are handled in _updateChoices, which also gates them.
-        this._controls = [this._toggleItem, fresh, swap, startSep];
+        this._controls = [this._toggleItem, fresh, swap, this._voiceOnlyItem, startSep];
 
         this._current = null;
         this._installClickHandling();
@@ -456,6 +463,9 @@ class VoiceIndicator extends PanelMenu.Button {
             this._toggleItem.label.text =
                 status.state === 'off' ? 'Turn voice mode on' : 'Turn voice mode off';
             this._toggleItem.sensitive = status.state !== 'down';
+            this._voiceOnlyItem.label.text =
+                status.voiceOnly ? 'Listen to everyone' : 'Only listen to my voice';
+            this._voiceOnlyItem.sensitive = status.state !== 'down';
             this._startItem.visible = !t && status.state === 'down';
             this._updateChoices(status);
         }

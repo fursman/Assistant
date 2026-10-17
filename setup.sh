@@ -153,7 +153,8 @@ install_gnome_integration() {
     # binding as long as it is named as a keysym, and the chord is bound in
     # both orders so it does not matter which one goes down first. SUPER+M
     # swaps the model, as on Hyprland; GNOME binds that to the notification
-    # list by default and keeps SUPER+V for it.
+    # list by default and keeps SUPER+V for it. SUPER+CTRL+V toggles
+    # voice-only, as on Hyprland.
     local tray
     tray=$(gsettings get org.gnome.shell.keybindings toggle-message-tray)
     if [[ "$tray" == *"<Super>m"* ]]; then
@@ -168,6 +169,8 @@ install_gnome_integration() {
         "$HOME/.local/bin/voice-assistant-ctl new-session"
     gnome_keybinding voice-swap-model "Voice assistant: swap model" "<Super>m" \
         "$HOME/.local/bin/assistant --swap"
+    gnome_keybinding voice-only "Voice assistant: only my voice" "<Primary><Super>v" \
+        "$HOME/.local/bin/assistant --voice-only toggle"
 
     # Ubuntu's dock (dash-to-dock) is a fixed strip by default and steals a
     # row of every screen. Make it hide itself and slide up only when the
@@ -185,7 +188,8 @@ install_gnome_integration() {
 
     DESKTOP_NOTES=(
         "Keys: SUPER+ALT toggles voice mode, SUPER+SHIFT+V starts a new"
-        "      conversation, SUPER+M swaps the model (all active now)."
+        "      conversation, SUPER+M swaps the model, SUPER+CTRL+V turns"
+        "      voice-only on or off (all active now)."
         "Dock: auto-hidden; push the pointer into the bottom edge to show it."
     )
     if [[ "$changed" == 1 ]]; then
@@ -419,6 +423,12 @@ VOICE_ASSISTANT_SMART_TURN=1
 # Keep each turn's audio and what the end-of-turn logic made of it, to see
 # why a turn was cut off or waited (~/.local/state/voice-assistant/turns).
 #VOICE_ASSISTANT_SAVE_TURNS=1
+
+# --- whose voice ---
+# Ignore turns in any voice but yours (SUPER+CTRL+V toggles it and writes it
+# here). Unlocking the screen by voice is separate, and off.
+#VOICE_ASSISTANT_VOICE_ONLY=1
+#VOICE_ASSISTANT_VOICE_UNLOCK=1
 ENVEOF
 fi
 
