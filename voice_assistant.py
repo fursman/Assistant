@@ -1825,9 +1825,16 @@ class SpeechDetector:
         n = x.size // self._WINDOW
         self._carry = x[n * self._WINDOW:].copy()
         out = []
-        for i in range(n):
-            chunk = torch.from_numpy(np.ascontiguousarray(x[i * self._WINDOW:(i + 1) * self._WINDOW]))
-            out.append(self.model(chunk, SAMPLE_RATE).item())
+        # inference_mode, not just habit: the JIT model's weights require
+        # grad, and its recurrent state carries from call to call, so every
+        # window was chained onto one ever-growing autograd graph until the
+        # next reset() -- ~20 KB a window, 2.4 GB an hour of idle listening
+        # (OOM-killed at 30 GB on 2026-10-17). Grad mode is per thread, so
+        # it has to be here, on the thread that runs the model.
+        with torch.inference_mode():
+            for i in range(n):
+                chunk = torch.from_numpy(np.ascontiguousarray(x[i * self._WINDOW:(i + 1) * self._WINDOW]))
+                out.append(self.model(chunk, SAMPLE_RATE).item())
         return out
 
     def scan(self, audio):

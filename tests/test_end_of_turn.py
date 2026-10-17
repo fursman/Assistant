@@ -304,3 +304,19 @@ def test_saved_turn_is_a_wav_and_a_json_line_and_old_ones_go(monkeypatch, tmp_pa
     assert [w.name for w in wavs] == [lines[1]["wav"], lines[2]["wav"]]
     with wave.open(str(wavs[-1])) as f:
         assert f.getframerate() == SR and f.getnframes() == SR // 2
+
+
+def test_vad_runs_without_autograd():
+    """The Silero JIT model's state carries across calls; with autograd on,
+    every window joined one graph that grew until OOM (30 GB, 2026-10-17)."""
+    import torch
+    seen = []
+
+    class Model:
+        def __call__(self, chunk, sr):
+            seen.append(torch.is_inference_mode_enabled())
+            return torch.tensor(0.0)
+
+    d = va.SpeechDetector(Model())
+    d.probabilities(np.zeros(3200, np.float32))
+    assert seen and all(seen)
