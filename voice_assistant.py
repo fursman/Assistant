@@ -2129,6 +2129,7 @@ class ClaudeSession:
                 # unrelated session someone ran in the checkout).
                 self.session_id = str(uuid.uuid4())
                 cmd.extend(["--session-id", self.session_id])
+            _refresh_session_env()        # its hyprctl/notify calls inherit this
             env = os.environ.copy()
             env.pop("CLAUDECODE", None)   # prevent the nesting check
             try:
@@ -6653,10 +6654,15 @@ def _discover_wayland_display():
     written for and silently breaks notifications, hyprctl and waybar updates
     everywhere else. Everything downstream is a subprocess, so fixing it in
     os.environ is enough.
+
+    Called again later (see _refresh_session_env): at boot the service can
+    start before the desktop has made its socket, and a session that restarts
+    leaves the old name pointing at nothing.
     """
-    if os.environ.get("WAYLAND_DISPLAY"):
-        return
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    current = os.environ.get("WAYLAND_DISPLAY")
+    if current and (Path(runtime) / current).is_socket():
+        return
     try:
         socks = sorted(
             p.name for p in Path(runtime).glob("wayland-*")
@@ -6673,10 +6679,11 @@ def _discover_hyprland_signature():
     Without HYPRLAND_INSTANCE_SIGNATURE every hyprctl the model runs fails, so
     "move this window" and "which workspace am I on" quietly never worked.
     """
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
-        return
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     base = Path(runtime) / "hypr"
+    current = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if current and (base / current / ".socket.sock").exists():
+        return
     try:
         instances = sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
@@ -6685,6 +6692,17 @@ def _discover_hyprland_signature():
         if (inst / ".socket.sock").exists():
             os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = inst.name
             return
+
+
+def _refresh_session_env():
+    """Re-find the desktop session's sockets if they were missing or are stale.
+
+    Cheap (a few stat calls), so it runs wherever the desktop is about to be
+    used: the screen wake, notifications, and spawning the model's CLI, whose
+    commands inherit the environment.
+    """
+    _discover_wayland_display()
+    _discover_hyprland_signature()
 
 
 def main():
