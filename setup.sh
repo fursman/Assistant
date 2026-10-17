@@ -165,7 +165,7 @@ install_gnome_integration() {
         "$HOME/.local/bin/voice-assistant-ctl toggle"
     gnome_keybinding voice-toggle-alt "Voice assistant: toggle (Alt first)" "<Alt>Super_L" \
         "$HOME/.local/bin/voice-assistant-ctl toggle"
-    gnome_keybinding voice-new-session "Voice assistant: new conversation" "<Shift><Super>v" \
+    gnome_keybinding voice-new-session "Voice assistant: new conversation" "<Shift><Super>a" \
         "$HOME/.local/bin/voice-assistant-ctl new-session"
     gnome_keybinding voice-swap-model "Voice assistant: swap model" "<Super>m" \
         "$HOME/.local/bin/assistant --swap"
@@ -187,7 +187,7 @@ install_gnome_integration() {
     fi
 
     DESKTOP_NOTES=(
-        "Keys: SUPER+ALT toggles voice mode, SUPER+SHIFT+V starts a new"
+        "Keys: SUPER+ALT toggles voice mode, SUPER+SHIFT+A starts a new"
         "      conversation, SUPER+M swaps the model, SUPER+CTRL+V turns"
         "      voice-only on or off (all active now)."
         "Dock: auto-hidden; push the pointer into the bottom edge to show it."

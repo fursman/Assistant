@@ -95,7 +95,7 @@ def render(cols, rows):
             body.append(f"  {col}{D if dim else ''}{ln}{R}")
         body.append("")
 
-    foot = f"{D}{GREY}  SUPER tap: mic   SUPER+M: backend   SUPER+SHIFT+V: new{R}"
+    foot = f"{D}{GREY}  SUPER tap: mic   SUPER+M: backend   SUPER+SHIFT+A: new{R}"
     avail = rows - len(head) - 1
     body = body[-avail:] if avail > 0 else []
 

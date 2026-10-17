@@ -102,7 +102,7 @@ picks per query.
 
 1. **SUPER** toggles voice mode. The status bar shows the state (a waybar module
    on Hyprland, a top-bar indicator on GNOME); chimes mark the edges.
-   **SUPER+M** swaps which backend answers; **SUPER+SHIFT+V** starts a new
+   **SUPER+M** swaps which backend answers; **SUPER+SHIFT+A** starts a new
    conversation. You can also just type: `assistant <question>` joins the same
    conversation from a terminal.
 2. **Silero VAD** watches the mic. Speech has to persist for ~96 ms before a
@@ -852,7 +852,7 @@ is on, so it reaches for `hyprctl` or `gsettings` as appropriate;
 | | Hyprland | GNOME |
 |---|---|---|
 | Toggle voice mode | **SUPER** (tap alone) | **SUPER+ALT** (either order) |
-| New conversation | **SUPER+SHIFT+V** | **SUPER+SHIFT+V** |
+| New conversation | **SUPER+SHIFT+A** | **SUPER+SHIFT+A** |
 | Swap backend | **SUPER+M** | **SUPER+M** |
 | Voice-only on/off | **SUPER+CTRL+V** | **SUPER+CTRL+V** |
 | Status | waybar module | top-bar indicator (Shell extension) |
