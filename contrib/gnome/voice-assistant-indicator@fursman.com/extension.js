@@ -116,6 +116,7 @@ const STATE_CLASSES = Object.keys(STATES).map(s => `voice-${s}`);
 const BACKEND_LABEL = {
     claude: 'Claude',
     local: 'Local Qwen3.8',
+    network: 'Network',
     dsh: 'DeepSeek Harness · Qwen3.8',
 };
 
@@ -157,10 +158,13 @@ function readStatus() {
             // so this is an old or foreign file; treat it as unknown state.
         }
     }
-    let model = null, effort = null, models = [], efforts = [];
+    let model = null, effort = null, models = [], efforts = [], label = null;
     if (text) {
         try {
             const d = JSON.parse(text);
+            // "Network · qwen3.8-flash-next": the assistant names the tier and
+            // its model; BACKEND_LABEL is for a status file from before tiers.
+            label = d.label ?? null;
             model = d.model ?? null;
             effort = d.effort ?? null;
             models = Array.isArray(d.models) ? d.models : [];
@@ -169,7 +173,7 @@ function readStatus() {
             // handled above
         }
     }
-    return {state, backend, pid, model, effort, models, efforts};
+    return {state, backend, pid, model, effort, models, efforts, label};
 }
 
 function readTranscript() {
@@ -480,7 +484,7 @@ class VoiceIndicator extends PanelMenu.Button {
         // answering, in one line, so none of it needs a menu to find out.
         const parts = [spec.title];
         if (status.backend)
-            parts.push(BACKEND_LABEL[status.backend] ?? status.backend);
+            parts.push(status.label ?? BACKEND_LABEL[status.backend] ?? status.backend);
         if (status.backend === 'claude') {
             if (status.model) parts.push(status.model);
             if (status.effort) parts.push(status.effort);

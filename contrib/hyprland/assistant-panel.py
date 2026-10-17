@@ -30,7 +30,7 @@ STATES = {  # glyph + colour for the phase published in status.class[0]
     "thinking":  ("◈", "thinking",  YELLOW),
     "speaking":  ("◆", "speaking",  MAGENTA),
 }
-BACKENDS = {"claude": "Claude", "local": "Local", "dsh": "Harness"}
+BACKENDS = {"claude": "Claude", "local": "Local", "network": "Network", "dsh": "Harness"}
 ROLES = {  # colour + label + whether it is dimmed secondary text
     "you":       (BLUE,    "You",       False),
     "assistant": (WHITE,   "Assistant", False),

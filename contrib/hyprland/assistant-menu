@@ -29,6 +29,7 @@ try: d=json.load(open(sys.argv[1]))
 except Exception: d={}
 cls=d.get("class") or []
 print("BACKEND="+shlex.quote(str(d.get("backend") or (cls[1] if len(cls)>1 else ""))))
+print("LABEL="+shlex.quote(str(d.get("label",""))))
 print("LOCAL_MODEL="+shlex.quote(str(d.get("local_model",""))))
 print("MODEL="+shlex.quote(str(d.get("model",""))))
 print("EFFORT="+shlex.quote(str(d.get("effort",""))))
@@ -45,7 +46,7 @@ vlabel="Turn voice mode on"; [ "$ACTIVE" = "True" ] && vlabel="Turn voice mode o
 choice="$(printf '%s\n' \
   "$vlabel" \
   "New conversation" \
-  "Swap backend  (now: ${BACKEND:-?}${LOCAL_MODEL:+ · $LOCAL_MODEL})" \
+  "Swap backend  (now: ${LABEL:-${BACKEND:-?}${LOCAL_MODEL:+ · $LOCAL_MODEL}})" \
   "Claude model   (${MODEL:-?})" \
   "Claude effort  (${EFFORT:-?})" | rofi_menu Assistant)"
 

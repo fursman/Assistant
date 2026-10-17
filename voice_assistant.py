@@ -59,7 +59,7 @@ import uuid
 import wave  # chimes, and saved turns (VOICE_ASSISTANT_SAVE_TURNS)
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pyaudio
@@ -305,17 +305,22 @@ LISTEN_RESUME_CHIME = os.getenv("VOICE_ASSISTANT_LISTEN_CHIME", "1").strip().low
     not in ("0", "false", "no", "off")
 
 # --- LLM backend -----------------------------------------------------------
-# "auto"   -> local llama-server when this machine has a >= 16 GB NVIDIA GPU
-#             and the unit is installed, else the claude CLI
-# "claude" -> Claude Code CLI (tools, filesystem, web; needs network)
-# "local"  -> llama-server on this machine (offline, run_shell tool)
-# "dsh"    -> the DeepSeek Harness (DeepSeek's open-source agent runtime, run
-#             locally through its Python SDK) driving that SAME llama-server:
-#             its agent loop, a persistent bash and a file editor, plus the
-#             assistant's web tools over MCP. Same model, different harness.
+# Three tiers, by where the model runs:
+# "local"   -> llama-server on this machine (offline, run_shell tool)
+# "network" -> llama-server elsewhere on the LAN (VOICE_ASSISTANT_NETWORK_URL)
+# "claude"  -> Claude Code CLI, hosted (tools, filesystem, web; needs network)
+# "auto"    -> local when this machine has a >= 16 GB NVIDIA GPU and the unit
+#              is installed (or a server already answers), else network when
+#              a network URL is configured, else claude
+# "dsh"     -> the local tier driven by the DeepSeek Harness (DeepSeek's
+#              open-source agent runtime, run locally through its Python SDK):
+#              its agent loop, a persistent bash and a file editor, plus the
+#              assistant's web tools over MCP. Same model, different harness.
+#              Kept as an alias; a tier's harness is otherwise its _HARNESS.
 LLM_BACKEND = os.getenv("VOICE_ASSISTANT_LLM_BACKEND", "auto").strip().lower()
-# Which harness drives the local model when `auto` lands on it: "native" is
-# the assistant's own tool loop, "dsh" the DeepSeek Harness (if installed).
+LLM_BACKEND = {"hosted": "claude"}.get(LLM_BACKEND, LLM_BACKEND)
+# Which harness drives the local model ("local", `auto`, the toggle): "native"
+# is the assistant's own tool loop, "dsh" the DeepSeek Harness (if installed).
 LOCAL_HARNESS = os.getenv("VOICE_ASSISTANT_LOCAL_HARNESS", "native").strip().lower()
 LOCAL_LLM_UNIT = os.getenv("VOICE_ASSISTANT_LOCAL_UNIT", "qwen38.service")
 # "16 GB" cards report 16303-16384 MiB. Qwen3.8-27B UD-IQ4_XS needs ~15.3 GB
@@ -393,6 +398,58 @@ LOCAL_LLM_TEMP = float(os.getenv("VOICE_ASSISTANT_LOCAL_TEMP", "0.7"))
 LOCAL_LLM_TOP_P = float(os.getenv("VOICE_ASSISTANT_LOCAL_TOP_P", "0.8"))
 LOCAL_LLM_TOP_K = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOP_K", "20"))
 LOCAL_LLM_PRESENCE = float(os.getenv("VOICE_ASSISTANT_LOCAL_PRESENCE_PENALTY", "1.5"))
+
+# The network tier: a llama-server on another machine, same protocol as the
+# local one. No URL, no network tier. The model name is asked of the server
+# when not given (its /v1/models). Timeout and thinking default to the local
+# tier's settings; sampling, history and tools are shared.
+NETWORK_LLM_URL = os.getenv("VOICE_ASSISTANT_NETWORK_URL", "").strip()
+NETWORK_LLM_MODEL = os.getenv("VOICE_ASSISTANT_NETWORK_MODEL", "").strip()
+NETWORK_LLM_API_KEY = os.getenv("VOICE_ASSISTANT_NETWORK_API_KEY", "none")
+NETWORK_HARNESS = os.getenv("VOICE_ASSISTANT_NETWORK_HARNESS", "native").strip().lower()
+NETWORK_LLM_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_NETWORK_TIMEOUT", "").strip()
+                            or LOCAL_LLM_TIMEOUT)
+NETWORK_LLM_THINK = os.getenv("VOICE_ASSISTANT_NETWORK_THINK",
+                              os.getenv("VOICE_ASSISTANT_LOCAL_THINK", "0")).strip().lower() \
+    not in ("0", "false", "no", "off", "")
+
+
+class LlmTier(NamedTuple):
+    """One llama-server tier: where the model runs and how it is driven.
+
+    Built fresh from the module settings on every call (_llm_tier), so a
+    change to one of them -- a test's monkeypatch included -- is seen at once.
+    """
+    name: str           # "local" | "network"
+    url: str            # OpenAI-compatible, normally ending in /v1
+    model: str          # "" while a network server has not said what it serves
+    harness: str        # "native" | "dsh"
+    api_key: str
+    timeout: float
+    think: bool
+
+    @property
+    def base(self) -> str:
+        """The server root, for /health, /props and the harness (no /v1)."""
+        return re.sub(r"/v1/?$", "", self.url.rstrip("/"))
+
+    @property
+    def title(self) -> str:
+        return self.name.capitalize()
+
+
+# What network servers said they serve, by URL (see _detect_served_model).
+_SERVED_MODELS = {}
+
+
+def _llm_tier(name: str = "local") -> LlmTier:
+    if name == "network":
+        return LlmTier("network", NETWORK_LLM_URL,
+                       NETWORK_LLM_MODEL or _SERVED_MODELS.get(NETWORK_LLM_URL, ""),
+                       NETWORK_HARNESS, NETWORK_LLM_API_KEY or "none",
+                       NETWORK_LLM_TIMEOUT, NETWORK_LLM_THINK)
+    return LlmTier("local", LOCAL_LLM_URL, LOCAL_LLM_MODEL, LOCAL_HARNESS,
+                   LOCAL_LLM_API_KEY or "none", LOCAL_LLM_TIMEOUT, LOCAL_LLM_THINK)
 
 # Tool access for the local model. Unrestricted shell by explicit choice -- the
 # Claude backend already runs with --dangerously-skip-permissions, and the user
@@ -764,16 +821,38 @@ DSH_VOICE_PROMPT = (
     + _SHARED_PROMPT_TAIL
 )
 
-# Neither model does the switching: it is a spoken command the assistant handles
-# before any model sees it, and a model that tries with a shell restarts the
-# service it is running in.
-_BACKEND_SWITCH_NOTE = (
-    "\n\nSwitching who answers -- Claude, the local model or the DeepSeek Harness -- is a "
-    "voice command the assistant handles itself. If the user asks you to switch, do not "
-    "run voice-llm, systemctl or anything that restarts voice-assistant.service; tell "
-    "them to say \"switch to Claude\" or \"switch to the local model\".")
-LOCAL_VOICE_PROMPT += _BACKEND_SWITCH_NOTE
-DSH_VOICE_PROMPT += _BACKEND_SWITCH_NOTE
+
+def _identity_note(tier: LlmTier) -> str:
+    """Asked which model it is, a llama-server model with no name to go on
+    guesses -- one network model said it was Claude. Name it, and where it
+    runs: the active tier's, not the local settings'."""
+    who = f"the open-weight model {tier.model}" if tier.model else "an open-weight model"
+    return (f"\n\nYou are {who}, served by llama.cpp at "
+            + re.sub(r"^https?://|/v1/?$", "", tier.url) + " -- not Claude. If asked which "
+            "model you are, say so.")
+
+
+def _backend_switch_note() -> str:
+    """Neither model does the switching: it is a spoken command the assistant
+    handles before any model sees it, and a model that tries with a shell
+    restarts the service it is running in."""
+    if NETWORK_LLM_URL:
+        who = "Claude, the local model, the network model or the DeepSeek Harness"
+        say = ('\"switch to Claude\", \"switch to the local model\" or '
+               '\"switch to the network model\"')
+    else:
+        who = "Claude, the local model or the DeepSeek Harness"
+        say = '\"switch to Claude\" or \"switch to the local model\"'
+    return (
+        f"\n\nSwitching who answers -- {who} -- is a "
+        "voice command the assistant handles itself. If the user asks you to switch, do not "
+        "run voice-llm, systemctl or anything that restarts voice-assistant.service; tell "
+        f"them to say {say}.")
+
+
+def _tier_prompt(base: str, tier: LlmTier) -> str:
+    """LOCAL_VOICE_PROMPT or DSH_VOICE_PROMPT, as the given tier's model hears it."""
+    return base + _identity_note(tier) + _backend_switch_note()
 
 # Where the `assistant` command reaches a running service. In the runtime
 # directory, not the state directory, because it must not outlive the boot.
@@ -1387,15 +1466,17 @@ def _nvidia_gpus():
     return gpus
 
 
-def _local_llm_health(timeout: float = 1.0) -> str:
-    """'ready' | 'loading' | 'down' for the server behind LOCAL_LLM_URL.
+def _llm_health(url: str, timeout: float = 1.0) -> str:
+    """'ready' | 'loading' | 'down' for the llama-server behind `url`.
 
     llama-server opens its port BEFORE the weights are in and answers every
     request with 503 "Loading model" until it can serve -- 5 s warm, ~35 s from
     a cold page cache. Treating that as failure is what produced the
     "PREFLIGHT FAIL ... is qwen38.service running?" line on every boot.
     """
-    base = re.sub(r"/v1/?$", "", LOCAL_LLM_URL.rstrip("/"))
+    if not url:
+        return "down"
+    base = re.sub(r"/v1/?$", "", url.rstrip("/"))
     try:
         with urllib.request.urlopen(base + "/health", timeout=timeout) as r:
             return "ready" if r.status == 200 else "loading"
@@ -1405,6 +1486,30 @@ def _local_llm_health(timeout: float = 1.0) -> str:
         return "down"
 
 
+def _local_llm_health(timeout: float = 1.0) -> str:
+    """_llm_health of the local tier: this machine's own server."""
+    return _llm_health(LOCAL_LLM_URL, timeout)
+
+
+def _detect_served_model(tier: LlmTier, timeout: float = 1.0) -> str:
+    """The model a tier serves: its configured name, else what the server
+    lists first at /v1/models. Remembered by URL, so the server is asked once
+    rather than at every status write; "" while it cannot be reached."""
+    if tier.model:
+        return tier.model
+    try:
+        req = urllib.request.Request(tier.base + "/v1/models",
+                                     headers={"Authorization": f"Bearer {tier.api_key}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        model = str(((data.get("data") or [{}])[0] or {}).get("id") or "")
+    except Exception:
+        return ""
+    if model:
+        _SERVED_MODELS[tier.url] = model
+    return model
+
+
 def _local_model_label(alias: str = None) -> str:
     """'qwen3.8-27b' -> 'Qwen3.8 27B': the local model's name as the panels show it."""
     alias = (alias if alias is not None else LOCAL_LLM_MODEL) or ""
@@ -1412,9 +1517,10 @@ def _local_model_label(alias: str = None) -> str:
     return " ".join(p.upper() if re.fullmatch(r"\d+b", p, re.I) else p[:1].upper() + p[1:] for p in parts)
 
 
-def _local_llm_n_ctx(timeout: float = 1.0) -> int:
-    """The context size llama-server was started with (0 when unknown)."""
-    base = re.sub(r"/v1/?$", "", LOCAL_LLM_URL.rstrip("/"))
+def _local_llm_n_ctx(timeout: float = 1.0, url: str = None) -> int:
+    """The context size llama-server was started with (0 when unknown); the
+    local tier's unless `url` names another server."""
+    base = re.sub(r"/v1/?$", "", (url or LOCAL_LLM_URL).rstrip("/"))
     try:
         with urllib.request.urlopen(base + "/props", timeout=timeout) as r:
             d = json.loads(r.read().decode("utf-8", "replace"))
@@ -1461,17 +1567,25 @@ _EFFORT_WORDS = {"low": "low", "medium": "medium", "high": "high",
 # them (too far by its ratio), and a switch is the one request that must never
 # reach a model with a shell -- it once ran `voice-llm claude` from inside its
 # own tool and restarted the service it was running in.
+_CLAUDE_NAMES = r"claude(?: code)?|clog|clogged|clawed|claud|cloud|clod|klaud|klaude|cloude"
+# (backend, names after a switch verb, names after "use"/"try"). The second
+# list is narrower where the word is ordinary English: "use the local time
+# zone", "use the network printer", "use the hosted docs" are not switches.
 _BACKEND_PHRASES = (
-    ("claude", r"claude(?: code)?|clog|clogged|clawed|claud|cloud|clod|klaud|klaude|cloude"),
-    ("local", r"qwen|quen|gwen|kwen|(?:the )?local(?: model| one| llm)?|llama"),
-    ("dsh", r"(?:the )?harness|deep ?seek|d ?s ?h"),
-    ("auto", r"auto|automatic"),
+    ("claude", _CLAUDE_NAMES + r"|(?:the )?hosted(?: model| one)?",
+     _CLAUDE_NAMES + r"|the hosted model"),
+    ("local", r"qwen|quen|gwen|kwen|(?:the )?local(?: model| one| llm)?|llama",
+     r"qwen|quen|gwen|kwen|the local model|llama"),
+    ("network", r"(?:the )?network(?: model| one| llm)?|(?:the )?cluster",
+     r"the network model|the cluster"),
+    ("dsh", r"(?:the )?harness|deep ?seek|d ?s ?h", None),
+    ("auto", r"auto|automatic", None),
 )
 
 
 def _parse_backend_request(text: str):
-    """The backend a spoken command asks for ('claude', 'local', 'dsh', 'auto'),
-    or None when the sentence is not asking for a switch.
+    """The backend a spoken command asks for ('claude', 'local', 'network',
+    'dsh', 'auto'), or None when the sentence is not asking for a switch.
 
     Narrow on purpose, like _parse_claude_request: a short sentence with a
     switch verb and a destination ("switch to clog please", "go back to the
@@ -1481,12 +1595,10 @@ def _parse_backend_request(text: str):
     s = _normalize_command(text)
     if len(s.split()) > 10:
         return None
-    for value, names in _BACKEND_PHRASES:
+    for value, names, use_names in _BACKEND_PHRASES:
         if re.search(rf"\b(?:switch|change|swap|go|move|hand|talk|flip)\b.*\b(?:to|over|back)\b.*\b(?:{names})\b", s):
             return value
-        if value != "local" and re.search(rf"\b(?:use|try)\b.*\b(?:{names})\b", s):
-            return value
-        if value == "local" and re.search(r"\b(?:use|try)\b.*\b(?:qwen|quen|gwen|kwen|the local model|llama)\b", s):
+        if re.search(rf"\b(?:use|try)\b.*\b(?:{use_names or names})\b", s):
             return value
     return None
 
@@ -2420,6 +2532,10 @@ class DshSession:
         self._seq = 0
         self.prompt_tokens = 0      # largest prompt the server saw on this runtime
         self.turns = 0
+        # The llama-server tier the next runtime is pointed at (the owner sets
+        # it), and the one the running runtime was started against.
+        self.tier = None
+        self.running_tier = None
         self._load_transcript()
 
     @property
@@ -2443,33 +2559,35 @@ class DshSession:
             self._prune_sessions()
             patch = self._write_patch()
             self.session_id = f"voice-{uuid.uuid4().hex[:12]}"
+            tier = self.tier or _llm_tier("local")
             harness = DeepSeekHarness(
                 dsh_home=str(DSH_HOME), cwd=str(Path.home()), profile=self.PROFILE,
                 # The stock DeepSeek adapter speaks OpenAI-style chat completions,
                 # which is what llama-server serves: no custom provider needed.
-                provider="deepseek-official", model=LOCAL_LLM_MODEL,
-                base_url=re.sub(r"/v1/?$", "", LOCAL_LLM_URL.rstrip("/")),
-                api_key=LOCAL_LLM_API_KEY or "none",
+                provider="deepseek-official", model=tier.model,
+                base_url=tier.base, api_key=tier.api_key,
                 # Qwen3.8 reasons unless told not to; the server runs with
                 # --reasoning off and this keeps the adapter from asking.
                 reasoning_effort="off", max_tokens=DSH_MAX_TOKENS,
                 initialize_timeout_seconds=60,
-                request_timeout_seconds=LOCAL_LLM_TIMEOUT,
+                request_timeout_seconds=tier.timeout,
                 patches=(str(patch),),
-                env={"DSH_SYSTEM_PROMPT": DSH_VOICE_PROMPT,
-                     "DSH_CONTEXT_WINDOW": str(self._context_window())})
+                env={"DSH_SYSTEM_PROMPT": _tier_prompt(DSH_VOICE_PROMPT, tier),
+                     "DSH_CONTEXT_WINDOW": str(self._context_window(tier))})
             harness.start()
         except Exception as e:
             self.logger.error(f"DeepSeek Harness failed to start: {str(e)[:400]}")
             return False
         self.harness = harness
+        self.running_tier = tier
         self.turns = 0
         self.prompt_tokens = 0
         # A fresh runtime knows nothing: everything in the ledger is unseen,
         # and the first prompt carries a recap of it.
         self.cursors["dsh"] = 0
         self.logger.info(
-            f"DeepSeek Harness up in {time.time() - t0:.2f}s (session {self.session_id}, "
+            f"DeepSeek Harness up in {time.time() - t0:.2f}s on {tier.model or '?'} at "
+            f"{tier.base} (session {self.session_id}, "
             f"{len(self.transcript)} remembered exchanges, window {self.window} tokens, "
             f"rotate at {self.rotate_at})")
         return True
@@ -2500,7 +2618,7 @@ class DshSession:
         self.stop()
         self.start()
 
-    def _context_window(self) -> int:
+    def _context_window(self, tier: LlmTier = None) -> int:
         """The context the runtime is told about: the server's own n_ctx unless
         VOICE_ASSISTANT_DSH_CONTEXT_WINDOW says otherwise. The rotation point
         follows it (75% of the window, never above DSH_ROTATE_TOKENS), so a
@@ -2508,7 +2626,7 @@ class DshSession:
         instead of refusing the prompt mid-turn."""
         window = DSH_CONTEXT_WINDOW
         if not os.getenv("VOICE_ASSISTANT_DSH_CONTEXT_WINDOW", "").strip():
-            n_ctx = _local_llm_n_ctx()
+            n_ctx = _local_llm_n_ctx(url=tier.url if tier else None)
             if n_ctx > 0:
                 window = n_ctx
         self.window = window
@@ -2846,8 +2964,11 @@ class VoiceAssistant:
         self._loop = None
         self._abort_event = threading.Event()
 
-        # Backend
+        # Backend: `backend` is what drives the turn ("local" = the native
+        # loop, "dsh" = the DeepSeek Harness, "claude"), `llm_tier` which
+        # llama-server the first two talk to ("local" or "network").
         self.backend = "claude"
+        self.llm_tier = "local"
         self._claude_available = False
         self._claude = None              # ClaudeSession when persistent
         self._claude_process = None      # one-shot fallback process
@@ -2931,7 +3052,9 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _resolve_backend(self):
-        """Choose 'local', 'dsh' or 'claude'. Returns (backend, why).
+        """Choose who answers. Returns (backend, tier, why): backend 'local'
+        (the native loop), 'dsh' or 'claude'; tier 'local', 'network' or
+        'claude'.
 
         Reads self.backend_pref rather than the environment, so a runtime
         switch (SUPER+M, `assistant --swap`) goes through the same reasoning as
@@ -2942,62 +3065,112 @@ class VoiceAssistant:
         self._dsh_available = importlib.util.find_spec("deepseek_harness") is not None
         pref = getattr(self, "backend_pref", LLM_BACKEND)
         if pref == "claude":
-            return "claude", "asked for claude"
+            return "claude", "claude", "asked for claude"
         if pref == "local":
-            return "local", "asked for the local model"
-        if pref == "dsh":
+            return self._tier_backend("local"), "local", "asked for the local model"
+        if pref == "network":
+            if NETWORK_LLM_URL:
+                return self._tier_backend("network"), "network", "asked for the network model"
+            self.logger.warning("Asked for the network model but VOICE_ASSISTANT_NETWORK_URL "
+                                "is not set; using auto")
+        elif pref == "dsh":
+            # The alias from before tiers: the local tier, under the harness.
             if self._dsh_available:
-                return "dsh", "asked for the DeepSeek Harness"
-            return "local", ("asked for the DeepSeek Harness but deepseek-harness-sdk "
-                             "is not installed — using the native loop")
-        if pref != "auto":
+                return "dsh", "local", "asked for the DeepSeek Harness"
+            return "local", "local", ("asked for the DeepSeek Harness but deepseek-harness-sdk "
+                                      "is not installed — using the native loop")
+        elif pref != "auto":
             self.logger.warning(f"Unknown backend preference {pref!r}; using auto")
 
+        local, why = self._local_tier_state()
+        if local in ("ready", "starting"):
+            return self._tier_backend("local"), "local", why
+        # Not on this machine. A network URL is a deliberate setting, so it
+        # wins over Claude even while that server is not answering: a down
+        # server costs only the per-query fallback, while settling on Claude
+        # would never come back to it.
+        if NETWORK_LLM_URL:
+            return self._tier_backend("network"), "network", f"{why}; network model at {NETWORK_LLM_URL}"
+        return "claude", "claude", why
+
+    def _local_tier_state(self):
+        """Whether this machine can run its own model, the way `auto` decides it.
+        Returns (state, why): 'ready' (a server answers), 'starting' (the unit
+        is up and loading), 'stopped' or 'failed' (installed, on a card that
+        qualifies, not running), 'absent' (no card or no unit)."""
         # A server that already answers wins: it may be on a GPU nvidia-smi
         # cannot see, or somewhere else entirely.
         health = _local_llm_health()
         if health != "down":
-            return self._local_backend(), f"llama-server is {health} at {LOCAL_LLM_URL}"
+            return "ready", f"llama-server is {health} at {LOCAL_LLM_URL}"
 
         gpus = _nvidia_gpus()
         if not gpus:
-            return "claude", "no NVIDIA GPU visible to nvidia-smi"
+            return "absent", "no NVIDIA GPU visible to nvidia-smi"
         name, total, _used = max(gpus, key=lambda g: g[1])
         if total < LOCAL_LLM_MIN_VRAM_MIB:
-            return "claude", f"{name}: {total} MiB VRAM < {LOCAL_LLM_MIN_VRAM_MIB} MiB needed"
+            return "absent", f"{name}: {total} MiB VRAM < {LOCAL_LLM_MIN_VRAM_MIB} MiB needed"
 
         unit = _user_unit(LOCAL_LLM_UNIT)
         if unit.get("LoadState") != "loaded":
-            return "claude", f"{name} qualifies but {LOCAL_LLM_UNIT} is not installed (run setup.sh)"
+            return "absent", f"{name} qualifies but {LOCAL_LLM_UNIT} is not installed (run setup.sh)"
         state = unit.get("ActiveState", "inactive")
         if state in ("active", "activating", "reloading"):
-            return self._local_backend(), f"{name} {total} MiB, {LOCAL_LLM_UNIT} {unit.get('SubState')}"
+            return "starting", f"{name} {total} MiB, {LOCAL_LLM_UNIT} {unit.get('SubState')}"
         if state == "failed":
-            return "claude", f"{LOCAL_LLM_UNIT} failed — journalctl --user -u {LOCAL_LLM_UNIT}"
-        return "claude", f"{LOCAL_LLM_UNIT} is {state} — `voice-llm qwen` starts it"
+            return "failed", f"{LOCAL_LLM_UNIT} failed — journalctl --user -u {LOCAL_LLM_UNIT}"
+        return "stopped", f"{LOCAL_LLM_UNIT} is {state} — `voice-llm qwen` starts it"
+
+    def _tier_backend(self, tier: str) -> str:
+        """Which harness drives a llama-server tier: its _HARNESS setting."""
+        cfg = _llm_tier(tier)
+        if cfg.harness == "dsh":
+            if self._dsh_available:
+                return "dsh"
+            self.logger.warning(f"VOICE_ASSISTANT_{tier.upper()}_HARNESS=dsh but "
+                                "deepseek-harness-sdk is not installed — using the native loop")
+        return "local"
 
     def _local_backend(self) -> str:
         """Which harness drives the local model when the choice is ours."""
-        if LOCAL_HARNESS == "dsh":
-            if self._dsh_available:
-                return "dsh"
-            self.logger.warning("VOICE_ASSISTANT_LOCAL_HARNESS=dsh but deepseek-harness-sdk "
-                                "is not installed — using the native loop")
-        return "local"
+        return self._tier_backend("local")
+
+    def _set_llm_tier(self, tier: str):
+        """Point the local and dsh backends at a tier ('claude' leaves them on
+        the local one)."""
+        self.llm_tier = tier if tier in ("local", "network") else "local"
+
+    def _llm(self) -> LlmTier:
+        """The llama-server tier the local and dsh backends talk to now. On
+        Claude it is the local one: what the router means by "local"."""
+        return _llm_tier(getattr(self, "llm_tier", "local") or "local")
+
+    @property
+    def tier(self) -> str:
+        """Who answers, as the user thinks of it: 'local', 'network' or 'claude'."""
+        if getattr(self, "backend", None) == "claude":
+            return "claude"
+        return getattr(self, "llm_tier", "local") or "local"
 
     def _preflight_checks(self):
         """Verify runtime requirements. Never fatal: a degraded assistant that
         says why is more useful than one that refuses to start."""
         self.backend_pref = LLM_BACKEND
-        self.backend, why = self._resolve_backend()
-        self.logger.info(f"LLM backend: {self.backend} ({why})")
+        self.backend, tier, why = self._resolve_backend()
+        self._set_llm_tier(tier)
+        self.logger.info(f"LLM backend: {self.backend} on the {self.tier} tier ({why})")
 
+        state = "down"
         if self.backend in ("local", "dsh"):
-            state = _local_llm_health()
-            self.logger.info(f"Local LLM at {LOCAL_LLM_URL}: {state}")
+            llm = self._llm()
+            state = _llm_health(llm.url)
+            if state == "ready" and not llm.model:
+                llm = llm._replace(model=_detect_served_model(llm))
+            self.logger.info(f"{llm.title} LLM at {llm.url}: {state}"
+                             + (f", serving {llm.model}" if llm.model else ""))
         if self._dsh_available:
             self.logger.info(f"DeepSeek Harness SDK: installed (home {DSH_HOME})")
-        elif self.backend_pref == "dsh" or LOCAL_HARNESS == "dsh":
+        elif self.backend_pref == "dsh" or "dsh" in (LOCAL_HARNESS, NETWORK_HARNESS):
             self.logger.warning("PREFLIGHT WARN: deepseek-harness-sdk not installed — "
                                 "run setup.sh, or pip install deepseek-harness-sdk")
             if state != "ready" and not self._claude_available:
@@ -3871,7 +4044,11 @@ class VoiceAssistant:
         status_file = self.state_dir / "status"
         symbols = {"off": "◯", "ready": "●", "listening": "◉",
                    "thinking": "◈", "speaking": "◆"}
-        which = backend or self.backend
+        driver = backend or self.backend
+        llm = self._llm()
+        # `local`, `dsh` and `claude` as before; the network tier, under either
+        # harness, is `network` (`label` says which harness).
+        which = "network" if driver != "claude" and llm.name == "network" else driver
         payload = {
             "text": symbols.get(state, ""),
             "class": [state, which],
@@ -3880,12 +4057,15 @@ class VoiceAssistant:
             # Extra keys for the indicator's model menu. waybar ignores what it
             # does not know, so this stays a valid custom-module payload.
             # `model`/`effort` are Claude's settings and mean something only when
-            # `backend` is claude; a local backend's model is `local_model`.
+            # `backend` is claude; a llama-server tier's model is `local_model`
+            # (the active tier's, network included).
+            "tier": "claude" if driver == "claude" else llm.name,
+            "label": self._backend_label(driver),
             "model": CLAUDE_MODEL,
             "effort": CLAUDE_EFFORT,
             "models": list(CLAUDE_MODELS),
             "efforts": list(CLAUDE_EFFORTS),
-            "local_model": _local_model_label(),
+            "local_model": _local_model_label(llm.model),
         }
         try:
             tmp = status_file.with_suffix(".tmp")
@@ -4138,13 +4318,18 @@ class VoiceAssistant:
     # ------------------------------------------------------------------
 
     def _local_llm_client(self):
-        if self._local_client is None:
+        """The OpenAI client for the active tier's server, replaced when the
+        tier changes (it is bound to one base URL)."""
+        llm = self._llm()
+        key = (llm.url, llm.api_key, llm.timeout)
+        if self._local_client is None or getattr(self, "_local_client_key", None) != key:
             from openai import OpenAI
             self._local_client = OpenAI(
-                base_url=LOCAL_LLM_URL,
-                api_key=LOCAL_LLM_API_KEY or "none",
-                timeout=LOCAL_LLM_TIMEOUT,
+                base_url=llm.url,
+                api_key=llm.api_key,
+                timeout=llm.timeout,
                 max_retries=0)
+            self._local_client_key = key
         return self._local_client
 
     # The web tools live in web_tools.py, so dsh_web_mcp.py can serve the very
@@ -4329,7 +4514,8 @@ class VoiceAssistant:
         v = self._router_verdict
         hard = bool(v is not None and getattr(v, "hard", False))
         use_hard = hard and allow_hard and self._hard_backend_ready()
-        model = LOCAL_LLM_MODEL
+        llm = self._llm()
+        model = llm.model
         if use_hard:
             try:
                 client = self._hard_llm_client()
@@ -4337,7 +4523,7 @@ class VoiceAssistant:
                 self.logger.warning(f"Hard backend client failed ({e}); answering locally")
                 use_hard = False
         if use_hard:
-            model = HARD_MODEL or LOCAL_LLM_MODEL
+            model = HARD_MODEL or llm.model
             think = HARD_THINK
             messages = [{"role": "system", "content": self._hard_voice_prompt()}]
             messages.extend(self._history_tail(self._local_history, HARD_HISTORY_TURNS))
@@ -4347,8 +4533,8 @@ class VoiceAssistant:
             # Thinking on demand: the router's hard verdict turns Qwen's reasoning on for this
             # turn only, under LOCAL_THINK_BUDGET tokens (llama.cpp closes the think block at
             # the budget and the answer follows).
-            think = LOCAL_LLM_THINK or (hard and ROUTER_THINK)
-            messages = [{"role": "system", "content": LOCAL_VOICE_PROMPT}]
+            think = llm.think or (hard and ROUTER_THINK)
+            messages = [{"role": "system", "content": _tier_prompt(LOCAL_VOICE_PROMPT, llm)}]
             messages.extend(self._local_history)
         messages.append({"role": "user", "content": text})
         turn_start = len(messages) - 1
@@ -4362,9 +4548,9 @@ class VoiceAssistant:
             "presence_penalty": LOCAL_LLM_PRESENCE,
             "chat_template_kwargs": {"enable_thinking": bool(think)},
         }
-        if think and LOCAL_THINK_BUDGET > 0 and not (LOCAL_LLM_THINK and not use_hard):
+        if think and LOCAL_THINK_BUDGET > 0 and not (llm.think and not use_hard):
             extra_body["reasoning_budget_tokens"] = LOCAL_THINK_BUDGET
-        if use_hard or (think and not LOCAL_LLM_THINK):
+        if use_hard or (think and not llm.think):
             if think:
                 self.logger.info(f"Router: thinking on for this turn (hard), budget {LOCAL_THINK_BUDGET} tokens")
             self._say_filler(LOCAL_THINK_FILLER)
@@ -4596,6 +4782,15 @@ class VoiceAssistant:
     def _ensure_dsh_session(self) -> bool:
         if self._dsh is None:
             self._dsh = DshSession(self.logger)
+        tier = self._llm()
+        self._dsh.tier = tier
+        running = self._dsh.running_tier
+        if self._dsh.alive and running is not None and (running.url, running.model) != (tier.url, tier.model):
+            # The runtime is bound to one server at start. After a tier switch
+            # it is replaced; the new one is seeded with the recap like any
+            # fresh runtime, so the conversation carries over.
+            self.logger.info(f"DeepSeek Harness: {running.name} -> {tier.name} tier, restarting it")
+            self._dsh.stop()
         if not self._dsh.alive:
             return self._dsh.start()
         return True
@@ -5101,30 +5296,58 @@ class VoiceAssistant:
     def _pick_backend_for_query(self) -> str:
         """Per-query decision; may fall back to claude with an audible cue.
 
-        Both local backends need llama-server, so both fall back the same way
-        while it is loading or down -- and the check here is what keeps the
-        harness's own five retries (17 s, measured) from ever being paid.
+        Both llama-server backends fall back the same way while the active
+        tier's server is loading or down, on this machine or the network --
+        and the check here is what keeps the harness's own five retries (17 s,
+        measured) from ever being paid.
         """
         routed = self._router_route()
         if routed is not None:
             return routed
         if self.backend not in ("local", "dsh"):
             return "claude"
-        state = _local_llm_health()
+        llm = self._llm()
+        state = _llm_health(llm.url)
         if state == "ready":
+            if not llm.model:
+                _detect_served_model(llm)   # was down when the tier was chosen
             return self.backend
         if LLM_FALLBACK and self._claude_available:
             self._cue_fallback(state)
             return "claude"
         return self.backend
 
-    BACKEND_LABEL = {"local": "Local Qwen3.8", "dsh": "DeepSeek Harness · Qwen3.8",
-                     "claude": "Claude"}
-    # What `toggle` cycles through, in this order (dsh only when installed).
-    BACKEND_CYCLE = ("local", "dsh", "claude")
+    def _backend_label(self, backend: str = None, spoken: bool = False) -> str:
+        """Who answers: "Local · qwen3.8-27b", "Network · qwen3.8-flash-next",
+        "Claude", with " · DeepSeek Harness" when it drives the model. Spoken,
+        just "the network model": a model id read aloud is a mouthful of noise."""
+        backend = backend or self.backend
+        if backend == "claude":
+            return "Claude"
+        llm = self._llm()
+        if spoken:
+            return f"the {llm.name} model" + (" under the DeepSeek Harness" if backend == "dsh" else "")
+        return " · ".join([llm.title] + ([llm.model] if llm.model else [])
+                          + (["DeepSeek Harness"] if backend == "dsh" else []))
+
+    # What `toggle` cycles through, in this order, skipping a tier this machine
+    # does not have (see _tier_available). The DeepSeek Harness is not a stop:
+    # it is how a tier is driven (VOICE_ASSISTANT_<TIER>_HARNESS).
+    BACKEND_CYCLE = ("local", "network", "claude")
+
+    def _tier_available(self, tier: str) -> bool:
+        """Worth a stop in the cycle. Local: as `auto` judges it, except that an
+        installed unit that is stopped counts, since switching starts it."""
+        if tier == "local":
+            return self._local_tier_state()[0] != "absent"
+        if tier == "network":
+            return bool(NETWORK_LLM_URL)
+        return self._claude_available
 
     def _switch_backend(self, value: str) -> dict:
-        """Change which model answers. 'local' | 'dsh' | 'claude' | 'auto' | 'toggle'.
+        """Change which model answers: 'local' | 'network' | 'claude' (or
+        'hosted') | 'dsh' | 'auto' | 'toggle'. 'dsh' is the local tier under
+        the DeepSeek Harness, as it was before there were tiers.
 
         The preference is written back to the env file so it survives a restart
         and `voice-llm status` agrees with what is actually happening. The local
@@ -5134,31 +5357,47 @@ class VoiceAssistant:
         to free the card for GPU passthrough, and a hotkey should not do that
         by surprise.
         """
+        value = {"hosted": "claude"}.get(value, value)
+        self._claude_available = shutil.which("claude") is not None
         if value == "toggle":
-            cycle = [b for b in self.BACKEND_CYCLE if b != "dsh" or self._dsh_available]
-            current = self.backend if self.backend in cycle else cycle[-1]
-            value = cycle[(cycle.index(current) + 1) % len(cycle)]
-        if value not in ("local", "dsh", "claude", "auto"):
+            cycle = self.BACKEND_CYCLE
+            i = cycle.index(self.tier)
+            # Lazily: the local check runs nvidia-smi, only worth it when reached.
+            value = next((t for t in cycle[i + 1:] + cycle[:i] if self._tier_available(t)),
+                         self.tier)
+        if value not in ("local", "network", "dsh", "claude", "auto"):
             return {"ok": False, "error": f"unknown backend {value!r}"}
+        if value == "network" and not NETWORK_LLM_URL:
+            return {"ok": False, "error": "no network model is configured"}
 
         self.backend_pref = value
-        self.backend, why = self._resolve_backend()
+        self.backend, tier, why = self._resolve_backend()
+        self._set_llm_tier(tier)
         _write_env_setting("VOICE_ASSISTANT_LLM_BACKEND", value)
 
         note = ""
         if self.backend in ("local", "dsh"):
-            state = _local_llm_health()
-            if state != "ready":
+            llm = self._llm()
+            state = _llm_health(llm.url)
+            if state == "ready" and not llm.model:
+                _detect_served_model(llm)   # for the label; asked once per server
+            if state != "ready" and llm.name == "local":
                 started = _start_user_unit(LOCAL_LLM_UNIT)
                 note = (" (loading, Claude answers meanwhile)" if started
                         else f" ({LOCAL_LLM_UNIT} would not start)")
                 self.logger.info(f"Backend -> {self.backend}; server {state}, start={started}")
+            elif state != "ready":
+                # Another machine's server: nothing here can start it.
+                note = (" (" + ("loading" if state == "loading" else "not answering")
+                        + (", Claude answers meanwhile)" if LLM_FALLBACK and self._claude_available
+                           else ")"))
+                self.logger.info(f"Backend -> {self.backend} on {llm.url}; server {state}")
             elif self.backend == "dsh":
                 # Boot the harness now, off the caller's thread, so its ~1.4 s
                 # is not on the user's first question.
                 threading.Thread(target=self._ensure_dsh_session, daemon=True).start()
-        label = self.BACKEND_LABEL.get(self.backend, self.backend)
-        self.logger.info(f"Backend switched to {self.backend} ({why}){note}")
+        label = self._backend_label()
+        self.logger.info(f"Backend switched to {self.backend} on the {self.tier} tier ({why}){note}")
         # Into the transcript as well. The popup is transient, and a swap is
         # the one status event the transcript cannot infer: if a later reply
         # reads oddly, knowing the model changed just before it is exactly the
@@ -5167,17 +5406,19 @@ class VoiceAssistant:
         self._notify(f"🔀 {label}{note}", title="Assistant model", transient=True,
                      timeout_ms=3000, slot="backend")
         self._set_status("ready" if self.is_active else "off")
-        return {"ok": True, "backend": self.backend, "preference": self.backend_pref,
-                "label": label, "why": why, "note": note.strip()}
+        return {"ok": True, "backend": self.backend, "tier": self.tier,
+                "preference": self.backend_pref, "label": label, "why": why,
+                "note": note.strip()}
 
     def _cue_fallback(self, why):
-        """Make it obvious this answer is coming from Claude, not the local model."""
+        """Make it obvious this answer is coming from Claude, not the tier's model."""
         label = {"loading": "still loading", "down": "not running",
                  "failed": "failed mid-answer"}.get(why, str(why))
-        self.logger.warning(f"Local LLM {why} — this query goes to claude")
+        title = self._llm().title
+        self.logger.warning(f"{title} LLM {why} — this query goes to claude")
         self._play_chime_async("fallback")
-        self._append_transcript("system", f"Local model {label} — this turn went to Claude")
-        self._notify(f"☁️ Local model {label} — asking Claude", transient=True,
+        self._append_transcript("system", f"{title} model {label} — this turn went to Claude")
+        self._notify(f"☁️ {title} model {label} — asking Claude", transient=True,
                      slot="progress")
         self._set_status("thinking", backend="claude")
 
@@ -5585,9 +5826,9 @@ class VoiceAssistant:
                     self.logger.info("Router: wanted Claude, but the claude CLI is not installed")
                     return None
                 target = "claude"
-            label = self.BACKEND_LABEL.get(target, target)
+            label = self._backend_label(target)
             self.logger.info(f"Router: this turn goes to {target} "
-                             f"({self.BACKEND_LABEL.get(self.backend, self.backend)} is the default)")
+                             f"({self._backend_label()} is the default)")
             # The transcript is the record, and a swap is the one thing it
             # cannot infer. Silent otherwise: this can happen on any turn, and
             # a chime each time would make the routing the loudest thing here.
@@ -6019,7 +6260,7 @@ class VoiceAssistant:
         llama-server is still loading; not worth its ~250 MB when the native
         loop will. The DeepSeek Harness (~1.4 s) when that is the backend.
         """
-        health = _local_llm_health()
+        health = _llm_health(self._llm().url)
         if self.backend == "dsh" and health == "ready":
             self._ensure_dsh_session()
             return
@@ -6055,9 +6296,11 @@ class VoiceAssistant:
             if state != prev:
                 if state == "ready":
                     # backend_pref, not the startup env: a runtime switch to
-                    # Claude must not be undone by the server coming back.
-                    if self.backend not in ("local", "dsh") and self.backend_pref == "auto":
+                    # Claude must not be undone by the server coming back. Under
+                    # auto this machine's model also outranks the network's.
+                    if self.tier != "local" and self.backend_pref == "auto":
                         self.backend = self._local_backend()
+                        self._set_llm_tier("local")
                         self.logger.info(f"Local LLM is up — switching to {self.backend}")
                     if self.backend == "dsh" and self.is_active:
                         threading.Thread(target=self._ensure_dsh_session, daemon=True).start()
@@ -6323,16 +6566,25 @@ class VoiceAssistant:
     async def _control_command(self, req: dict) -> dict:
         cmd = str(req.get("cmd", "")).strip()
         if cmd == "status":
+            # Off the loop: a network server that is down costs its timeout.
+            local, network = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: (_local_llm_health(),
+                               _llm_health(NETWORK_LLM_URL) if NETWORK_LLM_URL else None))
             return {"ok": True, "backend": self.backend,
                     "preference": self.backend_pref,
-                    "label": self.BACKEND_LABEL.get(self.backend, self.backend),
-                    "local_llm": _local_llm_health(),
+                    "tier": self.tier,
+                    "label": self._backend_label(),
+                    "local_llm": local,
+                    "network_llm": network,
                     "dsh": ("running" if self._dsh is not None and self._dsh.alive
                             else "installed" if self._dsh_available else "not installed"),
                     "voice_active": self.is_active, "busy": self.is_processing,
                     "session": self._session_id}
         if cmd == "backend":
-            return self._switch_backend(str(req.get("value", "toggle")))
+            # Off the loop too: the toggle may probe nvidia-smi, systemd and
+            # both servers before it knows where it is going.
+            return await asyncio.get_running_loop().run_in_executor(
+                None, self._switch_backend, str(req.get("value", "toggle")))
         if cmd == "claude":
             return self.set_claude_setting(req.get("model"), req.get("effort"))
         if cmd == "new_session":
@@ -6521,12 +6773,13 @@ class VoiceAssistant:
             want_backend = _parse_backend_request(transcription)
             if want_backend:
                 self.logger.info(f"Voice command: backend -> {want_backend} ({transcription})")
-                before = self.backend
+                # Both: local -> network keeps the same harness.
+                before = (self.backend, self.tier)
                 res = await loop.run_in_executor(None, self._switch_backend, want_backend)
-                label = self.BACKEND_LABEL.get(self.backend, self.backend)
+                label = self._backend_label(spoken=True)
                 if not res.get("ok", True):
                     line = f"Sorry, {res.get('error', 'that did not work')}."
-                elif self.backend == before:
+                elif (self.backend, self.tier) == before:
                     line = f"Already on {label}."
                 else:
                     line = f"Switched to {label}."

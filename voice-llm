@@ -2,7 +2,10 @@
 # Switch the voice assistant between the Claude Code CLI and the local
 # Qwen3.8-27B llama-server, and start/stop the model server to match.
 #
-#   voice-llm status | auto | claude | qwen | dsh | logs
+#   voice-llm status | auto | claude | qwen | network | dsh | logs
+#
+# `network` is a llama-server on another machine (VOICE_ASSISTANT_NETWORK_URL
+# in the env file); nothing here starts or stops it.
 #
 # `dsh` is the same local model driven by the DeepSeek Harness (DeepSeek's
 # open-source agent runtime, run locally through its Python SDK) instead of the
@@ -32,6 +35,7 @@ env_value() {
 }
 SERVER="$(env_value VOICE_ASSISTANT_LOCAL_UNIT)"; SERVER="${SERVER:-qwen38.service}"
 MODEL_NAME="$(env_value VOICE_ASSISTANT_LOCAL_MODEL)"; MODEL_NAME="${MODEL_NAME:-qwen3.8-27b}"
+NETWORK_URL="$(env_value VOICE_ASSISTANT_NETWORK_URL)"
 HEALTH="http://127.0.0.1:8081/health"
 MIN_VRAM=15000
 
@@ -80,18 +84,22 @@ gpu_vram() {   # "<name>|<total MiB>" for the largest card, or nothing
 # will actually do, not just what is configured.
 resolve_backend() {
     local cfg="$1" gpu total st
-    case "$cfg" in claude|local|dsh) echo "$cfg (forced)"; return;; esac
+    case "$cfg" in claude|local|dsh) echo "$cfg (forced)"; return;; hosted) echo "claude (forced)"; return;; esac
+    if [[ "$cfg" == network && -n "$NETWORK_URL" ]]; then echo "network (forced, $NETWORK_URL)"; return; fi
+    # Where auto settles when this machine cannot run its own model.
+    local other=claude
+    [[ -n "$NETWORK_URL" ]] && other=network
     st=$(server_state)
     [[ "$st" != down ]] && { echo "local (server $st)"; return; }
-    gpu=$(gpu_vram) || { echo "claude (no NVIDIA GPU)"; return; }
+    gpu=$(gpu_vram) || { echo "$other (no NVIDIA GPU)"; return; }
     total=${gpu#*|}
-    (( total < MIN_VRAM )) && { echo "claude (${gpu%|*}: ${total} MiB < ${MIN_VRAM} MiB)"; return; }
+    (( total < MIN_VRAM )) && { echo "$other (${gpu%|*}: ${total} MiB < ${MIN_VRAM} MiB)"; return; }
     [[ "$(systemctl --user show -p LoadState --value "$SERVER" 2>/dev/null)" == loaded ]] \
-        || { echo "claude ($SERVER not installed — run setup.sh)"; return; }
+        || { echo "$other ($SERVER not installed — run setup.sh)"; return; }
     case "$(systemctl --user is-active "$SERVER" 2>/dev/null)" in
         active|activating) echo "local (model loading)";;
-        failed)            echo "claude ($SERVER failed)";;
-        *)                 echo "claude ($SERVER stopped — voice-llm qwen)";;
+        failed)            echo "$other ($SERVER failed)";;
+        *)                 echo "$other ($SERVER stopped — voice-llm qwen)";;
     esac
 }
 
@@ -164,7 +172,9 @@ case "${1:-status}" in
     # adopts it within three seconds, so there is no restart to wait through.
     was=$(current_backend)
     set_backend auto
-    [[ "$was" == "claude" ]] && restart_assistant
+    # Away from anything forced but the local model itself (claude, network,
+    # dsh), the running assistant has to re-read it.
+    case "$was" in auto|local) ;; *) restart_assistant ;; esac
     ok "Voice assistant answers with the LOCAL $MODEL_NAME (run_shell tool, offline)"
     ;;
 
@@ -199,6 +209,22 @@ case "${1:-status}" in
     ok "Voice assistant answers with the DEEPSEEK HARNESS on the local $MODEL_NAME (bash, editor, web tools)"
     ;;
 
+  network)
+    if [[ -z "$NETWORK_URL" ]]; then
+        err "No network model: set VOICE_ASSISTANT_NETWORK_URL in $ENV_FILE"
+        exit 1
+    fi
+    # Same as dsh: over the control socket when the assistant is up.
+    if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/voice-assistant.sock" ]] \
+        && command -v assistant &>/dev/null && assistant --backend network &>/dev/null; then
+        :
+    else
+        set_backend network
+        restart_assistant
+    fi
+    ok "Voice assistant answers with the NETWORK model at $NETWORK_URL"
+    ;;
+
   claude)
     set_backend claude
     restart_assistant
@@ -217,7 +243,7 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: voice-llm [status|auto|claude|qwen|dsh|logs]"
+    echo "usage: voice-llm [status|auto|claude|qwen|network|dsh|logs]"
     echo
     echo "  status   what is configured, what it resolves to, and why"
     echo "  auto     pick per machine: local model if it fits, Claude otherwise (default)"

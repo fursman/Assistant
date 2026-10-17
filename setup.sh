@@ -349,20 +349,22 @@ else
     log_info "Writing $ENV_FILE (backend=auto)"
     cat > "$ENV_FILE" << 'ENVEOF'
 # Voice assistant runtime configuration (read by voice-assistant.service).
-# Switch backends with:  voice-llm auto | claude | qwen | dsh   (or the swap key)
+# Switch backends with:  voice-llm auto | claude | qwen | network | dsh   (or the swap key)
 #
-# auto   = local llama-server when this machine has a >= 16 GB NVIDIA GPU and
-#          qwen38.service is installed, else the Claude Code CLI
-# claude = Claude Code CLI (tools, filesystem, web; needs network)
-# local  = llama-server on this machine (Qwen3.8-27B + run_shell tool, offline)
-# dsh    = the same llama-server, driven by the DeepSeek Harness (DeepSeek's
-#          open-source agent runtime, run locally): bash, editor, web tools
+# auto    = local llama-server when this machine has a >= 16 GB NVIDIA GPU and
+#           qwen38.service is installed, else the network model if one is
+#           configured below, else the Claude Code CLI
+# claude  = Claude Code CLI, hosted (tools, filesystem, web; needs network)
+# local   = llama-server on this machine (Qwen3.8-27B + run_shell tool, offline)
+# network = a llama-server elsewhere on the LAN (VOICE_ASSISTANT_NETWORK_URL)
+# dsh     = the local llama-server, driven by the DeepSeek Harness (DeepSeek's
+#           open-source agent runtime, run locally): bash, editor, web tools
 VOICE_ASSISTANT_LLM_BACKEND=auto
-# Which harness `auto` uses for the local model: native (the assistant's own
-# tool loop) or dsh (the DeepSeek Harness).
+# Which harness drives the local model: native (the assistant's own tool
+# loop) or dsh (the DeepSeek Harness).
 VOICE_ASSISTANT_LOCAL_HARNESS=native
-# Answer with Claude for a single query while the local model is loading or
-# down, instead of telling the user the model did not answer.
+# Answer with Claude for a single query while the local or network model is
+# loading or down, instead of telling the user the model did not answer.
 VOICE_ASSISTANT_LLM_FALLBACK=1
 
 # --- local backend (ignored when the backend resolves to claude) ---
@@ -375,6 +377,13 @@ VOICE_ASSISTANT_LOCAL_THINK=0
 # Reasoning tokens a turn the router calls hard may spend, on top of the reply cap.
 # About 35 tok/s, so the full budget is a wait of roughly four minutes.
 VOICE_ASSISTANT_LOCAL_THINK_BUDGET=8192
+
+# --- network backend (a llama-server on another machine; unset = none) ---
+# The swap key cycles local -> network -> Claude, skipping what is not here.
+# The model name is asked of the server when not given.
+#VOICE_ASSISTANT_NETWORK_URL=http://llm.lan:8080/v1
+#VOICE_ASSISTANT_NETWORK_MODEL=
+#VOICE_ASSISTANT_NETWORK_HARNESS=native
 
 # --- tool access for the local model ---
 # 1 = the model can run arbitrary shell commands (parity with the Claude

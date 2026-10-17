@@ -33,8 +33,16 @@ import voice_assistant as va  # noqa: E402
     ("switch to deep seek", "dsh"),
     ("switch to auto", "auto"),
     ("use claude for this", "claude"),
+    ("switch to the network model", "network"),
+    ("go over to the cluster", "network"),
+    ("use the cluster", "network"),
+    ("switch to hosted", "claude"),
+    ("use the hosted model", "claude"),
+    ("switch back to local", "local"),
     # not commands
     ("use the local time zone", None),
+    ("use the network printer", None),
+    ("use the hosted docs", None),
     ("claude is good at this sort of thing", None),
     ("the cloud looks heavy today", None),
     ("switch to fable", None),                      # a Claude model, not a backend
@@ -183,3 +191,133 @@ def test_a_spoken_effort_change_applies_at_once(tmp_path, monkeypatch):
     host.is_processing = True
     res = host.set_claude_setting("fable")
     assert res["deferred"] and va.CLAUDE_MODEL == "opus" and host._claude_pending_model == "fable"
+
+
+# --- tiers: local, network, hosted -------------------------------------------------
+
+class TierHost(va.VoiceAssistant):
+    """The backend choice alone: no audio, no CLI, no servers."""
+    def __init__(self, state_dir, local="absent", claude=True):
+        self.logger = logging.getLogger("test-tiers")
+        self.state_dir = state_dir
+        self.backend, self.llm_tier, self.backend_pref = "claude", "local", "auto"
+        self._status_state = "ready"
+        self.is_active = False
+        self._dsh = None
+        self._dsh_available = False
+        self._claude_available = claude
+        self._router_verdict = None
+        self._local_state = local
+        self.notes = []
+
+    def _local_tier_state(self):
+        return self._local_state, f"local is {self._local_state}"
+
+    def _append_transcript(self, role, text): pass
+    def _notify(self, text, **k): self.notes.append(text)
+
+
+@pytest.fixture
+def tiers(monkeypatch):
+    """A network model configured, nothing reachable, nothing written."""
+    monkeypatch.setattr(va, "NETWORK_LLM_URL", "http://llm.lan:8080/v1")
+    monkeypatch.setattr(va, "NETWORK_LLM_MODEL", "qwen3.8-flash-next")
+    monkeypatch.setattr(va, "NETWORK_HARNESS", "native")
+    monkeypatch.setattr(va, "LOCAL_HARNESS", "native")
+    monkeypatch.setattr(va, "LOCAL_LLM_MODEL", "qwen3.8-27b")
+    monkeypatch.setattr(va.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(va, "_write_env_setting", lambda key, value: None)
+    monkeypatch.setattr(va, "_llm_health", lambda url, timeout=1.0: "ready")
+    monkeypatch.setattr(va, "_start_user_unit", lambda unit: True)
+
+
+def test_only_local_settings_make_the_local_tier_as_before(monkeypatch):
+    monkeypatch.setattr(va, "NETWORK_LLM_URL", "")
+    llm = va._llm_tier("local")
+    assert (llm.url, llm.model, llm.harness) == (va.LOCAL_LLM_URL, va.LOCAL_LLM_MODEL, va.LOCAL_HARNESS)
+    assert llm.base == va.LOCAL_LLM_URL.rstrip("/").removesuffix("/v1")
+    assert va._backend_switch_note().count("network") == 0
+
+
+def test_toggle_without_a_gpu_flips_between_network_and_claude(tmp_path, tiers):
+    host = TierHost(tmp_path, local="absent")
+    seen = [host._switch_backend("toggle")["tier"] for _ in range(4)]
+    assert seen == ["network", "claude", "network", "claude"]
+
+
+def test_toggle_cycles_all_three_tiers_and_skips_a_missing_one(tmp_path, tiers, monkeypatch):
+    host = TierHost(tmp_path, local="ready")
+    seen = [host._switch_backend("toggle")["tier"] for _ in range(4)]
+    assert seen == ["local", "network", "claude", "local"]
+    monkeypatch.setattr(va, "NETWORK_LLM_URL", "")
+    seen = [host._switch_backend("toggle")["tier"] for _ in range(3)]
+    assert seen == ["claude", "local", "claude"]
+
+
+def test_auto_prefers_local_then_network_then_claude(tmp_path, tiers, monkeypatch):
+    assert TierHost(tmp_path, local="starting")._resolve_backend()[:2] == ("local", "local")
+    assert TierHost(tmp_path, local="stopped")._resolve_backend()[:2] == ("local", "network")
+    monkeypatch.setattr(va, "NETWORK_LLM_URL", "")
+    assert TierHost(tmp_path, local="absent")._resolve_backend()[:2] == ("claude", "claude")
+
+
+def test_dsh_is_the_local_tier_under_the_harness(tmp_path, tiers, monkeypatch):
+    host = TierHost(tmp_path, local="absent")
+    host.backend_pref = "dsh"
+    monkeypatch.setattr(va.importlib.util, "find_spec", lambda name: object())
+    assert host._resolve_backend()[:2] == ("dsh", "local")
+    # The network tier takes the harness from its own setting.
+    monkeypatch.setattr(va, "NETWORK_HARNESS", "dsh")
+    host.backend_pref = "network"
+    assert host._resolve_backend()[:2] == ("dsh", "network")
+
+
+def test_network_tier_is_what_the_model_and_the_panels_hear(tmp_path, tiers):
+    host = TierHost(tmp_path, local="absent")
+    res = host._switch_backend("network")
+    assert res["ok"] and (host.backend, host.tier) == ("local", "network")
+    assert res["label"] == "Network · qwen3.8-flash-next" and host.notes[-1].endswith(res["label"])
+    assert host._backend_label(spoken=True) == "the network model"
+    llm = host._llm()
+    assert (llm.url, llm.model, llm.base) == ("http://llm.lan:8080/v1", "qwen3.8-flash-next",
+                                              "http://llm.lan:8080")
+    prompt = va._tier_prompt(va.LOCAL_VOICE_PROMPT, llm)
+    assert "qwen3.8-flash-next, served by llama.cpp at llm.lan:8080" in prompt
+    assert "switch to the network model" in prompt
+    d = json.loads((tmp_path / "status").read_text())
+    assert d["class"] == ["off", "network"] and d["tier"] == "network"
+    assert d["label"] == "Network · qwen3.8-flash-next"
+    assert d["local_model"] == "Qwen3.8 Flash Next", "the active tier's model"
+    assert host._switch_backend("hosted")["label"] == "Claude" and host.tier == "claude"
+
+
+def test_network_tier_needs_a_url(tmp_path, tiers, monkeypatch):
+    monkeypatch.setattr(va, "NETWORK_LLM_URL", "")
+    host = TierHost(tmp_path)
+    res = host._switch_backend("network")
+    assert not res["ok"] and host.tier == "claude"
+
+
+def test_network_model_down_falls_back_to_claude(tmp_path, tiers, monkeypatch):
+    asked = []
+    monkeypatch.setattr(va, "_llm_health", lambda url, timeout=1.0: asked.append(url) or "down")
+    monkeypatch.setattr(va, "LLM_FALLBACK", True)
+    host = TierHost(tmp_path)
+    host.backend, host.llm_tier = "local", "network"
+    host._play_chime_async = lambda name: None
+    assert host._pick_backend_for_query() == "claude"
+    assert asked == ["http://llm.lan:8080/v1"], "the network server, not this machine's"
+    assert "Network model not running" in host.notes[-1]
+    monkeypatch.setattr(va, "LLM_FALLBACK", False)
+    assert host._pick_backend_for_query() == "local"
+
+
+def test_a_spoken_switch_names_the_tier_briefly(tmp_path, tiers, monkeypatch):
+    monkeypatch.setattr(va, "TTS_TAIL_GATE", 0)
+    host = SpokenHost(tmp_path, "Switch to the network model.")
+    host.llm_tier, host.backend_pref = "local", "claude"
+    host._dsh, host._dsh_available, host._claude_available = None, False, True
+    host._local_tier_state = lambda: ("absent", "no GPU")
+    asyncio.run(host._process_audio([]))
+    assert host.said == ["Switched to the network model."]
+    assert host.tier == "network"

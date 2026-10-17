@@ -15,7 +15,8 @@ mic ─▶ capture thread ─▶ Silero VAD ─▶ smart-turn v3 (has the user f
                       └▶ Moonshine STT (transcribes while you talk)
                                     │
                                     ▼
-         Claude Code CLI  ·or·  local Qwen3.8-27B (own loop ·or· DeepSeek Harness)
+   local Qwen3.8-27B  ·or·  a model on the LAN  ·or·  Claude Code CLI
+                  (own loop ·or· DeepSeek Harness)
                                     │
                                     ▼
                       Pocket TTS ─▶ one persistent PipeWire stream
@@ -121,8 +122,9 @@ picks per query.
    exact command, and the reply clause by clause. Notifications only carry
    status. Left click the robot to read along; right click for the controls.
 
-The same switch is a spoken command: "switch to Claude", "go back to the local
-model", "use the harness". It is handled by the assistant before any model sees
+The same switch is a spoken command: "switch to Claude" (or "hosted"), "go back
+to the local model", "switch to the network model" (or "the cluster"), "use the
+harness". The reply names the tier only ("Switched to the network model."). It is handled by the assistant before any model sees
 it, with the recogniser's usual misses accepted ("clog", "clawed" and "cloud"
 are all Claude). That matters because a model with a shell will otherwise do it
 the hard way: the harness once found `voice-llm claude` and ran it from inside
@@ -135,11 +137,12 @@ detached and a few seconds later, so the reply finishes first.
 - **Semantic end of turn** — an 8.7 MB audio classifier, not a silence timer.
   ~0.45 s of dead air after you stop instead of ~2.7 s, and it holds through a
   mid-sentence pause instead of cutting you off.
-- **Two backends, chosen automatically** — the local model when this machine can
-  hold it, Claude otherwise, with a per-query fallback either way.
-- **Two harnesses for the local model** — the assistant's own tool loop, or the
+- **Three tiers, chosen automatically** — the local model when this machine can
+  hold it, else a model elsewhere on the LAN if one is configured, else Claude,
+  with a per-query fallback to Claude while a model is down.
+- **Two harnesses for a llama-server** — the assistant's own tool loop, or the
   [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) running
-  locally against the same llama-server, with the assistant's web tools plugged
+  locally against the same server, with the assistant's web tools plugged
   in over MCP.
 - **Speech recognition and synthesis on the CPU** — they keep working while the
   dGPU is passed through to a VM.
@@ -181,8 +184,9 @@ voice-assistant-ctl test         # installation checks
 voice-assistant-ctl backend …    # passes through to voice-llm
 
 voice-llm status                 # what backend is configured, and what it resolves to
-voice-llm auto                   # local model if this machine can run it, else Claude
+voice-llm auto                   # local model if this machine can run it, else network, else Claude
 voice-llm qwen                   # force the local model (starts the server)
+voice-llm network                # the model at VOICE_ASSISTANT_NETWORK_URL
 voice-llm dsh                    # the local model, driven by the DeepSeek Harness
 voice-llm claude                 # force Claude and stop the server (frees the GPU)
 voice-llm logs                   # the model server's own log
@@ -212,13 +216,17 @@ assistant --json                           # the raw reply, for scripting
 
 ### Swapping models
 
-**SUPER+M** cycles which model answers — the local Qwen3.8 in the assistant's own
-loop, the same model under the DeepSeek Harness, then Claude — and shows you
-which one you landed on. The same thing from a terminal:
+**SUPER+M** cycles which tier answers — local, network, then Claude — skipping
+a tier this machine does not have, and shows you which one you landed on
+("Network · qwen3.8-flash-next"). Local counts when `auto` would consider this
+machine able to run it (a server answers, or a qualifying GPU and an installed
+unit); network when `VOICE_ASSISTANT_NETWORK_URL` is set; Claude when the CLI is
+installed. Without a GPU it flips between network and Claude. The same thing
+from a terminal:
 
 ```bash
-assistant --swap                 # local -> dsh -> Claude -> local
-assistant --backend local        # or dsh, claude, auto
+assistant --swap                 # local -> network -> Claude -> local
+assistant --backend network      # or local, claude (hosted), dsh, auto
 assistant --model fable          # or opus, sonnet, haiku
 assistant --effort xhigh         # or low, medium, high, max
 ```
@@ -239,22 +247,41 @@ deliberate way to free the card for GPU passthrough.
 Each backend keeps its own thread. Swapping mid-conversation means the model you
 switch to has not heard what the other one did.
 
-## LLM backends: Claude or a local Qwen3.8-27B
+## LLM backends: local, network or Claude
+
+Three tiers, by where the model runs:
+
+- **local** — llama-server on this machine (`VOICE_ASSISTANT_LOCAL_URL` / `_MODEL`).
+- **network** — an OpenAI-compatible llama-server elsewhere on the LAN
+  (`VOICE_ASSISTANT_NETWORK_URL` / `_MODEL`). No URL, no network tier. Without
+  a model name the assistant asks the server (`/v1/models`). It gets the same
+  tools, prompt and history handling as the local tier, and is told its own
+  model name and address when asked who it is.
+- **hosted** — the Claude Code CLI (`claude`; "hosted" is accepted as a name).
 
 The backend is `auto` by default:
 
-1. A model server that already answers wins.
+1. A model server that already answers at the local URL wins.
 2. Otherwise, an NVIDIA GPU with ≥ 15000 MiB and an installed `qwen38.service`
    means **local**.
-3. Otherwise **Claude**.
+3. Otherwise **network**, when `VOICE_ASSISTANT_NETWORK_URL` is set -- even if
+   it is not answering right now: that costs only the per-query fallback.
+4. Otherwise **Claude**.
 
-When `auto` lands on the local model it uses the assistant's own tool loop; set
-`VOICE_ASSISTANT_LOCAL_HARNESS=dsh` to have it use the DeepSeek Harness instead.
+Under `auto`, a local server that comes up later takes over from network or
+Claude on its own.
 
-While the local server is loading — 5 s warm, ~35 s from cold, so most of one
+A llama-server tier is driven by its harness: `VOICE_ASSISTANT_LOCAL_HARNESS`
+and `VOICE_ASSISTANT_NETWORK_HARNESS`, `native` (the assistant's own tool loop,
+the default) or `dsh` (the DeepSeek Harness). `dsh` as a backend
+(`voice-llm dsh`, `assistant --backend dsh`, "switch to the harness") is kept
+from before tiers and means the local tier under the DeepSeek Harness,
+whatever `_LOCAL_HARNESS` says.
+
+While the local or network server is loading or down — 5 s warm, ~35 s from cold, so most of one
 boot — individual questions go to Claude with a distinct chime and a
-notification saying so, and the assistant switches over on its own the moment
-the model is ready. No restart, and no dead assistant during boot.
+notification saying so (`VOICE_ASSISTANT_LLM_FALLBACK`), and the assistant
+switches over on its own the moment the model is ready. No restart, and no dead assistant during boot.
 
 | | Claude Code CLI | local Qwen3.8-27B | Qwen3.8-27B under the DeepSeek Harness |
 |---|---|---|---|
@@ -281,7 +308,7 @@ contain recognition errors, and to confirm before anything irreversible.
 
 ### The DeepSeek Harness (`dsh`)
 
-`voice-llm dsh` (or `assistant --backend dsh`, or SUPER+M) drives the **same
+`voice-llm dsh` (or `assistant --backend dsh`) drives the **same
 local llama-server** through the
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), DeepSeek's
 open-source agent runtime, instead of the assistant's own tool loop. Same model,
@@ -292,7 +319,8 @@ assistant's `web_search` / `fetch_page` served to it as an MCP server
 `setup.sh` installs it with `pip install deepseek-harness-sdk`; the wheel bundles
 the `dsh` runtime (~260 MB unpacked), so no Node.js is needed. The assistant
 launches `dsh --profile sdk-minimal` as a subprocess speaking JSON-RPC on stdio,
-points the stock DeepSeek adapter at `http://127.0.0.1:8081` (it speaks
+points the stock DeepSeek adapter at the active tier's server (`http://127.0.0.1:8081`
+for local; it speaks
 OpenAI-style chat completions, which is what llama-server serves) and overlays a
 patch it writes into `~/.local/state/voice-assistant/dsh/` at every start.
 Measured here: the runtime boots in ~1 s; the first prompt on a fresh runtime
@@ -839,7 +867,9 @@ change, in waybar's custom-module format so it can be used verbatim:
 ```
 
 States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and the
-second class is `claude`, `local` or `dsh`. (`waybar-status` is a symlink to the
+second class is `claude`, `local`, `network` or `dsh` (the network tier is
+`network` under either harness). The payload also carries `tier` and `label`
+("Network · qwen3.8-flash-next"), which the indicator and panel show. (`waybar-status` is a symlink to the
 same file, for configs written against the old name.)
 
 ### GNOME indicator
@@ -941,9 +971,9 @@ optional.
 
 | variable | default | meaning |
 |---|---|---|
-| `VOICE_ASSISTANT_LLM_BACKEND` | `auto` | `auto`, `claude`, `local` or `dsh` |
-| `VOICE_ASSISTANT_LOCAL_HARNESS` | `native` | what `auto` uses for the local model: `native` or `dsh` |
-| `VOICE_ASSISTANT_LLM_FALLBACK` | `1` | answer with Claude while the local model is down |
+| `VOICE_ASSISTANT_LLM_BACKEND` | `auto` | `auto`, `local`, `network`, `claude` (or `hosted`), or `dsh` (the local tier under the DeepSeek Harness) |
+| `VOICE_ASSISTANT_LOCAL_HARNESS` | `native` | what drives the local model: `native` or `dsh` |
+| `VOICE_ASSISTANT_LLM_FALLBACK` | `1` | answer with Claude while the local or network model is down |
 | `VOICE_ASSISTANT_LOCAL_MIN_VRAM_MIB` | `15000` | VRAM needed to pick the local model |
 | `VOICE_ASSISTANT_MODEL` | `opus` | `opus`, `sonnet`, `haiku` or `fable`; changeable at runtime |
 | `VOICE_ASSISTANT_EFFORT` | `max` | `low`, `medium`, `high`, `xhigh` or `max`; changeable at runtime |
@@ -951,6 +981,20 @@ optional.
 | `VOICE_ASSISTANT_CLI_TIMEOUT` | | seconds a `claude` turn may take |
 | `VOICE_ASSISTANT_CONTEXT_MARKERS` | `1` | tell the model when time passed or the machine restarted |
 | `VOICE_ASSISTANT_CONTEXT_GAP` | `900` | seconds of silence before a gap is worth mentioning |
+
+### Network model
+
+| variable | default | meaning |
+|---|---|---|
+| `VOICE_ASSISTANT_NETWORK_URL` | (unset) | OpenAI-compatible llama-server on another machine, e.g. `http://llm.lan:8080/v1`; unset = no network tier |
+| `VOICE_ASSISTANT_NETWORK_MODEL` | (asked of the server) | model name sent to that endpoint |
+| `VOICE_ASSISTANT_NETWORK_HARNESS` | `native` | what drives it: `native` or `dsh` |
+| `VOICE_ASSISTANT_NETWORK_API_KEY` | `none` | if the endpoint wants one |
+| `VOICE_ASSISTANT_NETWORK_TIMEOUT` | `_LOCAL_TIMEOUT` | seconds one completion may take |
+| `VOICE_ASSISTANT_NETWORK_THINK` | `_LOCAL_THINK` | let the network model reason first |
+
+Sampling, history, tools and thinking budget are the `_LOCAL_` settings below.
+Nothing here starts or stops the remote server.
 
 ### Local model
 
@@ -1085,6 +1129,7 @@ win over both.
 |---|---|---|---|
 | **local backend** | never leaves | never leaves | never leave |
 | **dsh backend** | never leaves | never leaves | never leave |
+| **network backend** | never leaves | to the LAN server | run here, output to the LAN server |
 | **Claude backend** | never leaves | sent to Anthropic | sent to Anthropic |
 
 Audio is never uploaded in any mode: VAD, transcription, end-of-turn detection
