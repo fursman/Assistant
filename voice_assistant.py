@@ -369,8 +369,17 @@ LOCAL_LLM_HISTORY_CHARS = int(os.getenv("VOICE_ASSISTANT_LOCAL_HISTORY_CHARS", "
 LOCAL_TOOL_HISTORY_OUTPUT = int(os.getenv("VOICE_ASSISTANT_LOCAL_TOOL_HISTORY_OUTPUT", "4000"))
 # A tool command that would stop or restart the assistant's own service is run detached,
 # this many seconds later, so the turn can end first (see _run_shell_tool).
+# Only commands that act on the service: a plain mention of voice-assistant (its
+# config directory, `systemctl status`, a grep of the unit list) used to match,
+# and the model never saw the output of looking at its own settings. The verb
+# may sit anywhere in the systemctl command (`restart --user`, `--no-block`);
+# voice-assistant-jabra is another service.
 _SELF_RESTART_RE = re.compile(
-    r"voice-llm|voice-assistant(?:\.service)?\b|systemctl\s+--user\s+(?:restart|stop|kill)\s+voice-assistant",
+    r"\bvoice-llm\s+(?:auto|claude|qwen|local|network|dsh)\b"
+    r"|\bsystemctl\b[^;&|\n]*\b(?:restart|try-restart|reload-or-restart|stop|kill|disable)\b"
+    r"[^;&|\n]*\bvoice-assistant(?:\.service)?(?![-\w])"
+    r"|\bpkill\b[^;&|\n]*voice[-_]assistant(?![-\w])"
+    r"|\bkill\b[^;&|\n]*\bpgrep\b[^;&|\n]*voice[-_]assistant(?![-\w])",
     re.IGNORECASE)
 SELF_RESTART_DELAY = int(os.getenv("VOICE_ASSISTANT_SELF_RESTART_DELAY", "6"))
 LOCAL_LLM_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_LOCAL_TIMEOUT", "120"))

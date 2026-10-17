@@ -76,6 +76,28 @@ def test_shell_tool_defers_a_command_that_restarts_the_assistant(monkeypatch):
     assert launched[0][-1] == "sleep 6; which voice-llm && voice-llm claude"
 
 
+@pytest.mark.parametrize("cmd, restarts", [
+    ("systemctl --user restart voice-assistant", True),
+    ("systemctl restart --user voice-assistant.service", True),
+    ("systemctl --user --no-block restart voice-assistant", True),
+    ("systemctl --user disable --now voice-assistant", True),
+    ("pkill -f voice-assistant", True),
+    ("pkill -f voice_assistant.py", True),
+    ("kill $(pgrep -f voice_assistant)", True),
+    ("voice-llm network", True),
+    # looking is not restarting
+    ("systemctl --user status voice-assistant", False),
+    ("cat ~/.config/voice-assistant/env", False),
+    ("pgrep -f voice_assistant", False),
+    ("systemctl --user list-units | grep voice-assistant", False),
+    ("systemctl --user restart voice-assistant-jabra", False),
+    ("kill -USR1 $(cat ~/.local/state/voice-assistant/voice-assistant.pid)", False),
+    ("systemctl --user status voice-assistant; systemctl --user restart qwen38", False),
+])
+def test_self_restart_pattern(cmd, restarts):
+    assert bool(va._SELF_RESTART_RE.search(cmd)) == restarts
+
+
 def test_shell_tool_runs_ordinary_commands():
     host = Host()
     assert host._run_shell_tool("echo hello").strip() == "hello"
