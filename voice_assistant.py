@@ -40,6 +40,7 @@ import concurrent.futures
 import difflib
 import html
 import importlib.util
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -67,6 +68,7 @@ import torch
 from numpy.lib.stride_tricks import sliding_window_view
 from silero_vad import load_silero_vad
 
+import llm_discovery  # the LAN scan, shared with `voice-llm discover`
 import web_tools  # search and fetch, shared with the dsh MCP sidecar
 
 # The turn router is optional twice over: it needs `requests`, and it needs
@@ -429,6 +431,21 @@ NETWORK_LLM_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_NETWORK_TIMEOUT", "").str
 NETWORK_LLM_THINK = os.getenv("VOICE_ASSISTANT_NETWORK_THINK",
                               os.getenv("VOICE_ASSISTANT_LOCAL_THINK", "0")).strip().lower() \
     not in ("0", "false", "no", "off", "")
+# The URL is the network tier's CURRENT server: the swap key moves it to the
+# next server on the LAN and writes it back to the env file. What was
+# configured at start stays first in the cycle, so the order does not shift
+# under the user as they press through it.
+NETWORK_LLM_CONFIGURED = (NETWORK_LLM_URL, NETWORK_LLM_MODEL)
+# Look for model servers on the LAN at start, this often (seconds) and right
+# after a swap, in the background: a keypress only ever uses the last list.
+# 0 = never look; the configured server is then the only one.
+NETWORK_DISCOVER_INTERVAL = float(os.getenv("VOICE_ASSISTANT_NETWORK_DISCOVER_INTERVAL", "300"))
+# Where to look: the same ports `voice-llm discover` tries.
+NETWORK_DISCOVER_PORTS = llm_discovery.ports_from(
+    os.getenv("VOICE_ASSISTANT_NETWORK_DISCOVER_PORTS", "").strip()
+    or os.getenv("VOICE_LLM_DISCOVER_PORTS", ""))
+# How long the swap waits for a server's /health before skipping it.
+NETWORK_SWAP_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_NETWORK_SWAP_TIMEOUT", "0.5"))
 
 
 class LlmTier(NamedTuple):
@@ -467,6 +484,89 @@ def _llm_tier(name: str = "local") -> LlmTier:
                        NETWORK_LLM_TIMEOUT, NETWORK_LLM_THINK)
     return LlmTier("local", LOCAL_LLM_URL, LOCAL_LLM_MODEL, LOCAL_HARNESS,
                    LOCAL_LLM_API_KEY or "none", LOCAL_LLM_TIMEOUT, LOCAL_LLM_THINK)
+
+
+# The model servers the last LAN scan found (llm_discovery.Server), replaced
+# whole by the discovery thread, and when that was (0 = not yet). Plus what a
+# host name in the env file resolves to, so a server configured by name and
+# found by address is one stop, not two.
+_DISCOVERED_SERVERS = []
+_DISCOVERED_AT = 0.0
+_HOST_ADDRESSES = {}
+
+
+class NetworkServer(NamedTuple):
+    """One stop of the network tier: a model server on the LAN."""
+    url: str
+    model: str      # "" when it has not said
+    name: str       # its reverse DNS, "" when it has none
+
+
+def _server_key(url: str):
+    """(address, port): two URLs with the same key are the same server."""
+    ep = llm_discovery.endpoint(url, resolve=False)
+    if ep is None:
+        return url, 0
+    return _HOST_ADDRESSES.get(ep[0], ep[0]), ep[1]
+
+
+def _address_order(key):
+    """Addresses numerically, then names, each by port."""
+    host, port = key
+    try:
+        return 0, int(ipaddress.ip_address(host)), "", port
+    except ValueError:
+        return 1, 0, host, port
+
+
+def _network_servers() -> list:
+    """The network tier's stops in cycle order: the configured server first,
+    then the others by address and port. The configured one is there scan or
+    no scan, and so is the current one, which an earlier scan may have found
+    and the latest missed. No I/O: this is what a keypress reads."""
+    found = {}
+    for s in _DISCOVERED_SERVERS:
+        found.setdefault(_server_key(s.url), NetworkServer(s.url, s.model, s.name))
+    if NETWORK_LLM_URL:
+        found.setdefault(_server_key(NETWORK_LLM_URL),
+                         NetworkServer(NETWORK_LLM_URL, NETWORK_LLM_MODEL, ""))
+    out = []
+    url, model = NETWORK_LLM_CONFIGURED
+    if url:
+        hit = found.pop(_server_key(url), None)
+        # Its own URL and model, as written: the user chose them.
+        out.append(NetworkServer(url, model or (hit.model if hit else ""), hit.name if hit else ""))
+    out.extend(found[k] for k in sorted(found, key=_address_order))
+    return out
+
+
+def _network_server_name(url: str, servers: list = None) -> str:
+    """A server as the label shows it: its host name without the domain, else
+    its address; with the port when another server shares the host."""
+    servers = _network_servers() if servers is None else servers
+    key = _server_key(url)
+    name = next((s.name for s in servers if s.name and _server_key(s.url) == key), "")
+    host = name or urllib.parse.urlsplit(url).hostname or url
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        host = host.split(".")[0]
+    if any(_server_key(s.url)[0] == key[0] and _server_key(s.url) != key for s in servers):
+        host += f":{key[1]}"
+    return host
+
+
+def _use_network_server(server: NetworkServer, model: str = ""):
+    """Make `server` the network tier's: what _llm_tier("network") builds from
+    and what the env file says. The configured server keeps its configured
+    model name; any other is named by what it serves."""
+    global NETWORK_LLM_URL, NETWORK_LLM_MODEL
+    configured_url, configured_model = NETWORK_LLM_CONFIGURED
+    if configured_url and _server_key(server.url) == _server_key(configured_url):
+        model = configured_model or model
+    NETWORK_LLM_URL, NETWORK_LLM_MODEL = server.url, model or server.model
+    _write_env_setting("VOICE_ASSISTANT_NETWORK_URL", NETWORK_LLM_URL)
+    _write_env_setting("VOICE_ASSISTANT_NETWORK_MODEL", NETWORK_LLM_MODEL)
 
 # Tool access for the local model. Unrestricted shell by explicit choice -- the
 # Claude backend already runs with --dangerously-skip-permissions, and the user
@@ -3074,6 +3174,7 @@ class VoiceAssistant:
         # llama-server the first two talk to ("local" or "network").
         self.backend = "claude"
         self.llm_tier = "local"
+        self._network_rescan = threading.Event()   # wakes _watch_network_servers
         self._claude_available = False
         self._claude = None              # ClaudeSession when persistent
         self._claude_process = None      # one-shot fallback process
@@ -5627,7 +5728,9 @@ class VoiceAssistant:
 
     def _backend_label(self, backend: str = None, spoken: bool = False) -> str:
         """Who answers: "Local · qwen3.8-27b", "Network · qwen3.8-flash-next",
-        "Claude", with " · DeepSeek Harness" when it drives the model. Spoken,
+        "Claude", with " · DeepSeek Harness" when it drives the model. With
+        several network servers about, which one: "Network · qwen3.8-27b ·
+        llm-4060". Spoken,
         just "the network model": a model id read aloud is a mouthful of noise."""
         backend = backend or self.backend
         if backend == "claude":
@@ -5635,12 +5738,19 @@ class VoiceAssistant:
         llm = self._llm()
         if spoken:
             return f"the {llm.name} model" + (" under the DeepSeek Harness" if backend == "dsh" else "")
-        return " · ".join([llm.title] + ([llm.model] if llm.model else [])
+        # Which server, once there is more than one to tell apart.
+        where = []
+        if llm.name == "network":
+            servers = _network_servers()
+            if len(servers) > 1:
+                where = [_network_server_name(llm.url, servers)]
+        return " · ".join([llm.title] + ([llm.model] if llm.model else []) + where
                           + (["DeepSeek Harness"] if backend == "dsh" else []))
 
     # What `toggle` cycles through, in this order, skipping a tier this machine
     # does not have (see _tier_available). The DeepSeek Harness is not a stop:
-    # it is how a tier is driven (VOICE_ASSISTANT_<TIER>_HARNESS).
+    # it is how a tier is driven (VOICE_ASSISTANT_<TIER>_HARNESS). "network"
+    # is one stop per model server known (_network_servers).
     BACKEND_CYCLE = ("local", "network", "claude")
 
     def _tier_available(self, tier: str) -> bool:
@@ -5649,13 +5759,53 @@ class VoiceAssistant:
         if tier == "local":
             return self._local_tier_state()[0] != "absent"
         if tier == "network":
-            return bool(NETWORK_LLM_URL)
+            return bool(_network_servers())
         return self._claude_available
+
+    def _network_answers(self, server: NetworkServer) -> bool:
+        """A network server is worth a stop when its port answers: ready, or
+        loading (the switch then says Claude answers meanwhile, as it does for
+        the local model). One short /health, never a scan."""
+        state = _llm_health(server.url, timeout=NETWORK_SWAP_TIMEOUT)
+        if state == "down":
+            self.logger.info(f"Swap: skipping {server.url}, not answering")
+        return state != "down"
+
+    def _next_stop(self):
+        """Where `toggle` goes from here: (tier, NetworkServer or None). Local,
+        each network server, Claude, and around; a stop is checked only when
+        reached, and the first that is available wins."""
+        servers = _network_servers()
+        stops = [(t, s) for t in self.BACKEND_CYCLE
+                 for s in (servers if t == "network" else [None])]
+        here = _server_key(NETWORK_LLM_URL) if self.tier == "network" else None
+        i = next((k for k, (t, s) in enumerate(stops) if t == self.tier
+                  and (s is None or _server_key(s.url) == here)), None)
+        if i is None:       # on the network tier with no server: start from Claude
+            i = len(stops) - 1
+        for t, s in stops[i + 1:] + stops[:i]:
+            # Lazily: the local check runs nvidia-smi, only worth it when reached.
+            if t == "network" and self._network_answers(s):
+                return t, s
+            if t != "network" and self._tier_available(t):
+                return t, None
+        return self.tier, None
+
+    def _request_network_scan(self):
+        """Look at the LAN again now (the discovery thread, if it runs)."""
+        event = getattr(self, "_network_rescan", None)
+        if event is not None:
+            event.set()
 
     def _switch_backend(self, value: str) -> dict:
         """Change which model answers: 'local' | 'network' | 'claude' (or
         'hosted') | 'dsh' | 'auto' | 'toggle'. 'dsh' is the local tier under
-        the DeepSeek Harness, as it was before there were tiers.
+        the DeepSeek Harness, as it was before there were tiers. 'toggle' is
+        the next stop of the cycle (_next_stop): local, each network server
+        that answers, Claude. A swap between two network servers is a tier
+        switch like any other: the native loop's history is shared by every
+        llama-server, tool calls and all, and the harness is restarted on the
+        new server with the recap (_ensure_dsh_session).
 
         The preference is written back to the env file so it survives a restart
         and `voice-llm status` agrees with what is actually happening. The local
@@ -5667,16 +5817,26 @@ class VoiceAssistant:
         """
         value = {"hosted": "claude"}.get(value, value)
         self._claude_available = shutil.which("claude") is not None
+        server = None
         if value == "toggle":
-            cycle = self.BACKEND_CYCLE
-            i = cycle.index(self.tier)
-            # Lazily: the local check runs nvidia-smi, only worth it when reached.
-            value = next((t for t in cycle[i + 1:] + cycle[:i] if self._tier_available(t)),
-                         self.tier)
+            value, server = self._next_stop()
+            # The list the next press will use; never this one's to wait for.
+            self._request_network_scan()
+        elif value == "network" and not NETWORK_LLM_URL:
+            # None configured, but the LAN has some: the first that answers.
+            server = next((s for s in _network_servers() if self._network_answers(s)), None)
         if value not in ("local", "network", "dsh", "claude", "auto"):
             return {"ok": False, "error": f"unknown backend {value!r}"}
+        if server is not None and _server_key(server.url) != _server_key(NETWORK_LLM_URL):
+            # Another server: named by what it serves now, and written back
+            # so a restart and `voice-llm status` land on the same one.
+            model = (_detect_served_model(_llm_tier("network")._replace(
+                url=server.url, model=""), timeout=NETWORK_SWAP_TIMEOUT)
+                     or server.model)
+            _use_network_server(server, model)
+            self.logger.info(f"Network tier -> {server.url} ({NETWORK_LLM_MODEL or '?'})")
         if value == "network" and not NETWORK_LLM_URL:
-            return {"ok": False, "error": "no network model is configured"}
+            return {"ok": False, "error": "no network model is configured or found"}
 
         self.backend_pref = value
         self.backend, tier, why = self._resolve_backend()
@@ -6589,6 +6749,51 @@ class VoiceAssistant:
         self._play_chime_async("deactivate")
 
     # ------------------------------------------------------------------
+    # Network model servers
+    # ------------------------------------------------------------------
+
+    def _watch_network_servers(self):
+        """Keep the list of model servers on the LAN fresh, for the swap key.
+
+        A scan is a /24 on a few ports, about two seconds: far too long for a
+        keypress to wait on, so it runs here, at start, every
+        NETWORK_DISCOVER_INTERVAL seconds and right after a swap, and the swap
+        reads whatever the last one found. A server that appears is a stop on
+        the next press after the scan that sees it; no restart.
+        """
+        while True:
+            ok = self._discover_network_servers()
+            # No LAN yet (early in boot, on the move): look again soon.
+            self._network_rescan.wait(NETWORK_DISCOVER_INTERVAL if ok
+                                      else min(NETWORK_DISCOVER_INTERVAL, 30))
+            self._network_rescan.clear()
+
+    def _discover_network_servers(self) -> bool:
+        """One scan; False when there was no LAN to look on."""
+        global _DISCOVERED_SERVERS, _DISCOVERED_AT
+        # Names in the env file, by address, so a server is not two stops.
+        for url in {NETWORK_LLM_CONFIGURED[0], NETWORK_LLM_URL} - {""}:
+            host, ep = urllib.parse.urlsplit(url).hostname, llm_discovery.endpoint(url)
+            if host and ep:
+                _HOST_ADDRESSES[host] = ep[0]
+        try:
+            found = llm_discovery.scan(NETWORK_DISCOVER_PORTS, exclude=[LOCAL_LLM_URL])
+        except Exception as e:
+            self.logger.debug(f"Network discovery: {e}")
+            return False
+        before = {(s.url, s.model) for s in _DISCOVERED_SERVERS}
+        for srv in found:
+            _SERVED_MODELS[srv.url] = srv.model     # fresher than a first answer
+        _DISCOVERED_SERVERS, _DISCOVERED_AT = found, time.time()
+        if {(s.url, s.model) for s in found} != before:
+            self.logger.info(
+                f"Network model servers on the LAN: {len(found)}"
+                + "".join(f"\n  {s.url} {s.model} {s.name or '-'}" for s in found))
+            # The label names the server once there is more than one.
+            self._set_status(getattr(self, "_status_state", "off"))
+        return True
+
+    # ------------------------------------------------------------------
     # Local LLM watcher
     # ------------------------------------------------------------------
 
@@ -6879,12 +7084,23 @@ class VoiceAssistant:
             local, network = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: (_local_llm_health(),
                                _llm_health(NETWORK_LLM_URL) if NETWORK_LLM_URL else None))
+            servers = _network_servers()
             return {"ok": True, "backend": self.backend,
                     "preference": self.backend_pref,
                     "tier": self.tier,
                     "label": self._backend_label(),
                     "local_llm": local,
                     "network_llm": network,
+                    "network_url": NETWORK_LLM_URL or None,
+                    # The swap key's network stops, in its order.
+                    "network_servers": [
+                        dict(s._asdict(), label=_network_server_name(s.url, servers),
+                             current=_server_key(s.url) == _server_key(NETWORK_LLM_URL),
+                             configured=_server_key(s.url) == _server_key(NETWORK_LLM_CONFIGURED[0]))
+                        for s in servers],
+                    "network_scan": ("off" if NETWORK_DISCOVER_INTERVAL <= 0
+                                     else int(time.time() - _DISCOVERED_AT) if _DISCOVERED_AT
+                                     else "pending"),
                     "dsh": ("running" if self._dsh is not None and self._dsh.alive
                             else "installed" if self._dsh_available else "not installed"),
                     "voice_active": self.is_active, "busy": self.is_processing,
@@ -7290,6 +7506,8 @@ class VoiceAssistant:
     def run(self):
         if LLM_BACKEND in ("auto", "local"):
             threading.Thread(target=self._watch_local_llm, daemon=True).start()
+        if NETWORK_DISCOVER_INTERVAL > 0:
+            threading.Thread(target=self._watch_network_servers, daemon=True).start()
         try:
             self.logger.info("Voice Assistant ready — send SIGUSR1 to toggle")
             asyncio.run(self._listen_loop())

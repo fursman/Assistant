@@ -102,7 +102,8 @@ picks per query.
 
 1. **SUPER** toggles voice mode. The status bar shows the state (a waybar module
    on Hyprland, a top-bar indicator on GNOME); chimes mark the edges.
-   **SUPER+M** swaps which backend answers; **SUPER+SHIFT+A** starts a new
+   **SUPER+M** swaps which model answers, through every one there is: the
+   local model, each model server on the LAN, Claude; **SUPER+SHIFT+A** starts a new
    conversation. You can also just type: `assistant <question>` joins the same
    conversation from a terminal.
 2. **Silero VAD** watches the mic. Speech has to persist for ~96 ms before a
@@ -186,11 +187,11 @@ voice-assistant-ctl backend …    # passes through to voice-llm
 voice-llm status                 # what backend is configured, and what it resolves to
 voice-llm auto                   # local model if this machine can run it, else network, else Claude
 voice-llm qwen                   # force the local model (starts the server)
-voice-llm network                # the model at VOICE_ASSISTANT_NETWORK_URL
+voice-llm network                # the model at VOICE_ASSISTANT_NETWORK_URL (the swap key's last one)
 voice-llm dsh                    # the local model, driven by the DeepSeek Harness
 voice-llm claude                 # force Claude and stop the server (frees the GPU)
 voice-llm logs                   # the model server's own log
-voice-llm discover               # model servers on the LAN, for VOICE_ASSISTANT_NETWORK_URL
+voice-llm discover               # model servers on the LAN: the swap key's network stops
 ```
 
 Say **"new conversation"** (or "start over", "forget everything", "fresh start")
@@ -210,7 +211,7 @@ assistant what is using all my disk space
 assistant "remind me what we decided about the tomatoes"
 echo "summarise this" | assistant          # reads stdin when given no words
 assistant --speak "and read that one out"  # typed questions are silent by default
-assistant --status                         # model, local server, voice state, session
+assistant --status                         # model, servers (network ones too), voice state, session
 assistant --new                            # start a fresh conversation
 assistant --voice-only on                  # ignore voices but yours (off, toggle)
 assistant --json                           # the raw reply, for scripting
@@ -218,16 +219,29 @@ assistant --json                           # the raw reply, for scripting
 
 ### Swapping models
 
-**SUPER+M** cycles which tier answers — local, network, then Claude — skipping
-a tier this machine does not have, and shows you which one you landed on
-("Network · qwen3.8-flash-next"). Local counts when `auto` would consider this
-machine able to run it (a server answers, or a qualifying GPU and an installed
-unit); network when `VOICE_ASSISTANT_NETWORK_URL` is set; Claude when the CLI is
-installed. Without a GPU it flips between network and Claude. The same thing
-from a terminal:
+**SUPER+M** cycles through every model that is here right now — the local
+one, then each model server on the LAN, then Claude — and shows you which one
+you landed on ("Network · qwen3.8-27b · llm-4060"; the server's name, or its
+address, appears once there is more than one to tell apart). Local counts when
+`auto` would consider this machine able to run it (a server answers, or a
+qualifying GPU and an installed unit); Claude when the CLI is installed.
+
+The network stops are the configured server (`VOICE_ASSISTANT_NETWORK_URL`)
+first, then whatever the assistant has found on the LAN, by address and port.
+It looks in the background — at start, every five minutes
+(`VOICE_ASSISTANT_NETWORK_DISCOVER_INTERVAL`) and again after each swap — with
+the same scan as `voice-llm discover`, so a server that comes up is a stop
+within minutes, without a restart. The key never waits for a scan: it reads the
+last list and asks only the server it is about to land on for `/health`
+(0.5 s). One that does not answer is skipped; one that is still loading is a
+stop, with the "loading, Claude answers meanwhile" note, since it is about to
+be useful. Landing on a different server writes its URL and model name back to
+the env file, so a restart comes back to it and `voice-llm status` agrees.
+With one server it is local, network, Claude as it always was; without a GPU
+it goes network, Claude. The same thing from a terminal:
 
 ```bash
-assistant --swap                 # local -> network -> Claude -> local
+assistant --swap                 # local -> each network server -> Claude -> local
 assistant --backend network      # or local, claude (hosted), dsh, auto
 assistant --model fable          # or opus, sonnet, haiku
 assistant --effort xhigh         # or low, medium, high, max
@@ -247,7 +261,10 @@ load. Nothing is ever stopped by the swap: `voice-llm claude` remains the
 deliberate way to free the card for GPU passthrough.
 
 Each backend keeps its own thread. Swapping mid-conversation means the model you
-switch to has not heard what the other one did.
+switch to has not heard what the other one did. The llama-server tiers share
+one: from one network server to another (or to the local model) the new model
+gets the same history, tool calls included, as a switch between local and
+network always did.
 
 ## LLM backends: local, network or Claude
 
@@ -258,14 +275,19 @@ Three tiers, by where the model runs:
   (`VOICE_ASSISTANT_NETWORK_URL` / `_MODEL`). No URL, no network tier. Without
   a model name the assistant asks the server (`/v1/models`). It gets the same
   tools, prompt and history handling as the local tier, and is told its own
-  model name and address when asked who it is. When none is configured,
-  `setup.sh` looks for one (`voice-llm discover`): ports 8080 and 8081 on
-  this machine's /24 (`VOICE_LLM_DISCOVER_PORTS` to change), 0.3 s connect
-  timeouts in parallel, so about a second and a half; a host counts when its
-  `/v1/models` names a model, and this machine is left out. It lists what it
-  found and, at a terminal, asks before adding the first (or another by
-  number) to the env file; otherwise it prints the lines to add. A URL
-  already set is never replaced.
+  model name and address when asked who it is. The URL is the network
+  tier's *current* server: the swap key moves it along every server on the
+  LAN (see [Swapping models](#swapping-models)). Finding them is
+  `voice-llm discover` (`llm_discovery.py`, the same code the assistant runs
+  in the background): ports 8080, 8081 and 8082 on this machine's /24
+  (`VOICE_LLM_DISCOVER_PORTS` to change), 0.3 s connect timeouts in
+  parallel, so about two seconds; a host counts when its `/v1/models` names a
+  model, and this machine and its configured local server are left out. A
+  server that is still loading answers 503 to everything, so it turns up on
+  the scan after it is ready. When none is configured, `setup.sh` runs it,
+  lists what it found and, at a terminal, asks before adding the first (or
+  another by number) to the env file; otherwise it prints the lines to add.
+  A URL already set is never replaced.
 - **hosted** — the Claude Code CLI (`claude`; "hosted" is accepted as a name).
 
 The backend is `auto` by default:
@@ -922,7 +944,8 @@ change, in waybar's custom-module format so it can be used verbatim:
 States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and the
 second class is `claude`, `local`, `network` or `dsh` (the network tier is
 `network` under either harness). The payload also carries `tier` and `label`
-("Network · qwen3.8-flash-next"), which the indicator and panel show, and
+("Network · qwen3.8-flash-next", with the server's name when several are
+known), which the indicator and panel show, and
 `voice_only` (true adds a third class, `voice-only`). (`waybar-status` is a symlink to the
 same file, for configs written against the old name.)
 
@@ -1074,14 +1097,18 @@ optional.
 
 | variable | default | meaning |
 |---|---|---|
-| `VOICE_ASSISTANT_NETWORK_URL` | (unset) | OpenAI-compatible llama-server on another machine, e.g. `http://llm.lan:8080/v1`; unset = no network tier |
-| `VOICE_ASSISTANT_NETWORK_MODEL` | (asked of the server) | model name sent to that endpoint |
+| `VOICE_ASSISTANT_NETWORK_URL` | (unset) | OpenAI-compatible llama-server on another machine, e.g. `http://llm.lan:8080/v1`; first of the swap key's network stops, and rewritten when the swap lands on another; unset = only what discovery finds |
+| `VOICE_ASSISTANT_NETWORK_MODEL` | (asked of the server) | model name sent to that endpoint; rewritten with the URL |
+| `VOICE_ASSISTANT_NETWORK_DISCOVER_INTERVAL` | `300` | seconds between background looks for model servers on the LAN (also at start and after a swap); `0` = never look |
+| `VOICE_ASSISTANT_NETWORK_DISCOVER_PORTS` | `VOICE_LLM_DISCOVER_PORTS`, else `8080 8081 8082` | ports those looks try |
+| `VOICE_ASSISTANT_NETWORK_SWAP_TIMEOUT` | `0.5` | seconds the swap key waits for a server's `/health` before skipping it |
 | `VOICE_ASSISTANT_NETWORK_HARNESS` | `native` | what drives it: `native` or `dsh` |
 | `VOICE_ASSISTANT_NETWORK_API_KEY` | `none` | if the endpoint wants one |
 | `VOICE_ASSISTANT_NETWORK_TIMEOUT` | `_LOCAL_TIMEOUT` | seconds one completion may take |
 | `VOICE_ASSISTANT_NETWORK_THINK` | `_LOCAL_THINK` | let the network model reason first |
 
-Sampling, history, tools and thinking budget are the `_LOCAL_` settings below.
+Sampling, history, tools and thinking budget are the `_LOCAL_` settings below;
+the key, harness, timeout and thinking above apply to every network server.
 Nothing here starts or stops the remote server.
 
 ### Local model
@@ -1329,6 +1356,7 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 | `web_tools.py` | Keyless web search and page fetch, shared by the local backends |
 | `dsh_web_mcp.py` | The same two tools served to the DeepSeek Harness over MCP |
 | `turn_router.py` | The turn router: one `/judge` call per turn, calibrated, failing open |
+| `llm_discovery.py` | The LAN scan for model servers, shared by `voice-llm discover` and the swap key |
 | `router_calibration.json` | Its rubric fit and thresholds (`~/.config/voice-assistant/` copy wins) |
 | `tests/test_turn_router.py` | Router tests; `.venv/bin/python -m pytest tests` |
 | `setup.sh` | One-shot installer, including the local LLM stack |

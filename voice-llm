@@ -5,8 +5,9 @@
 #   voice-llm status | auto | claude | qwen | network | dsh | logs | discover
 #
 # `network` is a llama-server on another machine (VOICE_ASSISTANT_NETWORK_URL
-# in the env file); nothing here starts or stops it. `discover` looks for one
-# on the LAN and prints what it finds; setup.sh offers the first.
+# in the env file); nothing here starts or stops it. `discover` looks for
+# model servers on the LAN and prints what it finds; setup.sh offers the first,
+# and the running assistant's swap key cycles through all of them.
 #
 # `dsh` is the same local model driven by the DeepSeek Harness (DeepSeek's
 # open-source agent runtime, run locally through its Python SDK) instead of the
@@ -245,87 +246,19 @@ case "${1:-status}" in
 
   discover)
     # OpenAI-compatible servers on this machine's /24, one "<url> <model>
-    # <host name>" line each on stdout, in address order. Polite: two
+    # <host name>" line each on stdout, in address order. Polite: three
     # ports, a short connect timeout, and an HTTP request only to a port that
     # answered. This machine is left out, and so is its configured local
-    # server wherever that is.
-    exec python3 - "$(env_value VOICE_ASSISTANT_LOCAL_URL)" \
-        ${VOICE_LLM_DISCOVER_PORTS:-8080 8081} <<'PY'
-import concurrent.futures as cf
-import ipaddress
-import json
-import os
-import socket
-import subprocess
-import sys
-import urllib.parse
-import urllib.request
-
-local_url, ports = sys.argv[1], [int(p) for p in sys.argv[2:]]
-
-
-def addresses(*args):
-    out = subprocess.run(["ip", "-4", "-o", *args], capture_output=True, text=True).stdout
-    return [ipaddress.ip_interface(w[i + 1]) for w in map(str.split, out.splitlines())
-            for i, x in enumerate(w) if x == "inet"]
-
-
-mine = addresses("addr", "show")
-# The LAN is wherever the default route goes; a docker or VM bridge is not.
-lan_devs = {w[w.index("dev") + 1] for w in map(str.split, subprocess.run(
-    ["ip", "-4", "route", "show", "default"], capture_output=True, text=True
-).stdout.splitlines()) if "dev" in w}
-lan = [a for d in lan_devs for a in addresses("addr", "show", "dev", d, "scope", "global")]
-if not lan:
-    sys.exit("discover: no default route, so no LAN to look on")
-skip = {a.ip for a in mine}
-u = urllib.parse.urlsplit(local_url) if local_url else None
-skip_ep = {(u.hostname, u.port or 80)} if u and u.hostname else set()
-# Never wider than a /24, and never wider than the interface's own subnet.
-nets = {ipaddress.ip_interface(f"{a.ip}/{max(a.network.prefixlen, 24)}").network for a in lan}
-targets = [(str(h), p) for n in nets for h in n.hosts() if h not in skip for p in ports
-           if (str(h), p) not in skip_ep]
-
-
-def open_port(t):
-    try:
-        with socket.create_connection(t, timeout=0.3):
-            return t
-    except OSError:
-        return None
-
-
-def model(t):
-    try:
-        with urllib.request.urlopen(f"http://{t[0]}:{t[1]}/v1/models", timeout=2) as r:
-            d = json.load(r)
-        items = d.get("data") or d.get("models") or []
-        ids = [m.get("id") or m.get("model") or m.get("name") for m in items if isinstance(m, dict)]
-        return next((i for i in ids if i), None)
-    except Exception:
-        return None
-
-
-ex = cf.ThreadPoolExecutor(128)
-found = [t for t in ex.map(open_port, targets) if t]
-models = list(ex.map(model, found))
-names = {}
-for t, m in zip(found, models):
-    if m:
-        # Reverse DNS can hang where there is none; a name is only a label.
-        names[t] = ex.submit(lambda ip: socket.gethostbyaddr(ip)[0], t[0])
-for t, m in zip(found, models):
-    if not m:
-        continue
-    try:
-        name = names[t].result(timeout=1)
-    except Exception:
-        name = "-"
-    print(f"http://{t[0]}:{t[1]}/v1 {m} {name}", flush=True)
-# Not a `with` block, and no normal exit: either would wait out a reverse
-# lookup that is still hanging, and setup.sh reads until this exits.
-os._exit(0)
-PY
+    # server wherever that is. The scanner is llm_discovery.py, the same one
+    # the assistant uses to find the servers its swap key cycles through.
+    DISCOVER_PY="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/llm_discovery.py"
+    [[ -r "$DISCOVER_PY" ]] || DISCOVER_PY="$REPO_DIR/llm_discovery.py"
+    if [[ ! -r "$DISCOVER_PY" ]]; then
+        err "llm_discovery.py not found next to voice-llm or in $REPO_DIR"
+        exit 1
+    fi
+    exec python3 -I "$DISCOVER_PY" --exclude "$(env_value VOICE_ASSISTANT_LOCAL_URL)" \
+        ${VOICE_LLM_DISCOVER_PORTS:-8080 8081 8082}
     ;;
 
   *)
@@ -338,7 +271,7 @@ PY
     echo "  claude   force Claude and stop the model server (frees the GPU)"
     echo "           add --disable to keep it from starting at boot"
     echo "  logs     follow the model server"
-    echo "  discover look for a model server on the LAN (for VOICE_ASSISTANT_NETWORK_URL)"
+    echo "  discover model servers on the LAN (the swap key's network stops)"
     exit 2
     ;;
 esac

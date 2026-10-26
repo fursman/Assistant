@@ -230,6 +230,10 @@ def tiers(monkeypatch):
     """A network model configured, nothing reachable, nothing written."""
     monkeypatch.setattr(va, "NETWORK_LLM_URL", "http://llm.lan:8080/v1")
     monkeypatch.setattr(va, "NETWORK_LLM_MODEL", "qwen3.8-flash-next")
+    # Whatever this machine's env configured, and whatever a scan found: the
+    # current URL is then the one network server, as these tests mean it.
+    monkeypatch.setattr(va, "NETWORK_LLM_CONFIGURED", ("", ""))
+    monkeypatch.setattr(va, "_DISCOVERED_SERVERS", [])
     monkeypatch.setattr(va, "NETWORK_HARNESS", "native")
     monkeypatch.setattr(va, "LOCAL_HARNESS", "native")
     monkeypatch.setattr(va, "LOCAL_LLM_MODEL", "qwen3.8-27b")

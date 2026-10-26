@@ -3,7 +3,7 @@
 
     assistant what is using all my disk space
     assistant "remind me what we decided about the tomatoes"
-    assistant --swap                 # local -> network -> Claude, with a notification
+    assistant --swap                 # local -> each network server -> Claude, notified
     assistant --backend network      # or local, claude (hosted), dsh, auto
     assistant --model fable          # or opus, sonnet, haiku
     assistant --effort xhigh         # or low, medium, high, max
@@ -82,8 +82,8 @@ def main():
     p.add_argument("words", nargs="*", help="your question, quoted or not")
     p.add_argument("--speak", action="store_true", help="read the answer aloud too")
     p.add_argument("--swap", action="store_true",
-                   help="cycle local model -> network model -> Claude, skipping "
-                        "a tier this machine does not have")
+                   help="cycle local model -> each network model server found on "
+                        "the LAN -> Claude, skipping what is not here or not answering")
     p.add_argument("--model", choices=("opus", "sonnet", "haiku", "fable"),
                    help="Claude model to use from here on")
     p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
@@ -133,7 +133,18 @@ def main():
         print(f"model      {r['label']}  (preference: {r['preference']})")
         print(f"local llm  {r['local_llm']}")
         if r.get("network_llm"):
-            print(f"network    {r['network_llm']}")
+            print(f"network    {r['network_llm']}  {r.get('network_url') or ''}".rstrip())
+        servers = r.get("network_servers")
+        if servers is not None:
+            scan = r.get("network_scan")
+            when = ("discovery off" if scan == "off" else "first scan pending" if scan == "pending"
+                    else f"scanned {scan // 60} min ago" if isinstance(scan, int) and scan >= 60
+                    else "scanned just now" if isinstance(scan, int) else "")
+            print(f"servers    {len(servers)} known{f'  ({when})' if when else ''}")
+            for s in servers:
+                mark = "*" if s.get("current") else " "
+                print(f"         {mark} {s.get('label', '?'):<18} {s.get('model') or '?':<24} {s['url']}"
+                      + ("  (configured)" if s.get("configured") else ""))
         print(f"dsh        {r.get('dsh', 'unknown')}")
         print(f"voice      {voice}{'  (busy)' if r['busy'] else ''}")
         if "voice_only" in r:

@@ -383,11 +383,15 @@ VOICE_ASSISTANT_LOCAL_THINK=0
 VOICE_ASSISTANT_LOCAL_THINK_BUDGET=8192
 
 # --- network backend (a llama-server on another machine; unset = none) ---
-# The swap key cycles local -> network -> Claude, skipping what is not here.
-# The model name is asked of the server when not given.
+# The swap key cycles local -> each network server -> Claude, skipping what is
+# not here or not answering. The servers are this one plus any the assistant
+# finds on the LAN (ports 8080-8082, every 5 minutes; 0 = never look), and the
+# swap writes the one it lands on back here. The model name is asked of the
+# server when not given.
 #VOICE_ASSISTANT_NETWORK_URL=http://llm.lan:8080/v1
 #VOICE_ASSISTANT_NETWORK_MODEL=
 #VOICE_ASSISTANT_NETWORK_HARNESS=native
+#VOICE_ASSISTANT_NETWORK_DISCOVER_INTERVAL=300
 
 # --- tool access for the local model ---
 # 1 = the model can run arbitrary shell commands (parity with the Claude
@@ -438,7 +442,7 @@ fi
 if grep -qE '^VOICE_ASSISTANT_NETWORK_URL=.+' "$ENV_FILE"; then
     log_info "Network model: $(grep -E '^VOICE_ASSISTANT_NETWORK_URL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
 else
-    log_info "Looking for a model server on the LAN (ports ${VOICE_LLM_DISCOVER_PORTS:-8080 8081})..."
+    log_info "Looking for a model server on the LAN (ports ${VOICE_LLM_DISCOVER_PORTS:-8080 8081 8082})..."
     mapfile -t FOUND < <("$SCRIPT_DIR/voice-llm" discover 2>/dev/null || true)
     if (( ${#FOUND[@]} == 0 )); then
         log_info "  none found (set VOICE_ASSISTANT_NETWORK_URL in $ENV_FILE to add one)"
