@@ -175,6 +175,8 @@ def env(monkeypatch):
     monkeypatch.setattr(va, "HARD_URL", "")
     monkeypatch.setattr(va, "HARD_MODEL", "")
     monkeypatch.setattr(va, "LOCAL_TOOLS_ENABLED", True)
+    # Whether the model sees is a GET /props on the configured server: not here.
+    monkeypatch.setattr(va, "_server_vision", lambda url, timeout=1.0: False)
 
 
 # --- thinking on demand ------------------------------------------------------------

@@ -59,4 +59,4 @@ alt-tts = ["supertonic"]
 voice-assistant = "voice_assistant:main"
 
 [tool.setuptools]
-py-modules = ["voice_assistant", "web_tools", "dsh_web_mcp", "turn_router"]
+py-modules = ["voice_assistant", "web_tools", "look_tools", "dsh_web_mcp", "turn_router"]

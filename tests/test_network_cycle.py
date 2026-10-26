@@ -132,6 +132,20 @@ def test_one_server_behaves_as_before(tmp_path, lan, monkeypatch):
     assert host._backend_label() == "Network · qwen3.8-flash-next", "no server name with one"
 
 
+def test_each_press_asks_the_new_server_whether_it_sees(tmp_path, lan, monkeypatch):
+    """Whether a model takes images (and so gets `look`) is cached per server;
+    a press forgets the answer for where it lands, which may now serve another
+    model, and asks nothing on the key itself."""
+    bases = [u.removesuffix("/v1") for u in (CONFIGURED, FLASH, NEMOTRON, QWEN_4060)]
+    monkeypatch.setattr(va, "_VISION", {b: (b.endswith(":8082"), 0.0, True) for b in bases})
+    monkeypatch.setattr(va, "_server_vision", lambda *a, **k: pytest.fail("no /props on a keypress"))
+    host = CycleHost(tmp_path, local="ready")
+    press(host, 1)                              # local
+    for landed in press(host, 4):               # each network server
+        assert landed.removesuffix("/v1") not in va._VISION
+    assert set(va._VISION) == set(), "all four asked afresh on their next turn"
+
+
 def test_no_network_server_at_all(tmp_path, lan, monkeypatch):
     monkeypatch.setattr(va, "_DISCOVERED_SERVERS", [])
     monkeypatch.setattr(va, "NETWORK_LLM_CONFIGURED", ("", ""))

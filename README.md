@@ -50,7 +50,7 @@ network in each mode.
 - [Quick start](#quick-start) · [Requirements](#requirements) · [How it works](#how-it-works) · [Features](#features)
 - [Control](#control) · [LLM backends](#llm-backends-claude-or-a-local-qwen38-27b)
 - [Speech recognition](#speech-recognition) · [End of turn](#end-of-turn) · [Speech synthesis](#speech-synthesis) · [Making text speakable](#making-text-speakable)
-- [Knowing that time passed](#knowing-that-time-passed) · [Turn router](#turn-router) · [Web search](#web-search) · [Desktop](#desktop) · [Configuration](#configuration)
+- [Knowing that time passed](#knowing-that-time-passed) · [Turn router](#turn-router) · [Web search](#web-search) · [Seeing](#seeing-the-look-tool) · [Desktop](#desktop) · [Configuration](#configuration)
 - [Privacy](#privacy-and-what-leaves-the-machine) · [Power and GPU passthrough](#power-suspend-and-gpu-passthrough) · [Troubleshooting](#troubleshooting)
 - [Addendum: for the next reader, human or model](#addendum-for-the-next-reader-human-or-model)
 
@@ -210,6 +210,7 @@ what the other said.
 assistant what is using all my disk space
 assistant "remind me what we decided about the tomatoes"
 echo "summarise this" | assistant          # reads stdin when given no words
+assistant --image ~/Downloads/x.png "what is this"   # send a picture with the question
 assistant --speak "and read that one out"  # typed questions are silent by default
 assistant --status                         # model, servers (network ones too), voice state, session
 assistant --new                            # start a fresh conversation
@@ -319,6 +320,7 @@ switches over on its own the moment the model is ready. No restart, and no dead 
 | first token | ~0.9 s (persistent process) | 0.45–0.71 s | ~0.15 s warm, 3–4 s on a fresh runtime |
 | shell / filesystem | yes | yes (`run_shell`) | yes (persistent `bash`, `str_replace_editor`) |
 | web access | yes | `web_search` / `fetch_page` | the same two, over MCP |
+| images | reads image files | `look`, on a server with vision ([Seeing](#seeing-the-look-tool)) | no |
 | network required | yes | no (search excepted) | no (search excepted) |
 | VRAM while running | 0 | ~15.3 GB of 16 GB | ~15.3 GB of 16 GB |
 
@@ -862,6 +864,55 @@ real, well-covered company did not exist.
 Searches are the one thing that leaves the machine in local mode. Claude, being
 a hosted model, has its own web access.
 
+## Seeing: the look tool
+
+A llama-server model that takes images gets a fourth tool in the native loop,
+`look`, with one argument, `source`:
+
+| source | what it sends |
+|---|---|
+| `screen` | a screenshot: `grim` on Hyprland and Sway (the focused monitor), the xdg-desktop-portal on GNOME |
+| `camera` | one frame from the first webcam, by `ffmpeg` (MJPEG 1280x720, else the camera's defaults) |
+| `file` | an image file, with `path`; `~` expands and a relative path starts at home |
+
+**When it is offered:** only while the model answering advertises vision.
+llama-server says so at `GET /props` (`"modalities": {"vision": true}`, when it
+was started with `--mmproj`); the answer is cached per server and asked again on
+every swap (SUPER+M, `assistant --backend`, "switch to ..."). No answer, or
+anything but a literal `true`, is no: offering images to a model that cannot
+take them fails the whole turn. Claude needs nothing new (it opens image files
+itself; on Hyprland and Sway it is told that `grim` takes the screenshot), and
+the DeepSeek Harness has tools of its own and does not get `look`.
+
+"What's on my screen", "what am I holding", "look at this" and "describe the
+picture in Downloads" are what it is for, and the prompt says so. Saying so was
+not enough: asked "what's on my screen" under the voice prompt, Nemotron 3.5
+Super VL twice described a screen it had invented without calling `look`. So a
+turn whose words ask to look (screen, camera, image, picture, photo, "look at
+this", "what am I holding", ...) has to call a tool on its first step
+(`tool_choice: required`, `VOICE_ASSISTANT_LOOK_FORCE=0` to stop it), and any
+words written before that call are dropped rather than spoken: forced, the same
+model first wrote another invented description, then looked. The router's rubric
+asks about the web and the shell but not about seeing, so such a turn also keeps
+its tools when the verdict wanted none, and stays off the hard lane, whose
+backend gets no tools.
+
+The image is downscaled before it is sent (longest side 1280 px, JPEG), and it
+rides inside the tool result as an OpenAI `image_url` part, which llama-server
+accepts in a `tool` message. It is kept for the turn only: in the saved history
+it becomes a note, `[image of the screen, 20:15]`, so later turns do not resend
+hundreds of tokens of picture, and the model knows to look again. Nothing is
+written to disk; the capture lives in a temporary directory until it is encoded.
+Measured on the network Nemotron 3.5 Super VL (one slot, ~23 ms per prompt
+token): a 1280x720 screenshot is ~1,000 prompt tokens and 28 s to an answer,
+768 px ~400 tokens and 14 s; a whole "what's on my screen" turn, the call and
+then the answer, took 41 s, of which the capture was 0.14 s. On a slow server
+`VOICE_ASSISTANT_LOOK_MAX_SIDE=768` halves the wait at the cost of small text.
+
+`assistant --image FILE "question"` attaches a picture to a typed question:
+a model that sees gets the image itself, Claude gets the path and opens it, and
+a model that cannot see is told one was attached.
+
 ## Desktop
 
 The assistant does not care which desktop it is on: it talks to the screen
@@ -1142,6 +1193,19 @@ Nothing here starts or stops the remote server.
 | `VOICE_ASSISTANT_WEB_PAGE_CHARS` | `4000` | characters of a fetched page |
 | `VOICE_ASSISTANT_WEB_TIMEOUT` | `12` | seconds for a search or fetch |
 
+### Seeing
+
+| variable | default | meaning |
+|---|---|---|
+| `VOICE_ASSISTANT_LOOK` | `1` | offer `look` to a model that advertises vision |
+| `VOICE_ASSISTANT_LOOK_FORCE` | `1` | a turn that asks to look must call a tool first |
+| `VOICE_ASSISTANT_LOOK_MAX_SIDE` | `1280` | longest side of the image sent, in pixels |
+| `VOICE_ASSISTANT_LOOK_SCREEN` | `focused` | `focused` monitor or `all` of them (Hyprland, Sway) |
+| `VOICE_ASSISTANT_LOOK_CAMERA` | (first webcam) | a `/dev/video*` path, or a command that writes one frame to `{file}`, e.g. `cam look {file}` |
+| `VOICE_ASSISTANT_LOOK_MAX_FILE_MB` | `40` | image files bigger than this are refused |
+| `VOICE_ASSISTANT_LOOK_TIMEOUT` | `20` | seconds one capture or conversion may take |
+| `VOICE_ASSISTANT_LOOK_ATTACH` | `tool` | `tool`: the image inside the tool result; `user`: in a user message after it, for a server that will not take images in a tool message |
+
 ### Turn router
 
 | variable | default | meaning |
@@ -1257,7 +1321,9 @@ win over both.
 Audio is never uploaded in any mode: VAD, transcription, end-of-turn detection
 and synthesis are all local, always. In local mode the only outbound traffic is
 `web_search` / `fetch_page`, and only when the model chooses to use them. Model
-weights are downloaded once, on first run.
+weights are downloaded once, on first run. A screenshot or camera frame is taken
+only when the model calls `look`, and goes where the transcript goes: nowhere on
+the local backend, to the LAN server on the network one.
 
 Nothing is recorded until you press the key, and nothing is kept on disk
 unless you turn on `VOICE_ASSISTANT_SAVE_TURNS`. With voice unlock or voice-only
@@ -1354,6 +1420,7 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 |------|-------------|
 | `voice_assistant.py` | The assistant |
 | `web_tools.py` | Keyless web search and page fetch, shared by the local backends |
+| `look_tools.py` | Screenshot, webcam frame and image file for `look`, downscaled to JPEG |
 | `dsh_web_mcp.py` | The same two tools served to the DeepSeek Harness over MCP |
 | `turn_router.py` | The turn router: one `/judge` call per turn, calibrated, failing open |
 | `llm_discovery.py` | The LAN scan for model servers, shared by `voice-llm discover` and the swap key |

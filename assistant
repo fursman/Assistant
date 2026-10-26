@@ -3,6 +3,7 @@
 
     assistant what is using all my disk space
     assistant "remind me what we decided about the tomatoes"
+    assistant --image ~/Downloads/plant.jpg "what is wrong with this leaf"
     assistant --swap                 # local -> each network server -> Claude, notified
     assistant --backend network      # or local, claude (hosted), dsh, auto
     assistant --model fable          # or opus, sonnet, haiku
@@ -18,6 +19,9 @@ either one can refer to what the other said.
 Nothing is spoken unless you ask for it with --speak, on the assumption that
 if you are typing you would rather read the answer than wait for it to be
 read out.
+
+With --image, a model that can see gets the picture itself; Claude gets its
+path and opens it; a model that cannot see is told it was attached.
 """
 import argparse
 import json
@@ -81,6 +85,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("words", nargs="*", help="your question, quoted or not")
     p.add_argument("--speak", action="store_true", help="read the answer aloud too")
+    p.add_argument("--image", metavar="FILE",
+                   help="send this image with the question (PNG, JPEG, GIF, WebP, BMP, TIFF)")
     p.add_argument("--swap", action="store_true",
                    help="cycle local model -> each network model server found on "
                         "the LAN -> Claude, skipping what is not here or not answering")
@@ -111,14 +117,24 @@ def main():
         r = request({"cmd": "new_session"})
     else:
         question = " ".join(args.words).strip()
-        if not question:
+        if not question and not (args.image and sys.stdin.isatty()):
             if sys.stdin.isatty():
                 p.print_help()
                 return 0
             question = sys.stdin.read().strip()      # assistant < notes.txt
+        if not question and args.image:
+            question = "What is in this image?"
         if not question:
             die("nothing to ask")
-        r = request({"cmd": "ask", "text": question, "speak": args.speak})
+        payload = {"cmd": "ask", "text": question, "speak": args.speak}
+        if args.image:
+            # The service has another working directory: send the whole path.
+            # Whether it is an image the service checks, with the rest.
+            image = Path(args.image).expanduser().resolve()
+            if not image.is_file():
+                die(f"no such file: {args.image}")
+            payload["image"] = str(image)
+        r = request(payload)
 
     if args.json:
         print(json.dumps(r, indent=2))
