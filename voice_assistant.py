@@ -478,8 +478,11 @@ _SERVED_MODELS = {}
 
 def _llm_tier(name: str = "local") -> LlmTier:
     if name == "network":
+        # What the server says it serves wins over the env file's name: a
+        # server swapped to another model (Flash-Next -> Nemotron) is not
+        # announced, or introduced to itself, as the old one.
         return LlmTier("network", NETWORK_LLM_URL,
-                       NETWORK_LLM_MODEL or _SERVED_MODELS.get(NETWORK_LLM_URL, ""),
+                       _SERVED_MODELS.get(NETWORK_LLM_URL, "") or NETWORK_LLM_MODEL,
                        NETWORK_HARNESS, NETWORK_LLM_API_KEY or "none",
                        NETWORK_LLM_TIMEOUT, NETWORK_LLM_THINK)
     return LlmTier("local", LOCAL_LLM_URL, LOCAL_LLM_MODEL, LOCAL_HARNESS,
@@ -534,8 +537,9 @@ def _network_servers() -> list:
     url, model = NETWORK_LLM_CONFIGURED
     if url:
         hit = found.pop(_server_key(url), None)
-        # Its own URL and model, as written: the user chose them.
-        out.append(NetworkServer(url, model or (hit.model if hit else ""), hit.name if hit else ""))
+        # Its own URL, as written: the user chose it. The model is what it
+        # serves now, the configured name only while it has not said.
+        out.append(NetworkServer(url, (hit.model if hit else "") or model, hit.name if hit else ""))
     out.extend(found[k] for k in sorted(found, key=_address_order))
     return out
 
@@ -558,12 +562,14 @@ def _network_server_name(url: str, servers: list = None) -> str:
 
 def _use_network_server(server: NetworkServer, model: str = ""):
     """Make `server` the network tier's: what _llm_tier("network") builds from
-    and what the env file says. The configured server keeps its configured
-    model name; any other is named by what it serves."""
+    and what the env file says. Named by what it serves (`model`, fresh from
+    the server, else the scan's); the configured name only when neither has
+    an answer."""
     global NETWORK_LLM_URL, NETWORK_LLM_MODEL
     configured_url, configured_model = NETWORK_LLM_CONFIGURED
-    if configured_url and _server_key(server.url) == _server_key(configured_url):
-        model = configured_model or model
+    if not (model or server.model) and configured_url \
+            and _server_key(server.url) == _server_key(configured_url):
+        model = configured_model
     NETWORK_LLM_URL, NETWORK_LLM_MODEL = server.url, model or server.model
     _write_env_setting("VOICE_ASSISTANT_NETWORK_URL", NETWORK_LLM_URL)
     _write_env_setting("VOICE_ASSISTANT_NETWORK_MODEL", NETWORK_LLM_MODEL)
@@ -6785,6 +6791,16 @@ class VoiceAssistant:
         for srv in found:
             _SERVED_MODELS[srv.url] = srv.model     # fresher than a first answer
         _DISCOVERED_SERVERS, _DISCOVERED_AT = found, time.time()
+        # The current server now serves another model: name it so in the
+        # env file too, so a restart and `voice-llm status` agree.
+        global NETWORK_LLM_MODEL
+        now = next((s.model for s in found
+                    if NETWORK_LLM_URL and _server_key(s.url) == _server_key(NETWORK_LLM_URL)), "")
+        if now and now != NETWORK_LLM_MODEL:
+            self.logger.info(f"Network server {NETWORK_LLM_URL} now serves {now} "
+                             f"(was {NETWORK_LLM_MODEL or 'unnamed'})")
+            NETWORK_LLM_MODEL = now
+            _write_env_setting("VOICE_ASSISTANT_NETWORK_MODEL", now)
         if {(s.url, s.model) for s in found} != before:
             self.logger.info(
                 f"Network model servers on the LAN: {len(found)}"

@@ -216,8 +216,12 @@ def test_the_env_file_keeps_its_other_lines(tmp_path, monkeypatch):
                                "VOICE_ASSISTANT_NETWORK_MODEL=qwen3.8-27b\n"
                                "VOICE_ASSISTANT_LOCAL_THINK=0\n")
     assert (va.NETWORK_LLM_URL, va.NETWORK_LLM_MODEL) == (QWEN_4060, "qwen3.8-27b")
-    # Back to the configured one: its configured model name, not a guess.
-    va._use_network_server(va.NetworkServer(CONFIGURED, "something-else", ""))
+    # Back to the configured one: named by what it serves now, which may no
+    # longer be what the env file was written for...
+    va._use_network_server(va.NetworkServer(CONFIGURED, "nemotron-3.5-super-vl", ""))
+    assert va.NETWORK_LLM_MODEL == "nemotron-3.5-super-vl"
+    # ...and by the configured name only while it has not said.
+    va._use_network_server(va.NetworkServer(CONFIGURED, "", ""))
     assert va.NETWORK_LLM_MODEL == "qwen3.8-flash-next"
 
 
@@ -304,6 +308,23 @@ def test_discovery_replaces_the_list_and_learns_the_models(tmp_path, lan, monkey
     monkeypatch.setattr(llm_discovery, "scan", broken)
     assert not host._discover_network_servers()
     assert [s.url for s in va._network_servers()] == [CONFIGURED, QWEN_4060], "kept"
+
+
+def test_a_server_that_changed_models_is_named_by_the_new_one(tmp_path, lan, monkeypatch):
+    # The cluster went from Flash-Next to Nemotron on the same URL; the env
+    # file still says Flash-Next.
+    monkeypatch.setattr(llm_discovery, "scan", lambda ports, exclude=(): [
+        llm_discovery.Server("http://192.168.1.105:8080/v1", "nemotron-3.5-super-vl", "")])
+    monkeypatch.setattr(llm_discovery.socket, "gethostbyname", lambda name: "192.168.1.105")
+    monkeypatch.setattr(va, "_DISCOVERED_SERVERS", [])
+    host = CycleHost(tmp_path, local="absent")
+    host._switch_backend("network")
+    assert host._backend_label() == "Network · qwen3.8-flash-next"
+    assert host._discover_network_servers()
+    assert host._backend_label() == "Network · nemotron-3.5-super-vl"
+    assert va._llm_tier("network").model == "nemotron-3.5-super-vl", "what it is told it is"
+    assert ("VOICE_ASSISTANT_NETWORK_MODEL", "nemotron-3.5-super-vl") in lan["written"]
+    assert va._network_servers()[0].model == "nemotron-3.5-super-vl"
 
 
 # --- the scanner -------------------------------------------------------------
