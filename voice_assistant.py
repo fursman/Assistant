@@ -70,6 +70,7 @@ from silero_vad import load_silero_vad
 
 import llm_discovery  # the LAN scan, shared with `voice-llm discover`
 import look_tools  # screenshots, webcam frames and image files for `look`
+import weather_tools  # Open-Meteo, shared with the dsh MCP sidecar
 import web_tools  # search and fetch, shared with the dsh MCP sidecar
 
 # The turn router is optional twice over: it needs `requests`, and it needs
@@ -902,6 +903,28 @@ LOCAL_TOOLS = [{
             "required": ["url"],
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "weather",
+        "description": (
+            "Current weather and a short forecast for a place: temperature, what it "
+            "feels like, rain or snow, wind, and each day's high, low and chance of "
+            "precipitation. Use this for any question about the weather, now or in "
+            "the next few days, instead of web_search. Leave place empty for the "
+            "user's own location."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "place": {"type": "string", "description": (
+                    "Town or city, with its province, state or country when the name "
+                    "is ambiguous, e.g. \"Victoria, BC\". Empty for where the user is.")},
+                "days": {"type": "integer", "description": (
+                    "Days of forecast, today included, 1 to 7. Default 3.")},
+            },
+        },
+    },
 }]
 
 # Offered after LOCAL_TOOLS when the model can see. One tool with a source,
@@ -961,6 +984,19 @@ _LOOK_HINT = re.compile(
     r"(?:what do|what can|can|do) you see|what (?:am i|i'?m|i am) holding|am i holding|"
     r"holding (?:up|this|that)|camera|webcam|image|picture|photo|png|jpe?g)\b", re.IGNORECASE)
 
+# Words that ask about the weather. The router's web question names weather,
+# so such a turn usually gets its tools anyway; this keeps them when the
+# verdict says no tool, and keeps the turn off the hard lane, whose backend
+# has none -- a forecast is not something to reason out. Narrow like
+# _LOOK_HINT: "rain" alone is the band, the name and the verb as often as the
+# sky.
+_WEATHER_HINT = re.compile(
+    r"\b(weather|forecast|(?:is it|will it|it'?s|is it going to|it'?s going to|"
+    r"gonna) (?:rain|snow|be (?:hot|cold|warm|sunny|windy|wet))(?:ing)?|"
+    r"how (?:hot|cold|warm|windy) is it|temperature (?:outside|out there|today|"
+    r"tonight|tomorrow|in|at|on|right now)|(?:outside|current) temperature|"
+    r"need (?:an umbrella|a jacket|a coat))\b", re.IGNORECASE)
+
 # What both backends are told about speaking, and about the process they live
 # inside. The transcript caveat is not decoration: the input is automatic
 # speech recognition with a few percent word error rate, and both backends can
@@ -1013,10 +1049,13 @@ LOCAL_VOICE_PROMPT = (
     "character you produce is read aloud. Write symbols, units and numbers as "
     "words where a person would say them. Do not read out raw command output "
     "verbatim; summarise it in a sentence.\n\n"
-    "You have three tools. web_search looks something up online; use it for "
+    "You have four tools. web_search looks something up online; use it for "
     "anything you do not know, anything recent, and any person, company or "
     "product you cannot place, rather than answering from memory and hoping. "
-    "fetch_page reads one page you found. run_shell executes commands on this "
+    "fetch_page reads one page you found. weather gives the current conditions "
+    "and the next few days for a place; use it, not web_search, for any "
+    "question about the weather, and say what it returns in one sentence. "
+    "run_shell executes commands on this "
     "machine, for when the answer depends on the state of the system or the "
     "user asks you to do something -- just do it rather than explaining how.\n\n"
     "Never search with run_shell and curl: the search engines block it, and "
@@ -1049,7 +1088,10 @@ DSH_VOICE_PROMPT = (
     "mcp__web__web_search looks something up online; use it for anything you do "
     "not know, anything recent, and any person, company or product you cannot "
     "place, rather than answering from memory and hoping. mcp__web__fetch_page "
-    "reads one page you found. str_replace_editor edits files.\n\n"
+    "reads one page you found. mcp__web__weather gives the current conditions "
+    "and the next few days for a place; use it, not mcp__web__web_search, for "
+    "any question about the weather, and say what it returns in one sentence. "
+    "str_replace_editor edits files.\n\n"
     "Never search with bash and curl: the search engines block it, and "
     "mcp__web__web_search is the tool that works. If it comes back empty, the "
     "thing really is obscure -- say you could not find it. Do not invent an "
@@ -3104,10 +3146,17 @@ class DshSession:
             except OSError:
                 pass
 
+    @staticmethod
+    def _sidecar_env() -> dict:
+        return {k: os.environ[k] for k in web_tools.ENV_VARS if os.environ.get(k)}
+
     def _write_patch(self) -> Path:
         """The profile overlay: our bash description and timeout, and the web
         tools as an MCP server. Rewritten every start so paths are always this
-        checkout's and this interpreter's."""
+        checkout's and this interpreter's. The harness hands an MCP server only
+        HOME, PATH and a few more of its environment, so the web and weather
+        settings (VOICE_ASSISTANT_SEARXNG_URL, ...) are passed here or the
+        sidecar would never see them."""
         here = Path(__file__).resolve().parent
         bash_desc = (
             "Run commands in a bash shell on the user's Linux desktop "
@@ -3131,7 +3180,7 @@ class DshSession:
             "        transport: stdio\n"
             f"        command: {json.dumps(sys.executable)}\n"
             f"        args: [{json.dumps(str(here / 'dsh_web_mcp.py'))}]\n"
-            "        env: {}\n"
+            f"        env: {json.dumps(self._sidecar_env())}\n"
             f"        cwd: {json.dumps(str(Path.home()))}\n"
             f"        toolCallTimeoutMs: {int(web_tools.WEB_TIMEOUT * 1000 * 3)}\n"
             "        failOnStartupError: false\n")
@@ -4715,7 +4764,7 @@ class VoiceAssistant:
             "Glob": "Searching files", "Grep": "Searching code",
             "WebSearch": "Searching web", "WebFetch": "Fetching page",
             "Task": "Running agent", "NotebookEdit": "Editing notebook",
-            "Look": "Looking",
+            "Look": "Looking", "Weather": "Checking weather",
         }
         label = labels.get(tool_name, f"Using {tool_name}")
         # Two audiences. The popup is glanced at, so it gets a short summary.
@@ -4748,6 +4797,9 @@ class VoiceAssistant:
             exact = args.get("url", "")
             if exact:
                 detail = f"\n{exact[:120]}"
+        elif tool_name == "Weather":
+            exact = args.get("place") or weather_tools.WEATHER_PLACE or "here"
+            detail = f"\n{exact[:120]}"
         elif tool_name == "Look":
             exact = args.get("path") or {"screen": "at the screen",
                                          "camera": "through the camera"}.get(args.get("source"), "")
@@ -4899,6 +4951,9 @@ class VoiceAssistant:
 
     def _fetch_page_tool(self, url: str) -> str:
         return web_tools.fetch_page(url, self.logger)
+
+    def _weather_tool(self, place: str, days=None) -> str:
+        return weather_tools.weather(place, days, self.logger)
 
     def _llm_sees(self) -> bool:
         """Whether the model the native loop is talking to takes images."""
@@ -5108,9 +5163,11 @@ class VoiceAssistant:
         offer_look = sees and LOOK_ENABLED and LOCAL_TOOLS_ENABLED
         image = self._turn_image if sees else None
         look_hint = offer_look and bool(_LOOK_HINT.search(text))
+        weather_hint = LOCAL_TOOLS_ENABLED and bool(_WEATHER_HINT.search(text))
 
         v = self._router_verdict
-        hard = bool(v is not None and getattr(v, "hard", False)) and not (look_hint or image)
+        hard = bool(v is not None and getattr(v, "hard", False)) \
+            and not (look_hint or weather_hint or image)
         use_hard = hard and allow_hard and self._hard_backend_ready()
         model = llm.model
         if use_hard:
@@ -5184,6 +5241,10 @@ class VoiceAssistant:
             # The rubric asks about the web and the shell, never about seeing:
             # "what's on my screen" can come back as no tool at all.
             self.logger.info("Router: no tool wanted, but the turn asks to look; tools stay on")
+            tool_choice = "auto"
+        elif tool_choice == "none" and weather_hint:
+            self.logger.info("Router: no tool wanted, but the turn asks about the weather; "
+                             "tools stay on")
             tool_choice = "auto"
 
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
@@ -5356,6 +5417,10 @@ class VoiceAssistant:
                     url = c["parsed"].get("url", "")
                     self._notify_tool_use("WebFetch", json.dumps({"url": url}))
                     result = self._fetch_page_tool(url)
+                elif c["name"] == "weather":
+                    place = str(c["parsed"].get("place") or "")
+                    self._notify_tool_use("Weather", json.dumps({"place": place}))
+                    result = self._weather_tool(place, c["parsed"].get("days"))
                 elif c["name"] == "look" and offer_look:
                     source = str(c["parsed"].get("source") or "")
                     path = str(c["parsed"].get("path") or "")
@@ -5425,7 +5490,8 @@ class VoiceAssistant:
     # The harness's tool names, as the notifications know them.
     _DSH_TOOL_LABELS = {"bash": "Bash", "str_replace_editor": "Edit",
                         "mcp__web__web_search": "WebSearch",
-                        "mcp__web__fetch_page": "WebFetch"}
+                        "mcp__web__fetch_page": "WebFetch",
+                        "mcp__web__weather": "Weather"}
 
     def _ledger(self) -> "DshSession":
         """The shared conversation ledger (it lives on the DshSession object,
@@ -6471,7 +6537,7 @@ class VoiceAssistant:
     @staticmethod
     def _hard_voice_prompt() -> str:
         """The local system prompt without its tools paragraph: the hard backend gets none."""
-        cut = LOCAL_VOICE_PROMPT.find("\n\nYou have three tools")
+        cut = LOCAL_VOICE_PROMPT.find("\n\nYou have four tools")
         head = LOCAL_VOICE_PROMPT[:cut] if cut != -1 else LOCAL_VOICE_PROMPT
         return head + ("\n\nYou have no tools on this turn: answer from what you know, "
                        "and say so when you are not sure.")

@@ -4,9 +4,14 @@
 The harness's minimal profile gives the model a shell and a file editor and
 nothing for the web; its own web_search needs an Exa, Perplexity or DeepSeek
 API key. This sidecar exposes the assistant's keyless `web_search` and
-`fetch_page` (web_tools.py) as an MCP server over stdio, and the harness is
-told about it by the patch voice_assistant.py writes into its home. Inside the
-harness the tools are named `mcp__web__web_search` and `mcp__web__fetch_page`.
+`fetch_page` (web_tools.py) and `weather` (weather_tools.py) as an MCP server
+over stdio, and the harness is told about it by the patch voice_assistant.py
+writes into its home. Inside the harness the tools are named
+`mcp__web__web_search`, `mcp__web__fetch_page` and `mcp__web__weather`.
+
+The harness starts it with only HOME, PATH, SHELL, TERM, USER and LOGNAME of
+its own environment, so the settings these tools read (web_tools.ENV_VARS,
+VOICE_ASSISTANT_SEARXNG_URL among them) are passed in the patch explicitly.
 
 Speaks the MCP JSON-RPC 2.0 stdio transport: one JSON object per line, no
 framing headers. Only the methods a tool server needs are implemented.
@@ -17,6 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import weather_tools  # noqa: E402
 import web_tools  # noqa: E402
 
 # stdout is the wire, so it must flush per message; stderr is the log.
@@ -53,6 +59,25 @@ TOOLS = [{
         "properties": {"url": {"type": "string", "description": "Full URL of the page."}},
         "required": ["url"],
     },
+}, {
+    "name": "weather",
+    "description": (
+        "Current weather and a short forecast for a place: temperature, what it "
+        "feels like, rain or snow, wind, and each day's high, low and chance of "
+        "precipitation. Use this for any question about the weather, now or in "
+        "the next few days, instead of web_search. Leave place empty for the "
+        "user's own location."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "place": {"type": "string", "description": (
+                "Town or city, with its province, state or country when the name "
+                "is ambiguous, e.g. \"Victoria, BC\". Empty for where the user is.")},
+            "days": {"type": "integer", "description": (
+                "Days of forecast, today included, 1 to 7. Default 3.")},
+        },
+    },
 }]
 
 
@@ -61,6 +86,8 @@ def call_tool(name: str, args: dict) -> str:
         return web_tools.web_search(str(args.get("query", "")), log)
     if name == "fetch_page":
         return web_tools.fetch_page(str(args.get("url", "")), log)
+    if name == "weather":
+        return weather_tools.weather(str(args.get("place") or ""), args.get("days"), log)
     raise KeyError(name)
 
 

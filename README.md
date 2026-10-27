@@ -50,7 +50,7 @@ network in each mode.
 - [Quick start](#quick-start) · [Requirements](#requirements) · [How it works](#how-it-works) · [Features](#features)
 - [Control](#control) · [LLM backends](#llm-backends-claude-or-a-local-qwen38-27b)
 - [Speech recognition](#speech-recognition) · [End of turn](#end-of-turn) · [Speech synthesis](#speech-synthesis) · [Making text speakable](#making-text-speakable)
-- [Knowing that time passed](#knowing-that-time-passed) · [Turn router](#turn-router) · [Web search](#web-search) · [Seeing](#seeing-the-look-tool) · [Desktop](#desktop) · [Configuration](#configuration)
+- [Knowing that time passed](#knowing-that-time-passed) · [Turn router](#turn-router) · [Web search](#web-search) · [Weather](#weather) · [Seeing](#seeing-the-look-tool) · [Desktop](#desktop) · [Configuration](#configuration)
 - [Privacy](#privacy-and-what-leaves-the-machine) · [Power and GPU passthrough](#power-suspend-and-gpu-passthrough) · [Troubleshooting](#troubleshooting)
 - [Addendum: for the next reader, human or model](#addendum-for-the-next-reader-human-or-model)
 
@@ -319,7 +319,7 @@ switches over on its own the moment the model is ready. No restart, and no dead 
 |---|---|---|---|
 | first token | ~0.9 s (persistent process) | 0.45–0.71 s | ~0.15 s warm, 3–4 s on a fresh runtime |
 | shell / filesystem | yes | yes (`run_shell`) | yes (persistent `bash`, `str_replace_editor`) |
-| web access | yes | `web_search` / `fetch_page` | the same two, over MCP |
+| web access | yes | `web_search` / `fetch_page` / `weather` | the same three, over MCP |
 | images | reads image files | `look`, on a server with vision ([Seeing](#seeing-the-look-tool)) | no |
 | network required | yes | no (search excepted) | no (search excepted) |
 | VRAM while running | 0 | ~15.3 GB of 16 GB | ~15.3 GB of 16 GB |
@@ -346,7 +346,7 @@ local llama-server** through the
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), DeepSeek's
 open-source agent runtime, instead of the assistant's own tool loop. Same model,
 different harness: its agent loop, a persistent `bash`, a file editor, and the
-assistant's `web_search` / `fetch_page` served to it as an MCP server
+assistant's `web_search` / `fetch_page` / `weather` served to it as an MCP server
 (`dsh_web_mcp.py`). Nothing leaves the machine except the searches.
 
 `setup.sh` installs it with `pip install deepseek-harness-sdk`; the wheel bundles
@@ -852,7 +852,8 @@ time with `VOICE_ASSISTANT_ROUTER_THR_*`.
 
 The local backends get two tools, `web_search` and `fetch_page`, shared by the
 native loop and the DeepSeek Harness (over MCP) so there is one implementation
-and one set of tuned thresholds.
+and one set of tuned thresholds. A third, [`weather`](#weather), answers the
+question search was worst at.
 
 They exist because the model kept trying to search by hand and could not. In one
 session 18 of its 30 shell commands were curl-and-grep against Bing, DuckDuckGo
@@ -863,6 +864,92 @@ real, well-covered company did not exist.
 
 Searches are the one thing that leaves the machine in local mode. Claude, being
 a hosted model, has its own web access.
+
+### SearXNG
+
+Without help, `web_search` has three keyless sources: Bing's RSS feed (often
+blocked), Wikipedia and Google News. They are fine for a company or a person and
+thin for anything live. Asked "current temperature Victoria British Columbia",
+they returned 17 loose matches topping out at 0.26, and the model said it could
+not find it.
+
+[SearXNG](https://docs.searxng.org/) is a self-hosted metasearch engine: it asks
+Google, Bing, Brave, DuckDuckGo, Wikipedia and others on your behalf and merges
+what they say. Point `VOICE_ASSISTANT_SEARXNG_URL` at one and it becomes the
+primary source. Asked the same question through SearXNG, the first two results
+were The Weather Network and Environment Canada with the temperature in the
+snippet.
+
+| | how it is used |
+|---|---|
+| **answers** and **infobox** | first, as `[answer]` and `[infobox]` lines: SearXNG's direct answer when an engine has one, and Wikidata's summary of the thing named |
+| **results** | next, in SearXNG's own order. That order comes from several real engines agreeing, and it is better than word overlap at telling a live weather page from an article about the climate. Word overlap still drops results that share no word with the query, and still decides the "weak matches only" warning |
+| **Wikipedia, Google News** | asked at the same time, and up to two results added below SearXNG's when they match the query strongly (score 0.6 or more) |
+| **Bing** | a fallback only: used when SearXNG is not set, errors, times out (`VOICE_ASSISTANT_SEARXNG_TIMEOUT`, 6 s) or returns nothing that matches. SearXNG already asks Bing properly |
+
+Every source is asked in parallel, so a search takes as long as the slowest
+source it uses, not the sum. A dated result leads with its date, which helps
+with "who won" questions. Unset, nothing changes: the three keyless sources,
+ranked as before.
+
+Docker is the easy way to run one. SearXNG serves only HTML until JSON is
+allowed in its `settings.yml`; without it, the assistant's requests get 403
+Forbidden (the log says what to change):
+
+```yaml
+# searxng/settings.yml
+use_default_settings: true
+server:
+  secret_key: "change-me"       # openssl rand -hex 32
+  limiter: false                # a private LAN instance needs no bot protection
+search:
+  formats: [html, json]
+```
+
+```bash
+docker run -d --name searxng --restart unless-stopped -p 8080:8080 \
+  -v "$PWD/searxng:/etc/searxng" searxng/searxng
+curl 'http://localhost:8080/search?q=test&format=json' | head -c 300
+```
+
+Then add `VOICE_ASSISTANT_SEARXNG_URL=http://<host>:8080` to
+`~/.config/voice-assistant/env` and restart the service. The DeepSeek Harness's
+MCP sidecar is handed this setting along with the other web and weather ones:
+the harness starts an MCP server with only `HOME`, `PATH` and a few others of
+its environment, so they are written into the patch that starts it.
+
+## Weather
+
+`weather` gives the current conditions and a short forecast for a place, from
+[Open-Meteo](https://open-meteo.com/). No key is needed and it answers in about
+a second. Asked for Victoria, it returns:
+
+```
+Weather for Victoria, British Columbia, Canada, as of 14:15 local time:
+Now 11°C (feels like 9°C), light drizzle, humidity 81%, wind 10 km/h from the southwest, gusts 24 km/h, 0.1 mm of precipitation in the last hour.
+Today: light drizzle, high 11°C, low 6°C, 42% chance of precipitation (0.4 mm).
+Tomorrow (Wednesday): heavy drizzle, high 10°C, low 5°C, 32% chance of precipitation (1.9 mm).
+Thursday: light drizzle, high 9°C, low 5°C, 41% chance of precipitation (0.7 mm).
+```
+
+The model turns that into one sentence. Its arguments are `place` and,
+optionally, `days` (today included, 1 to 7, default 3). An empty `place`, or
+"here", is `VOICE_ASSISTANT_WEATHER_PLACE`, this machine's home. The place goes
+to Open-Meteo's geocoder, which matches names only, so a qualifier is checked
+locally: "Victoria, BC" and "Victoria, Texas" each find their own Victoria, and
+an exact name beats a bigger near one ("Victoria" alone is Vitória, Brazil, to
+the geocoder). Units are metric unless `VOICE_ASSISTANT_WEATHER_UNITS=imperial`.
+A place that cannot be found, or a service that does not answer, comes back as
+a sentence telling the model what to say.
+
+The prompt sends weather questions to `weather` rather than `web_search`. It is
+in the native loop and in the DeepSeek Harness (as `mcp__web__weather`). The
+router's web question already names the weather, but a turn whose words ask
+about it ("weather", "forecast", "will it rain", "how cold is it", "temperature
+outside", ...) keeps its tools even when the verdict wanted none, and stays off
+the hard lane, whose backend has no tools. Unlike `look`, the first step is not
+forced to call a tool; if a model turns out to answer the weather from memory,
+forcing can be added the same way.
 
 ## Seeing: the look tool
 
@@ -1192,6 +1279,11 @@ Nothing here starts or stops the remote server.
 | `VOICE_ASSISTANT_WEB_RESULTS` | `6` | search results returned |
 | `VOICE_ASSISTANT_WEB_PAGE_CHARS` | `4000` | characters of a fetched page |
 | `VOICE_ASSISTANT_WEB_TIMEOUT` | `12` | seconds for a search or fetch |
+| `VOICE_ASSISTANT_SEARXNG_URL` | (none) | a [SearXNG](#searxng) instance with JSON enabled, searched first, e.g. `http://searxng.lan:8080` |
+| `VOICE_ASSISTANT_SEARXNG_TIMEOUT` | `6` | seconds to wait for it before the keyless sources answer instead |
+| `VOICE_ASSISTANT_WEATHER_PLACE` | (none) | where [`weather`](#weather) looks when no place is named, e.g. `Victoria, BC` |
+| `VOICE_ASSISTANT_WEATHER_UNITS` | `metric` | `metric` (°C, km/h, mm) or `imperial` (°F, mph, inches) |
+| `VOICE_ASSISTANT_WEATHER_TIMEOUT` | `5` | seconds for each Open-Meteo request |
 
 ### Seeing
 
@@ -1320,7 +1412,9 @@ win over both.
 
 Audio is never uploaded in any mode: VAD, transcription, end-of-turn detection
 and synthesis are all local, always. In local mode the only outbound traffic is
-`web_search` / `fetch_page`, and only when the model chooses to use them. Model
+`web_search` / `fetch_page` / `weather`, and only when the model chooses to use
+them: a search goes to your SearXNG, which passes it on to its engines, when one
+is set, and `weather` sends Open-Meteo the place name and its coordinates. Model
 weights are downloaded once, on first run. A screenshot or camera frame is taken
 only when the model calls `look`, and goes where the transcript goes: nowhere on
 the local backend, to the LAN server on the network one.
@@ -1419,9 +1513,10 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 | File | Description |
 |------|-------------|
 | `voice_assistant.py` | The assistant |
-| `web_tools.py` | Keyless web search and page fetch, shared by the local backends |
+| `web_tools.py` | Web search (SearXNG first when set, keyless sources otherwise) and page fetch, shared by the local backends |
+| `weather_tools.py` | Current weather and forecast from Open-Meteo, shared the same way |
 | `look_tools.py` | Screenshot, webcam frame and image file for `look`, downscaled to JPEG |
-| `dsh_web_mcp.py` | The same two tools served to the DeepSeek Harness over MCP |
+| `dsh_web_mcp.py` | The same three tools served to the DeepSeek Harness over MCP |
 | `turn_router.py` | The turn router: one `/judge` call per turn, calibrated, failing open |
 | `llm_discovery.py` | The LAN scan for model servers, shared by `voice-llm discover` and the swap key |
 | `router_calibration.json` | Its rubric fit and thresholds (`~/.config/voice-assistant/` copy wins) |

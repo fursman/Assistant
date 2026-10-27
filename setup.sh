@@ -400,6 +400,15 @@ VOICE_ASSISTANT_LOCAL_TOOLS=1
 VOICE_ASSISTANT_LOCAL_TOOL_TIMEOUT=30
 VOICE_ASSISTANT_LOCAL_MAX_TOOL_ITERS=5
 
+# --- web search and weather (the local models' web_search and weather tools) ---
+# A SearXNG instance, with the JSON format enabled in its settings.yml, asked
+# first; unset = Bing, Wikipedia and Google News alone, which are thin on
+# anything live.
+#VOICE_ASSISTANT_SEARXNG_URL=http://searxng.lan:8080
+# Where "what's the weather" means when no place is named, and the units.
+#VOICE_ASSISTANT_WEATHER_PLACE=Victoria, BC
+#VOICE_ASSISTANT_WEATHER_UNITS=metric
+
 # --- DeepSeek Harness (backend dsh) ---
 # Its minimal profile has no compaction: past this many prompt tokens the
 # harness gets a fresh session seeded with a recap of the recent exchanges.

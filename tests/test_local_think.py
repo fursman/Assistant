@@ -267,7 +267,7 @@ def test_hard_turn_goes_to_the_hard_backend_without_tools(hard_env, monkeypatch)
     kw = remote.chat.completions.calls[0]
     assert kw["model"] == "flash-next"
     assert "tools" not in kw and "tool_choice" not in kw
-    assert kw["messages"][0]["role"] == "system" and "three tools" not in kw["messages"][0]["content"]
+    assert kw["messages"][0]["role"] == "system" and "four tools" not in kw["messages"][0]["content"]
     assert "no tools on this turn" in kw["messages"][0]["content"]
     assert [m["content"] for m in kw["messages"][1:]] == ["q2", "a2", "q3", "a3", "why does entropy always increase"]
     assert kw["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}

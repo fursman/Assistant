@@ -278,7 +278,7 @@ def test_look_is_offered_when_the_model_sees(settings, monkeypatch):
     host = Host(["Hello."])
     assert host._stream_local_llm("hello", threading.Event()) is True
     kw = host.calls[0]
-    assert _tool_names(kw) == ["run_shell", "web_search", "fetch_page", "look"]
+    assert _tool_names(kw) == ["run_shell", "web_search", "fetch_page", "weather", "look"]
     assert va.LOOK_VOICE_NOTE in kw["messages"][0]["content"]
 
 
