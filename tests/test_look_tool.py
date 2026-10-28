@@ -197,6 +197,9 @@ class FakeCompletions:
             return _Stream([_Chunk(_Delta(content=w)) for w in words]
                            + [_Chunk(_Delta(tool_calls=[_TC(0, "call_1", name, json.dumps(args))])),
                               _Chunk(_Delta(), finish="tool_calls")])
+        if isinstance(step, dict):              # {"text": ..., "finish": "length"}
+            return _Stream([_Chunk(_Delta(content=step["text"])),
+                            _Chunk(_Delta(), finish=step.get("finish", "stop"))])
         return _Stream([_Chunk(_Delta(content=step)), _Chunk(_Delta(), finish="stop")])
 
 
@@ -414,6 +417,24 @@ def test_a_forced_step_that_answers_anyway_is_spoken(settings, monkeypatch):
     host._stream_local_llm("what's on my screen", threading.Event())
     assert host.calls[0]["tool_choice"] == "required"
     assert host._assistant_text == "I cannot take a screenshot right now."
+
+
+def test_a_forced_step_stuck_writing_is_dropped_and_asked_again_unforced(settings, monkeypatch):
+    """Nemotron, required to call look, asked "do you want me to capture your
+    screen? Yes or no?" until the token cap, unable to end without a call."""
+    _sees(monkeypatch, True)
+    loop = "Do you want me to capture your screen? Yes or no? " * 20
+    spoken = []
+    host = Host([{"text": loop, "finish": "length"}, ("look", {"source": "screen"}),
+                 "The bar says 147 percent."], verdict=Verdict(tools=[]))
+    host._flush_sentences = lambda final=False: spoken.append(host._assistant_text)
+    host._stream_local_llm("look at the top of my screen", threading.Event())
+    assert host.calls[0]["tool_choice"] == "required"
+    assert host.calls[0]["max_tokens"] == va.LOOK_FORCE_MAX_TOKENS, "the forced step is short"
+    assert "tool_choice" not in host.calls[1], "asked again, unforced"
+    assert host._assistant_text == "The bar says 147 percent."
+    assert all("Yes or no" not in t for t in spoken), "none of the loop is spoken"
+    assert "Yes or no" not in json.dumps(host.calls[1]["messages"]), "nor fed back"
 
 
 def test_forcing_can_be_switched_off(settings, monkeypatch):

@@ -607,6 +607,13 @@ LOOK_ATTACH = os.getenv("VOICE_ASSISTANT_LOOK_ATTACH", "tool").strip().lower()
 # described a screen it had invented, both times.
 LOOK_FORCE = os.getenv("VOICE_ASSISTANT_LOOK_FORCE", "1").strip().lower() \
     not in ("0", "false", "no", "off")
+# The forced step's token cap. llama.cpp's "required" lets Nemotron write prose
+# before the call and, the call being required, never end without one: asked to
+# look at the screen it asked "do you want me to capture your screen? Yes or
+# no?" forty times, to the 2048-token cap (4 minutes), all of it then spoken. A
+# forced step that has not called anything by this many tokens is dropped and
+# the step re-run unforced.
+LOOK_FORCE_MAX_TOKENS = int(os.getenv("VOICE_ASSISTANT_LOOK_FORCE_MAX_TOKENS", "200"))
 # A server that did not answer /props is asked again after this many seconds.
 VISION_RETRY_SECONDS = 30.0
 
@@ -3784,6 +3791,11 @@ class VoiceAssistant:
         worker thread: they take 0.3-0.8 s each on this CPU, and the recording
         loop has end-of-turn decisions to make in real time.
         """
+        # Moonshine's ONNX Runtime otherwise takes a spinning thread per core.
+        # Measured on block (i9-13900K, 32 threads), medium_streaming over 16.5 s
+        # of speech: default 15.0 s wall at 30.5 cores average (the fan roars
+        # whenever the user talks); single-threaded 7.6 s wall at 1.0 core.
+        os.environ.setdefault("MOONSHINE_ORT_SINGLE_THREAD", "1")
         import moonshine_voice as mv
         from moonshine_voice.transcriber import Transcriber
 
@@ -5273,6 +5285,7 @@ class VoiceAssistant:
                              "tools stay on")
             tool_choice = "auto"
 
+        force_failed = False
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
             # Offer tools until the last allowed step, so the model has to
             # answer in words rather than looping forever. On that last step the
@@ -5303,8 +5316,9 @@ class VoiceAssistant:
                                         if k not in ("top_k", "presence_penalty")}
             if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS and tools:
                 kwargs["tools"] = tools
-                if step == 0 and look_hint and LOOK_FORCE:
+                if step == 0 and look_hint and LOOK_FORCE and not force_failed:
                     kwargs["tool_choice"] = "required"
+                    kwargs["max_tokens"] = min(kwargs["max_tokens"], LOOK_FORCE_MAX_TOKENS)
                 elif tool_choice != "auto":
                     kwargs["tool_choice"] = tool_choice
 
@@ -5394,6 +5408,15 @@ class VoiceAssistant:
                     "Local LLM wrote a tool call as prose; suppressed it rather "
                     "than speaking it")
 
+            if forced and not calls and finish == "length":
+                # Writing instead of calling until the cap: it is stuck, not
+                # answering (see LOOK_FORCE_MAX_TOKENS). Say none of it and ask
+                # again without the requirement.
+                self.logger.warning(
+                    f"Forced tool step wrote {len(held)} chars and no call in "
+                    f"{LOOK_FORCE_MAX_TOKENS} tokens; retrying unforced: {held[:80]!r}")
+                force_failed = True
+                continue
             if held and not calls:
                 self._assistant_text += held      # no call after all: it was the answer
                 self._flush_sentences(final=False)

@@ -1292,6 +1292,7 @@ Nothing here starts or stops the remote server.
 |---|---|---|
 | `VOICE_ASSISTANT_LOOK` | `1` | offer `look` to a model that advertises vision |
 | `VOICE_ASSISTANT_LOOK_FORCE` | `1` | a turn that asks to look must call a tool first |
+| `VOICE_ASSISTANT_LOOK_FORCE_MAX_TOKENS` | `200` | a forced look step that has called nothing by this many tokens is dropped unspoken and re-run unforced (a model made to call can otherwise write until the reply cap) |
 | `VOICE_ASSISTANT_LOOK_MAX_SIDE` | `1280` | longest side of the image sent, in pixels |
 | `VOICE_ASSISTANT_LOOK_SCREEN` | `focused` | `focused` monitor or `all` of them (Hyprland, Sway) |
 | `VOICE_ASSISTANT_LOOK_CAMERA` | (first webcam) | a `/dev/video*` path, or a command that writes one frame to `{file}`, e.g. `cam look {file}` |
@@ -1354,6 +1355,7 @@ win over both.
 |---|---|---|
 | `VOICE_ASSISTANT_STT_ENGINE` | `moonshine` | `moonshine` or `whisper` |
 | `VOICE_ASSISTANT_MOONSHINE_MODEL` | `medium_streaming` | `tiny`, `base`, or a `*_streaming` variant |
+| `MOONSHINE_ORT_SINGLE_THREAD` | `1` (set by the assistant) | Moonshine's ONNX Runtime on one thread: on a 32-thread i9 the default spun every core (30 cores average) and was twice as slow; `0` to restore it |
 | `VOICE_ASSISTANT_MOONSHINE_UPDATE_INTERVAL` | `0.25` | seconds of audio between decoding passes |
 | `VOICE_ASSISTANT_WHISPER_MODEL` | `small` | fallback engine's model |
 | `VOICE_ASSISTANT_WHISPER_DEVICE` | `auto` | `auto`, `cuda` or `cpu` |
