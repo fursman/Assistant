@@ -1346,6 +1346,12 @@ _TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
          "eighty", "ninety"]
 
 
+# The most threads a TTS engine is given. Past this, more threads only fight
+# each other, and a big part (block's 24-core i9) handed its whole width to
+# synthesis falls apart as soon as a VM takes most of the cores away.
+TTS_MAX_THREADS = int(os.getenv("VOICE_ASSISTANT_TTS_MAX_THREADS", "8"))
+
+
 def _physical_cores() -> int:
     """Physical cores, not hyperthreads.
 
@@ -1359,20 +1365,27 @@ def _physical_cores() -> int:
     if override and override.isdigit() and int(override) > 0:
         return int(override)
     try:
-        # Distinct (physical_id, core_id) pairs = real cores.
-        cores, phys, core = set(), None, None
+        allowed = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        allowed = None
+    try:
+        # Distinct (physical_id, core_id) pairs = real cores, counting only
+        # the CPUs this process may run on: a VM host that keeps a guest's
+        # cores to itself (block's win-block pins 2-15) leaves the rest.
+        cores, cpu, phys = set(), None, None
         for line in Path("/proc/cpuinfo").read_text().splitlines():
-            if line.startswith("physical id"):
+            if line.startswith("processor"):
+                cpu, phys = int(line.split(":")[1]), None
+            elif line.startswith("physical id"):
                 phys = line.split(":")[1].strip()
-            elif line.startswith("core id"):
-                core = line.split(":")[1].strip()
-                if phys is not None:
-                    cores.add((phys, core))
+            elif line.startswith("core id") and phys is not None:
+                if allowed is None or cpu in allowed:
+                    cores.add((phys, line.split(":")[1].strip()))
         if cores:
-            return len(cores)
+            return min(len(cores), TTS_MAX_THREADS)
     except Exception:
         pass
-    return max(1, (os.cpu_count() or 2) // 2)
+    return max(1, min((len(allowed) if allowed else os.cpu_count() or 2) // 2, TTS_MAX_THREADS))
 
 
 def _num_to_words(n: int) -> str:
@@ -4288,9 +4301,16 @@ class VoiceAssistant:
         Speed is not supported upstream; it is accepted and ignored rather than
         silently changing pitch.
         """
+        import torch
         from pocket_tts import TTSModel
 
+        # torch defaults to every physical core on the machine (24 on block),
+        # with no regard for the CPUs this process is allowed: when a VM
+        # takes most of them, the oversubscribed pool turns speech choppy.
+        threads = _physical_cores()
+        torch.set_num_threads(threads)
         model = TTSModel.load_model()
+        self.logger.info(f"Pocket TTS: {threads} threads")
         # A preset name (alba, azelma, ...), a path, or a name that matches a
         # saved voice in this repo's voices/ directory. The default is Kokoro's
         # af_heart cloned into Pocket: 16.5 s of Kokoro speech run through

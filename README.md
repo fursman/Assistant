@@ -1378,7 +1378,8 @@ win over both.
 | `VOICE_ASSISTANT_TTS_VOICE` | `af_heart` | Kokoro voice, when Kokoro is selected |
 | `VOICE_ASSISTANT_SUPERTONIC_VOICE` | `M1` | Supertonic voice style |
 | `VOICE_ASSISTANT_TTS_SPEED` | `1.0` | Kokoro only; Pocket ignores it |
-| `VOICE_ASSISTANT_TTS_THREADS` | physical cores | ONNX threads for synthesis |
+| `VOICE_ASSISTANT_TTS_THREADS` | physical cores (max 8) | threads for synthesis (Kokoro, Pocket) |
+| `VOICE_ASSISTANT_TTS_MAX_THREADS` | `8` | most threads a TTS engine (Kokoro, Pocket) gets; the default count is the physical cores this process may run on, up to this |
 | `VOICE_ASSISTANT_TTS_PREBUFFER` | `0.35` | seconds queued before the first word plays |
 | `VOICE_ASSISTANT_TTS_PREBUFFER_WAIT` | `1.2` | deadline on that wait |
 | `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
