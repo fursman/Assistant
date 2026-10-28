@@ -332,3 +332,45 @@ def test_history_tail():
     assert tail(h, 5) == h
     assert tail(h, 0) == [] and tail([], 3) == []
     assert tail([{"role": "assistant", "content": "orphan"}], 2) == []
+
+
+# --- whose sampling a network server uses ----------------------------------------
+
+class NetworkHost(Host):
+    def _llm(self):
+        return va._llm_tier("network")
+
+
+@pytest.fixture
+def network(env, monkeypatch):
+    monkeypatch.setattr(va, "NETWORK_LLM_URL", "http://192.168.1.105:8080/v1")
+    monkeypatch.setattr(va, "NETWORK_LLM_MODEL", "nemotron-3.5-super-vl")
+    monkeypatch.setattr(va, "NETWORK_LLM_THINK", False)
+    monkeypatch.setattr(va, "_SERVED_MODELS", {})
+
+
+def test_a_network_server_samples_with_its_own_settings(network, monkeypatch):
+    monkeypatch.setattr(va, "NETWORK_SAMPLING", "server")
+    client = FakeClient()
+    assert NetworkHost(client, FakeVerdict(hard=False))._stream_local_llm(
+        "what is two plus two", threading.Event()) is True
+    kw = client.chat.completions.calls[0]
+    assert "temperature" not in kw and "top_p" not in kw
+    assert "top_k" not in kw["extra_body"] and "presence_penalty" not in kw["extra_body"]
+    assert kw["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}, "still no thinking"
+
+
+def test_client_sampling_sends_the_local_values_as_before(network, monkeypatch):
+    monkeypatch.setattr(va, "NETWORK_SAMPLING", "client")
+    client = FakeClient()
+    NetworkHost(client, FakeVerdict(hard=False))._stream_local_llm("hi", threading.Event())
+    kw = client.chat.completions.calls[0]
+    assert (kw["temperature"], kw["top_p"]) == (va.LOCAL_LLM_TEMP, va.LOCAL_LLM_TOP_P)
+    assert kw["extra_body"]["presence_penalty"] == va.LOCAL_LLM_PRESENCE
+
+
+def test_the_local_tier_always_sends_its_sampling(env, monkeypatch):
+    monkeypatch.setattr(va, "NETWORK_SAMPLING", "server")
+    client = FakeClient()
+    Host(client, FakeVerdict(hard=False))._stream_local_llm("hi", threading.Event())
+    assert client.chat.completions.calls[0]["temperature"] == va.LOCAL_LLM_TEMP

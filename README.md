@@ -1244,6 +1244,7 @@ optional.
 | `VOICE_ASSISTANT_NETWORK_API_KEY` | `none` | if the endpoint wants one |
 | `VOICE_ASSISTANT_NETWORK_TIMEOUT` | `_LOCAL_TIMEOUT` | seconds one completion may take |
 | `VOICE_ASSISTANT_NETWORK_THINK` | `_LOCAL_THINK` | let the network model reason first |
+| `VOICE_ASSISTANT_NETWORK_SAMPLING` | `server` | `server`: send no sampling, so each server uses the settings it was started with for its own model (Nemotron rambles on Qwen's); `client`: send the local tier's `_TEMP`/`_TOP_P`/`_TOP_K`/`_PRESENCE_PENALTY` |
 
 Sampling, history, tools and thinking budget are the `_LOCAL_` settings below;
 the key, harness, timeout and thinking above apply to every network server.

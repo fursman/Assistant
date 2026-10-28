@@ -430,6 +430,12 @@ NETWORK_LLM_API_KEY = os.getenv("VOICE_ASSISTANT_NETWORK_API_KEY", "none")
 NETWORK_HARNESS = os.getenv("VOICE_ASSISTANT_NETWORK_HARNESS", "native").strip().lower()
 NETWORK_LLM_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_NETWORK_TIMEOUT", "").strip()
                             or LOCAL_LLM_TIMEOUT)
+# Whose sampling a network server uses. "server" (default): send none, so each
+# llama-server applies the defaults it was started with for its own model --
+# Qwen's temp 0.7 / presence 1.5 make Nemotron ramble and second-guess itself
+# ("oh no, wait, actually..."), NVIDIA recommends temp 1.0, top_p 0.95 for it.
+# "client": send the local tier's values, as before.
+NETWORK_SAMPLING = os.getenv("VOICE_ASSISTANT_NETWORK_SAMPLING", "server").strip().lower()
 NETWORK_LLM_THINK = os.getenv("VOICE_ASSISTANT_NETWORK_THINK",
                               os.getenv("VOICE_ASSISTANT_LOCAL_THINK", "0")).strip().lower() \
     not in ("0", "false", "no", "off", "")
@@ -5270,6 +5276,11 @@ class VoiceAssistant:
                 max_tokens=LOCAL_LLM_MAX_TOKENS
                 + int(extra_body.get("reasoning_budget_tokens", 0)),
                 extra_body=extra_body)
+            if llm.name == "network" and NETWORK_SAMPLING == "server" and not use_hard:
+                # The server knows its model's sampling; see NETWORK_SAMPLING.
+                del kwargs["temperature"], kwargs["top_p"]
+                kwargs["extra_body"] = {k: v for k, v in extra_body.items()
+                                        if k not in ("top_k", "presence_penalty")}
             if LOCAL_TOOLS_ENABLED and step < LOCAL_MAX_TOOL_ITERS and tools:
                 kwargs["tools"] = tools
                 if step == 0 and look_hint and LOOK_FORCE:
