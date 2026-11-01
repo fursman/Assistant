@@ -325,6 +325,22 @@ TTS_TAIL_GATE = float(os.getenv("VOICE_ASSISTANT_TTS_TAIL_GATE", "0.35"))
 LISTEN_RESUME_CHIME = os.getenv("VOICE_ASSISTANT_LISTEN_CHIME", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 
+# --- Speech on the LAN ---------------------------------------------------
+# Recognition and synthesis servers elsewhere (remote_speech.py has both
+# protocols; github.com/fursman/moonshine-rknn is the recognition server):
+# host:port of the recognition server, URL of the synthesis server. Unset =
+# everything stays on this machine. The tiers listed
+# use them while they answer and fall back to this machine's engines when they
+# do not; the local tier is left out by default so it keeps working with the
+# network down.
+REMOTE_STT = os.getenv("VOICE_ASSISTANT_REMOTE_STT", "").strip()
+REMOTE_TTS = os.getenv("VOICE_ASSISTANT_REMOTE_TTS", "").strip()
+# The server's own voice name: rk1-tts runs Kokoro, whose af_heart is the
+# voice Pocket's af_heart was cloned from.
+REMOTE_TTS_VOICE = os.getenv("VOICE_ASSISTANT_REMOTE_TTS_VOICE", "af_heart").strip()
+REMOTE_SPEECH_TIERS = {t.strip() for t in os.getenv(
+    "VOICE_ASSISTANT_REMOTE_SPEECH_TIERS", "network,claude").split(",") if t.strip()}
+
 # --- LLM backend -----------------------------------------------------------
 # Three tiers, by where the model runs:
 # "local"   -> llama-server on this machine (offline, run_shell tool)
@@ -4043,9 +4059,29 @@ class VoiceAssistant:
                     pass
             self._setup_tts()
             self._warmup()
+            self._setup_remote_speech()
         except Exception as e:
             self.logger.error(f"Error loading models: {e}")
             sys.exit(1)
+
+    def _setup_remote_speech(self):
+        """Wrap the local engines (already loaded and warm: they are the
+        fallback) so the tiers in REMOTE_SPEECH_TIERS use the LAN servers."""
+        if not (REMOTE_STT or REMOTE_TTS):
+            return
+        import remote_speech
+        use = lambda: self.tier in REMOTE_SPEECH_TIERS  # noqa: E731
+        tiers = "/".join(sorted(REMOTE_SPEECH_TIERS)) or "no"
+        if REMOTE_STT:
+            remote = remote_speech.RemoteStt(REMOTE_STT, SAMPLE_RATE)
+            self.stt = remote_speech.FallbackStt(self.stt, remote, use)
+            self.logger.info(f"Speech recognition on {REMOTE_STT} for the {tiers} tiers, "
+                             f"this machine's otherwise")
+        if REMOTE_TTS and self.tts_available and self.kokoro:
+            remote = remote_speech.RemoteTts(REMOTE_TTS, REMOTE_TTS_VOICE)
+            self.kokoro = remote_speech.FallbackTts(self.kokoro, remote, use)
+            self.logger.info(f"Speech synthesis on {REMOTE_TTS} ({REMOTE_TTS_VOICE}) for the "
+                             f"{tiers} tiers, this machine's otherwise")
 
     # One loader for both features, so turning voice-only on for the first
     # time cannot race a second load.
