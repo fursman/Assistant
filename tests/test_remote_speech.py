@@ -75,15 +75,16 @@ class SttServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, mode="ok"):
+    def __init__(self, mode="ok", host="127.0.0.1"):
         self.mode = mode
         self.samples = 0
-        super().__init__(("127.0.0.1", 0), self.Handler)
+        self.utterances = 0
+        super().__init__((host, 0), self.Handler)
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     @property
     def spec(self):
-        return f"127.0.0.1:{self.server_address[1]}"
+        return f"{self.server_address[0]}:{self.server_address[1]}"
 
     class Handler(socketserver.BaseRequestHandler):
         def handle(self):
@@ -97,6 +98,8 @@ class SttServer(socketserver.ThreadingTCPServer):
                     payload = _recv_exact(conn, size) if size else b""
                     if kind == b"H":
                         send(b"O", b'{"ok": true}')
+                    elif kind == b"B":
+                        srv.utterances += 1
                     elif kind == b"A":
                         srv.samples += size // 4
                         if srv.mode == "die":
@@ -219,16 +222,16 @@ class TtsServer(http.server.ThreadingHTTPServer):
     """POST /tts -> float32 chunks; `chunks` of 1000 samples, `die_after` cuts the reply."""
     daemon_threads = True
 
-    def __init__(self, chunks=3, die_after=None, status=200):
+    def __init__(self, chunks=3, die_after=None, status=200, host="127.0.0.1"):
         self.chunks, self.die_after, self.status = chunks, die_after, status
         self.requests = []
         self.left_early = threading.Event()
-        super().__init__(("127.0.0.1", 0), self.Handler)
+        super().__init__((host, 0), self.Handler)
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server_address[1]}"
+        return f"http://{self.server_address[0]}:{self.server_address[1]}"
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -331,3 +334,72 @@ def test_health_tracks_the_probe():
     state["ok"] = True
     h.mark_down("poke")          # wakes the prober
     assert wait_for(h.up)
+
+
+# -- pools of servers -------------------------------------------------------
+
+def stt_pool(specs, ups):
+    local = LocalStt()
+    healths = [FakeHealth(u) for u in ups]
+    remotes = [rs.RemoteStt(sp, 16000, finish_timeout=1.0) for sp in specs]
+    return rs.FallbackStt(local, remotes, lambda: True, healths), local, healths
+
+
+def one_utterance(w):
+    w.begin_utterance()
+    w.feed(np.zeros(1600, np.float32), 16000)
+    return w.finish()
+
+
+def test_the_boards_take_turns():
+    a, b = SttServer(host="127.0.0.1"), SttServer(host="127.0.0.2")
+    w, local, _ = stt_pool([a.spec, b.spec], [True, True])
+    for _ in range(4):
+        assert one_utterance(w) == "remote stream"
+    assert (a.utterances, b.utterances) == (2, 2)
+    assert local.calls == []
+
+
+def test_a_refusing_board_is_skipped_before_falling_back_to_this_machine():
+    good = SttServer(host="127.0.0.2")
+    w, local, healths = stt_pool([f"127.0.0.1:{closed_port()}", good.spec], [True, True])
+    assert one_utterance(w) == "remote stream"
+    assert healths[0].downs and not healths[1].downs
+    assert local.calls == []
+
+
+def test_no_board_up_means_this_machine():
+    a = SttServer()
+    w, local, _ = stt_pool([a.spec], [False])
+    assert one_utterance(w) == "local stream" and a.utterances == 0
+
+
+def test_a_board_that_dies_mid_utterance_hands_the_recording_to_the_next():
+    dying, good = SttServer(mode="die", host="127.0.0.1"), SttServer(host="127.0.0.2")
+    w, local, healths = stt_pool([dying.spec, good.spec], [True, True])
+    assert one_utterance(w) is None         # both idle: the first board takes it, and dies
+    segments, _ = w.transcribe(np.zeros(8000, np.float32))
+    assert segments[0].text == "remote batch 8000", "the batch went to the other board"
+    assert local.calls == []
+
+
+def test_speech_goes_to_a_board_that_is_not_listening():
+    listening = SttServer(host="127.0.0.1")
+    t1, t2 = TtsServer(host="127.0.0.1"), TtsServer(host="127.0.0.2")
+    stt, _, _ = stt_pool([listening.spec], [True])
+    tts = rs.FallbackTts(LocalTts(), [rs.RemoteTts(t1.url), rs.RemoteTts(t2.url)], lambda: True,
+                         [FakeHealth(), FakeHealth()])
+    stt.begin_utterance()                   # the user is talking to 127.0.0.1
+    for _ in range(3):
+        list(tts.stream("Hi."))
+    stt.finish()
+    assert len(t1.requests) == 0 and len(t2.requests) == 3
+
+
+def test_speech_moves_on_when_a_board_fails_before_the_first_word():
+    bad, good = TtsServer(status=500, host="127.0.0.1"), TtsServer(host="127.0.0.2")
+    healths = [FakeHealth(), FakeHealth()]
+    local = LocalTts()
+    tts = rs.FallbackTts(local, [rs.RemoteTts(bad.url), rs.RemoteTts(good.url)], lambda: True, healths)
+    pieces = list(tts.stream("Hi."))
+    assert len(pieces) == 3 and local.spoken == [] and healths[0].downs

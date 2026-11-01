@@ -328,8 +328,10 @@ LISTEN_RESUME_CHIME = os.getenv("VOICE_ASSISTANT_LISTEN_CHIME", "1").strip().low
 # --- Speech on the LAN ---------------------------------------------------
 # Recognition and synthesis servers elsewhere (remote_speech.py has both
 # protocols; github.com/fursman/moonshine-rknn is the recognition server):
-# host:port of the recognition server, URL of the synthesis server. Unset =
-# everything stays on this machine. The tiers listed
+# host:port of the recognition server, URL of the synthesis server, or comma-
+# separated lists of several (requests go to an idle board answering health
+# checks, taking turns; synthesis prefers a board not transcribing the user at
+# that moment). Unset = everything stays on this machine. The tiers listed
 # use them while they answer and fall back to this machine's engines when they
 # do not; the local tier is left out by default so it keeps working with the
 # network down.
@@ -4073,12 +4075,14 @@ class VoiceAssistant:
         use = lambda: self.tier in REMOTE_SPEECH_TIERS  # noqa: E731
         tiers = "/".join(sorted(REMOTE_SPEECH_TIERS)) or "no"
         if REMOTE_STT:
-            remote = remote_speech.RemoteStt(REMOTE_STT, SAMPLE_RATE)
+            remote = [remote_speech.RemoteStt(spec.strip(), SAMPLE_RATE)
+                      for spec in REMOTE_STT.split(",") if spec.strip()]
             self.stt = remote_speech.FallbackStt(self.stt, remote, use)
             self.logger.info(f"Speech recognition on {REMOTE_STT} for the {tiers} tiers, "
                              f"this machine's otherwise")
         if REMOTE_TTS and self.tts_available and self.kokoro:
-            remote = remote_speech.RemoteTts(REMOTE_TTS, REMOTE_TTS_VOICE)
+            remote = [remote_speech.RemoteTts(url.strip(), REMOTE_TTS_VOICE)
+                      for url in REMOTE_TTS.split(",") if url.strip()]
             self.kokoro = remote_speech.FallbackTts(self.kokoro, remote, use)
             self.logger.info(f"Speech synthesis on {REMOTE_TTS} ({REMOTE_TTS_VOICE}) for the "
                              f"{tiers} tiers, this machine's otherwise")

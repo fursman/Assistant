@@ -1,7 +1,7 @@
 """Speech on another machine, with this one's engines as the fallback.
 
 The network and Claude tiers can hand speech recognition and synthesis to
-servers on the LAN (the Turing Pi's RK1 boards: Moonshine on one, Kokoro with
+servers on the LAN, one or a pool of several (the Turing Pi's RK1 boards: Moonshine on one, Kokoro with
 its decoder on the NPU on another), so this machine's CPU is left alone while
 you talk and while it answers. The local tier never leaves the machine: it is
 the one that has to work with the network down.
@@ -23,6 +23,7 @@ rk1-speech/stt_server.py), chunked HTTP for the synthesiser.
 """
 from __future__ import annotations
 
+import collections
 import http.client
 import json
 import logging
@@ -246,71 +247,141 @@ class _Segment:
         self.text = text
 
 
+# Requests from this machine in flight, by kind and host. Shared by the
+# recogniser and synthesiser pools: a board doing both at once shares its CPU
+# between them (measured: recognition unaffected, synthesis ~0.25 s slower to
+# start), so a synthesiser prefers a board that is not transcribing right now.
+_IN_FLIGHT = {"stt": collections.Counter(), "tts": collections.Counter()}
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+class Pool:
+    """The servers that can do one kind of job, in the order to try them.
+
+    First the ones answering their health checks; among those, ones with no
+    request of this kind in flight before busy ones, hosts in `avoid` last,
+    and otherwise the least recently used first, so the boards take turns."""
+
+    def __init__(self, kind: str, servers, health=None):
+        self.kind = kind
+        self.servers = list(servers)
+        if health is None:
+            health = [Health(srv.name, srv.probe) for srv in self.servers]
+        elif not isinstance(health, (list, tuple)):
+            health = [health]
+        self.health = list(health)
+        self._used = [0.0] * len(self.servers)
+
+    def order(self, avoid=()):
+        with _IN_FLIGHT_LOCK:
+            busy = dict(_IN_FLIGHT[self.kind])
+        up = [i for i, h in enumerate(self.health) if h.up()]
+        up.sort(key=lambda i: (busy.get(self.servers[i].host, 0),
+                               self.servers[i].host in avoid, self._used[i]))
+        return [(i, self.servers[i], self.health[i]) for i in up]
+
+    def acquire(self, i):
+        self._used[i] = time.monotonic()
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT[self.kind][self.servers[i].host] += 1
+
+    def release(self, i):
+        with _IN_FLIGHT_LOCK:
+            c = _IN_FLIGHT[self.kind]
+            c[self.servers[i].host] -= 1
+            if c[self.servers[i].host] <= 0:
+                del c[self.servers[i].host]
+
+
+def _as_list(x):
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+
 class FallbackStt:
-    """The local recogniser's interface; the remote one does the work when
-    `use_remote()` says this turn may leave the machine and it is up."""
+    """The local recogniser's interface; a server from the pool does the work
+    when `use_remote()` says this turn may leave the machine. A server that
+    refuses is marked down and the next one tried; with none left, or none
+    allowed, this machine's engine does it."""
 
-    def __init__(self, local, remote: RemoteStt, use_remote, health: Health = None):
+    def __init__(self, local, remote, use_remote, health=None):
         self.local = local
-        self.remote = remote
+        self.pool = Pool("stt", _as_list(remote), health)
         self.use_remote = use_remote
-        self.health = health or Health(remote.name, remote.probe)
         self.is_streaming = True
-        self._remote_turn = False
+        self._active = None            # pool index of this utterance's server
 
-    def _route(self) -> bool:
-        return bool(self.use_remote()) and self.health.up()
+    @property
+    def remote(self):
+        return self.pool.servers[self._active if self._active is not None else 0]
+
+    def _candidates(self):
+        return self.pool.order() if self.use_remote() else []
 
     def begin_utterance(self):
-        self._remote_turn = False
-        if self._route():
+        self._drop_active()
+        for i, server, health in self._candidates():
             try:
-                self.remote.begin()
-                self._remote_turn = True
-                return
+                server.begin()
             except OSError as e:
-                self.health.mark_down(str(e))
+                health.mark_down(str(e))
+                continue
+            self._active = i
+            self.pool.acquire(i)
+            return
         begin = getattr(self.local, "begin_utterance", None)
         if begin is not None:
             begin()
 
+    def _drop_active(self):
+        if self._active is not None:
+            self.pool.servers[self._active].close()
+            self.pool.release(self._active)
+            self._active = None
+
     def feed(self, chunk, sample_rate):
-        if self._remote_turn:
-            self.remote.feed(chunk, sample_rate)
+        if self._active is not None:
+            self.pool.servers[self._active].feed(chunk, sample_rate)
             return
         feed = getattr(self.local, "feed", None)
         if feed is not None:
             feed(chunk, sample_rate)
 
     def partial(self) -> str:
-        if self._remote_turn:
-            return self.remote.partial()
+        if self._active is not None:
+            return self.pool.servers[self._active].partial()
         partial = getattr(self.local, "partial", None)
         return partial() if partial is not None else ""
 
     def finish(self):
-        if self._remote_turn:
-            self._remote_turn = False
+        if self._active is not None:
+            i, self._active = self._active, None
             try:
-                return self.remote.finish()
+                return self.pool.servers[i].finish()
             except Exception as e:
-                # None sends the caller to transcribe(), which runs locally
-                # now that the server is marked down.
-                self.health.mark_down(str(e))
+                # None sends the caller to transcribe(), which goes to
+                # another server, or runs here.
+                self.pool.health[i].mark_down(str(e))
                 return None
+            finally:
+                self.pool.release(i)
         finish = getattr(self.local, "finish", None)
         return finish() if finish is not None else None
 
     def transcribe(self, audio, **kwargs):
-        if self._route():
+        for i, server, health in self._candidates():
+            self.pool.acquire(i)
             try:
-                return [_Segment(self.remote.batch(audio))], None
+                return [_Segment(server.batch(audio))], None
             except Exception as e:
-                self.health.mark_down(str(e))
+                health.mark_down(str(e))
+            finally:
+                self.pool.release(i)
         return self.local.transcribe(audio, **kwargs)
 
     def close(self):
-        self.remote.close()
+        self._drop_active()
+        for server in self.pool.servers:
+            server.close()
         close = getattr(self.local, "close", None)
         if close is not None:
             close()
@@ -367,14 +438,18 @@ class RemoteTts:
 
 
 class FallbackTts:
-    """The local synthesiser's interface (create/stream); the remote one
-    speaks when `use_remote()` allows it and it is up."""
+    """The local synthesiser's interface (create/stream); a server from the
+    pool speaks when `use_remote()` allows it, preferring a board that is not
+    transcribing the user at the moment."""
 
-    def __init__(self, local, remote: RemoteTts, use_remote, health: Health = None):
+    def __init__(self, local, remote, use_remote, health=None):
         self.local = local
-        self.remote = remote
+        self.pool = Pool("tts", _as_list(remote), health)
         self.use_remote = use_remote
-        self.health = health or Health(remote.name, remote.probe)
+
+    @property
+    def remote(self):
+        return self.pool.servers[0]
 
     def _local_stream(self, text, voice, speed):
         stream = getattr(self.local, "stream", None)
@@ -384,27 +459,34 @@ class FallbackTts:
             yield self.local.create(text, voice=voice, speed=speed)
 
     def stream(self, text, voice=None, speed=None):
-        if bool(self.use_remote()) and self.health.up():
-            gen = self.remote.stream(text, voice=voice, speed=speed)
-            try:
-                first = next(gen)
-            except StopIteration:
-                return
-            except Exception as e:
-                # Nothing has been heard yet, so the whole unit can still be
-                # spoken here.
-                self.health.mark_down(str(e))
-            else:
-                yield first
+        if self.use_remote():
+            with _IN_FLIGHT_LOCK:
+                listening = set(_IN_FLIGHT["stt"])
+            for i, server, health in self.pool.order(avoid=listening):
+                self.pool.acquire(i)
                 try:
-                    yield from gen
-                except Exception as e:
-                    # Part of it was heard; repeating it locally would say
-                    # those words twice. The rest of this unit is lost.
-                    self.health.mark_down(f"{e} (mid-sentence)")
+                    gen = server.stream(text, voice=voice, speed=speed)
+                    try:
+                        first = next(gen)
+                    except StopIteration:
+                        return
+                    except Exception as e:
+                        # Nothing has been heard yet: the next server, or this
+                        # machine, can still say all of it.
+                        health.mark_down(str(e))
+                        continue
+                    yield first
+                    try:
+                        yield from gen
+                    except Exception as e:
+                        # Part of it was heard; repeating it elsewhere would
+                        # say those words twice. The rest of this unit is lost.
+                        health.mark_down(f"{e} (mid-sentence)")
+                    finally:
+                        gen.close()
+                    return
                 finally:
-                    gen.close()
-                return
+                    self.pool.release(i)
         yield from self._local_stream(text, voice, speed)
 
     def create(self, text, voice=None, speed=None):
