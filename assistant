@@ -9,6 +9,7 @@
     assistant --model fable          # or opus, sonnet, haiku
     assistant --effort xhigh         # or low, medium, high, max
     assistant --voice-only on        # or off, toggle: ignore voices but yours
+    assistant --speech toggle        # or local, network: where speech runs
     assistant --status
     assistant --new                  # start a fresh conversation
 
@@ -74,6 +75,19 @@ def request(payload: dict) -> dict:
         die(f"could not read the reply: {e}")
 
 
+def speech_line(r: dict) -> str:
+    """`network  (stt a, b; tts c, d; network/claude tiers)`, or `local`."""
+    servers = r.get("speech_servers") or {}
+    if r["speech"] != "network":
+        return "local" + ("" if any(servers.values()) or not servers
+                          else "  (no network speech configured)")
+    where = [f"{kind} {', '.join(servers[kind])}" for kind in ("stt", "tts") if servers.get(kind)]
+    tiers = r.get("speech_tiers")
+    if tiers is not None:
+        where.append(f"{'/'.join(tiers) or 'no'} tiers")
+    return "network" + (f"  ({'; '.join(where)})" if where else "")
+
+
 def die(message: str, code: int = 1):
     print(f"assistant: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -100,6 +114,9 @@ def main():
     p.add_argument("--voice-only", choices=("on", "off", "toggle"),
                    help="ignore every voice but yours (needs a learned voiceprint; "
                         "until then everyone is heard)")
+    p.add_argument("--speech", choices=("local", "network", "toggle"),
+                   help="where speech recognition and synthesis run: this machine, or "
+                        "the LAN speech servers (VOICE_ASSISTANT_REMOTE_STT/_TTS)")
     p.add_argument("--status", action="store_true", help="show what is running")
     p.add_argument("--new", action="store_true", help="start a fresh conversation")
     p.add_argument("--json", action="store_true", help="print the raw reply")
@@ -109,6 +126,8 @@ def main():
         r = request({"cmd": "claude", "model": args.model, "effort": args.effort})
     elif args.voice_only:
         r = request({"cmd": "voice_only", "value": args.voice_only})
+    elif args.speech:
+        r = request({"cmd": "speech", "value": args.speech})
     elif args.swap or args.backend:
         r = request({"cmd": "backend", "value": args.backend or "toggle"})
     elif args.status:
@@ -167,6 +186,8 @@ def main():
             vp = r.get("voiceprint")
             print(f"voice-only {'on' if r['voice_only'] else 'off'}"
                   f"{f'  (voiceprint {vp})' if vp else ''}")
+        if "speech" in r:
+            print(f"speech     {speech_line(r)}")
         print(f"session    {r['session']}")
     else:
         note = r.get("note") or ""

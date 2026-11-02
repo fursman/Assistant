@@ -159,7 +159,7 @@ function readStatus() {
         }
     }
     let model = null, effort = null, models = [], efforts = [], label = null;
-    let voiceOnly = false;
+    let voiceOnly = false, speech = null;
     if (text) {
         try {
             const d = JSON.parse(text);
@@ -171,11 +171,12 @@ function readStatus() {
             models = Array.isArray(d.models) ? d.models : [];
             efforts = Array.isArray(d.efforts) ? d.efforts : [];
             voiceOnly = d.voice_only === true;
+            speech = d.speech ?? null;
         } catch (e) {
             // handled above
         }
     }
-    return {state, backend, pid, model, effort, models, efforts, label, voiceOnly};
+    return {state, backend, pid, model, effort, models, efforts, label, voiceOnly, speech};
 }
 
 function readTranscript() {
@@ -354,6 +355,12 @@ class VoiceIndicator extends PanelMenu.Button {
             () => spawn([ASSISTANT_BIN, '--voice-only', 'toggle']));
         this.menu.addMenuItem(this._voiceOnlyItem);
 
+        // Where speech runs: the LAN speech servers or this machine.
+        this._speechItem = new PopupMenu.PopupMenuItem('Use local speech');
+        this._speechItem.connect('activate',
+            () => spawn([ASSISTANT_BIN, '--speech', 'toggle']));
+        this.menu.addMenuItem(this._speechItem);
+
         // Claude's model and effort. Only meaningful on the Claude backend, so
         // both are hidden otherwise rather than offering a setting that would
         // sit unused until you switched back.
@@ -372,7 +379,8 @@ class VoiceIndicator extends PanelMenu.Button {
         this._startItem = start;
         // Everything that is hidden in the transcript view. The model and
         // effort submenus are handled in _updateChoices, which also gates them.
-        this._controls = [this._toggleItem, fresh, swap, this._voiceOnlyItem, startSep];
+        this._controls = [this._toggleItem, fresh, swap, this._voiceOnlyItem,
+            this._speechItem, startSep];
 
         this._current = null;
         this._installClickHandling();
@@ -466,6 +474,9 @@ class VoiceIndicator extends PanelMenu.Button {
             this._voiceOnlyItem.label.text =
                 status.voiceOnly ? 'Listen to everyone' : 'Only listen to my voice';
             this._voiceOnlyItem.sensitive = status.state !== 'down';
+            this._speechItem.label.text =
+                status.speech === 'local' ? 'Use network speech' : 'Use local speech';
+            this._speechItem.sensitive = status.state !== 'down';
             this._startItem.visible = !t && status.state === 'down';
             this._updateChoices(status);
         }

@@ -351,6 +351,19 @@ REMOTE_TTS_VOICE = os.getenv("VOICE_ASSISTANT_REMOTE_TTS_VOICE", "af_heart").str
 REMOTE_TTS_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT", "10"))
 REMOTE_SPEECH_TIERS = {t.strip() for t in os.getenv(
     "VOICE_ASSISTANT_REMOTE_SPEECH_TIERS", "network,claude").split(",") if t.strip()}
+# Where speech runs, switched at run time (`assistant --speech`, SUPER+SHIFT+M,
+# "use local speech"): "network" lets the tiers above use the servers, "local"
+# keeps recognition and synthesis on this machine whatever the tier. This is
+# where it starts; a switch writes its choice back to the env file. With no
+# servers configured it is local whatever this says.
+SPEECH_MODE = "local" if os.getenv("VOICE_ASSISTANT_SPEECH", "network").strip().lower() \
+    == "local" else "network"
+
+
+def _initial_speech_mode() -> str:
+    """SPEECH_MODE, or local when there is no LAN speech server to use."""
+    return SPEECH_MODE if (REMOTE_STT or REMOTE_TTS) else "local"
+
 
 # --- LLM backend -----------------------------------------------------------
 # Three tiers, by where the model runs:
@@ -2040,6 +2053,22 @@ def _parse_voice_only_request(text: str):
     return None
 
 
+# Where speech runs, as whole sentences like voice-only's: "switch speech to
+# local", "use network speech", "speech local". Asked before the backend
+# switch, which would otherwise hear "switch speech to local" as the model.
+_SPEECH_REQUEST = re.compile(
+    r"(?:(?:switch|change|move|set|put|turn) (?:the )?speech (?:back )?(?:over )?to (?:the )?"
+    r"(?P<a>local|network)(?: speech)?"
+    r"|(?:use|switch to|change to|go to|go back to) (?:the )?(?P<b>local|network) speech"
+    r"|speech (?P<c>local|network))(?: from now on| now)?")
+
+
+def _parse_speech_request(text: str):
+    """'local' or 'network' for a spoken switch of where speech runs, else None."""
+    m = _SPEECH_REQUEST.fullmatch(re.sub(r" please$", "", _normalize_command(text)))
+    return (m.group("a") or m.group("b") or m.group("c")) if m else None
+
+
 def _parse_claude_request(text: str):
     """Pull a model and/or an effort level out of a spoken command.
 
@@ -3448,6 +3477,10 @@ class VoiceAssistant:
         self._turn_think = False
         self._turn_model = ""
 
+        # Where speech runs (SPEECH_MODE): read by the LAN speech wrappers at
+        # every utterance and sentence, so a switch needs no restart.
+        self.speech_mode = _initial_speech_mode()
+
         # Who is speaking (voiceprint.py): loaded by _setup_voiceprint.
         self.voice_only = VOICE_ONLY
         self.voice_unlock = None
@@ -4077,12 +4110,14 @@ class VoiceAssistant:
 
     def _setup_remote_speech(self):
         """Wrap the local engines (already loaded and warm: they are the
-        fallback) so the tiers in REMOTE_SPEECH_TIERS use the LAN servers."""
+        fallback) so the tiers in REMOTE_SPEECH_TIERS use the LAN servers,
+        while the speech mode is network."""
         if not (REMOTE_STT or REMOTE_TTS):
             return
         import remote_speech
-        use = lambda: self.tier in REMOTE_SPEECH_TIERS  # noqa: E731
+        use = self._use_remote_speech
         tiers = "/".join(sorted(REMOTE_SPEECH_TIERS)) or "no"
+        self.logger.info(f"Speech: {self.speech_mode}")
         if REMOTE_STT:
             remote = [remote_speech.RemoteStt(spec.strip(), SAMPLE_RATE)
                       for spec in REMOTE_STT.split(",") if spec.strip()]
@@ -4095,6 +4130,50 @@ class VoiceAssistant:
             self.kokoro = remote_speech.FallbackTts(self.kokoro, remote, use)
             self.logger.info(f"Speech synthesis on {REMOTE_TTS} ({REMOTE_TTS_VOICE}) for the "
                              f"{tiers} tiers, this machine's otherwise")
+
+    def _use_remote_speech(self) -> bool:
+        """Whether this utterance or sentence may go to the LAN servers. Asked
+        by the wrappers each time, so a switch is heard from the next one; a
+        sentence already on a board finishes there."""
+        return self.speech_mode == "network" and self.tier in REMOTE_SPEECH_TIERS
+
+    def set_speech_mode(self, value="toggle") -> dict:
+        """Speech 'local' | 'network' | 'toggle', for the control socket, the
+        hotkey and the spoken command: both recognition and synthesis, from
+        the next utterance and sentence. Network still leaves the local tier
+        on the machine. Written back to the env file like voice-only, so it
+        survives a restart; not when there is no network to choose, so a
+        board configured later is used without another switch."""
+        value = str(value).strip().lower()
+        before = self.speech_mode
+        if value == "toggle":
+            want = "local" if before == "network" else "network"
+        elif value in ("local", "network"):
+            want = value
+        else:
+            return {"ok": False, "error": f"unknown speech setting {value!r}"}
+        note = ""
+        if want == "network" and not (REMOTE_STT or REMOTE_TTS):
+            want, note = "local", "no network speech configured"
+        else:
+            _write_env_setting("VOICE_ASSISTANT_SPEECH", want)
+        self.speech_mode = want
+        label = f"Speech: {want}" + (f" ({note})" if note else "")
+        self.logger.info(label + ("" if want == before else f" (was {before})"))
+        # Into the transcript too, like a model swap: a reply in the other
+        # voice, or a slower transcription, reads differently once you know.
+        self._append_transcript("system", label)
+        self._notify(label, title="Assistant speech", transient=True,
+                     timeout_ms=3000, slot="speech")
+        self._set_status(getattr(self, "_status_state", None) or "off")
+        return {"ok": True, "speech": want, "changed": want != before,
+                "label": label, "servers": self._speech_servers()}
+
+    @staticmethod
+    def _speech_servers() -> dict:
+        """The configured LAN speech servers, for status: {"stt": [...], "tts": [...]}."""
+        return {kind: [x.strip() for x in spec.split(",") if x.strip()]
+                for kind, spec in (("stt", REMOTE_STT), ("tts", REMOTE_TTS))}
 
     # One loader for both features, so turning voice-only on for the first
     # time cannot race a second load.
@@ -4746,6 +4825,8 @@ class VoiceAssistant:
             "local_model": _local_model_label(llm.model),
             # Also a class, so a bar can style it without reading the JSON.
             "voice_only": bool(getattr(self, "voice_only", False)),
+            # Where speech runs: "network" (the LAN servers, for their tiers) or "local".
+            "speech": getattr(self, "speech_mode", "local"),
         }
         if payload["voice_only"]:
             payload["class"].append("voice-only")
@@ -7554,6 +7635,9 @@ class VoiceAssistant:
                     "voice_only": self.voice_only,
                     "voiceprint": (self._voiceprint.status_line()
                                    if self._voiceprint is not None else None),
+                    "speech": getattr(self, "speech_mode", "local"),
+                    "speech_servers": self._speech_servers(),
+                    "speech_tiers": sorted(REMOTE_SPEECH_TIERS),
                     "session": self._session_id}
         if cmd == "backend":
             # Off the loop too: the toggle may probe nvidia-smi, systemd and
@@ -7564,6 +7648,10 @@ class VoiceAssistant:
             # Off the loop: the first 'on' may have the voiceprint model to load.
             return await asyncio.get_running_loop().run_in_executor(
                 None, self.set_voice_only, str(req.get("value", "toggle")))
+        if cmd == "speech":
+            # Off the loop: the status write and notify-send are blocking.
+            return await asyncio.get_running_loop().run_in_executor(
+                None, self.set_speech_mode, str(req.get("value", "toggle")))
         if cmd == "claude":
             return self.set_claude_setting(req.get("model"), req.get("effort"))
         if cmd == "new_session":
@@ -7796,6 +7884,25 @@ class VoiceAssistant:
                 else:
                     line = ("I'm already listening to everyone." if not before
                             else "Okay, I'll listen to everyone.")
+                await loop.run_in_executor(None, self._say, line)
+                spoke = True
+                return
+
+            # "switch speech to local", "use network speech". Before the backend
+            # switch, which would take the first for the local model.
+            want_speech = _parse_speech_request(transcription)
+            if want_speech:
+                self.logger.info(f"Voice command: speech -> {want_speech} ({transcription})")
+                before = self.speech_mode
+                res = await loop.run_in_executor(None, self.set_speech_mode, want_speech)
+                if res["speech"] != want_speech:
+                    line = "There's no network speech configured, so speech stays on this machine."
+                elif res["speech"] == before:
+                    line = f"Speech is already {'on the network' if before == 'network' else 'local'}."
+                elif res["speech"] == "network":
+                    line = "Okay, speech is on the network."
+                else:
+                    line = "Okay, speech is local."
                 await loop.run_in_executor(None, self._say, line)
                 spoke = True
                 return

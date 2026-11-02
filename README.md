@@ -197,7 +197,9 @@ voice-llm discover               # model servers on the LAN: the swap key's netw
 Say **"new conversation"** (or "start over", "forget everything", "fresh start")
 to clear the context by voice. Say **"switch to fable"** (or opus, sonnet,
 haiku) or **"set the effort to extra high"** (low, medium, high, xhigh, max) to
-change what answers; see [Swapping models](#swapping-models).
+change what answers; see [Swapping models](#swapping-models). Say **"switch
+speech to local"** (or "use network speech") to move recognition and synthesis
+off or back onto the LAN boards; see [Speech on the LAN](#speech-on-the-lan).
 
 ### Asking from a terminal
 
@@ -212,9 +214,10 @@ assistant "remind me what we decided about the tomatoes"
 echo "summarise this" | assistant          # reads stdin when given no words
 assistant --image ~/Downloads/x.png "what is this"   # send a picture with the question
 assistant --speak "and read that one out"  # typed questions are silent by default
-assistant --status                         # model, servers (network ones too), voice state, session
+assistant --status                         # model, servers (network ones too), voice state, speech, session
 assistant --new                            # start a fresh conversation
 assistant --voice-only on                  # ignore voices but yours (off, toggle)
+assistant --speech toggle                  # speech on the LAN boards or this machine (local, network)
 assistant --json                           # the raw reply, for scripting
 ```
 
@@ -705,6 +708,25 @@ moment. Only the network and Claude tiers use them
 (`VOICE_ASSISTANT_REMOTE_SPEECH_TIERS`); the local tier stays on the machine so
 it keeps working with the network down.
 
+**SUPER+SHIFT+M** switches speech between the boards and this machine, both
+recognition and synthesis together, and says which in a notification:
+**"Speech: network"** or **"Speech: local"**. Local never uses the boards,
+whatever the tier; network uses them as above, so the local tier still stays
+here. It takes effect from the next utterance and the next sentence, with no
+restart; a sentence a board is already speaking finishes there. The same from
+a terminal or by voice:
+
+```bash
+assistant --speech toggle        # or local, network; prints "Speech: local"
+assistant --status               # speech     network  (stt ...; tts ...; claude/network tiers)
+```
+
+or say "switch speech to local", "use network speech". The choice is written
+to the env file as `VOICE_ASSISTANT_SPEECH`, so a restart comes back to it,
+and goes into the transcript and the status file (`speech`). With no boards
+configured there is nothing to switch to: network answers **"Speech: local (no
+network speech configured)"** and stays local, writing nothing.
+
 This machine's engines stay loaded as the fallback. A board that refuses, goes
 quiet or fails its health check is marked down, probed in the background, and
 the next board or this machine takes the turn. A recogniser that drops
@@ -1051,6 +1073,7 @@ is on, so it reaches for `hyprctl` or `gsettings` as appropriate;
 | New conversation | **SUPER+SHIFT+A** | **SUPER+SHIFT+A** |
 | Swap backend | **SUPER+M** | **SUPER+M** |
 | Voice-only on/off | **SUPER+CTRL+V** | **SUPER+CTRL+V** |
+| Speech local/network | **SUPER+SHIFT+M** | **SUPER+SHIFT+M** |
 | Status | waybar module | top-bar indicator (Shell extension) |
 | Installed by | `contrib/hyprland/hyprland-voice-assistant.conf` | `setup.sh` (gsettings + `contrib/gnome/`) |
 
@@ -1120,7 +1143,8 @@ second class is `claude`, `local`, `network` or `dsh` (the network tier is
 `network` under either harness). The payload also carries `tier` and `label`
 ("Network · qwen3.8-flash-next", with the server's name when several are
 known), which the indicator and panel show, and
-`voice_only` (true adds a third class, `voice-only`). (`waybar-status` is a symlink to the
+`voice_only` (true adds a third class, `voice-only`) and `speech` (`local` or
+`network`, where speech runs). (`waybar-status` is a symlink to the
 same file, for configs written against the old name.)
 
 ### GNOME indicator
@@ -1424,6 +1448,7 @@ win over both.
 | `VOICE_ASSISTANT_REMOTE_TTS` | (unset) | synthesis server(s) on the LAN, URLs, comma-separated for a pool |
 | `VOICE_ASSISTANT_REMOTE_TTS_VOICE` | `af_heart` | the synthesis server's own voice name |
 | `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude` | tiers that use the LAN speech servers |
+| `VOICE_ASSISTANT_SPEECH` | `network` | `local` keeps recognition and synthesis on this machine whatever the tier; `network` uses the LAN speech servers for the tiers above. Local whenever no server is configured; SUPER+SHIFT+M, `assistant --speech` and "switch speech to local" write it back |
 | `VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` | `0.8` | seconds queued before a board's first word plays |
 | `VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT` | `10` | seconds a board may go quiet mid-sentence before this machine's voice takes over; a board running full Kokoro on its CPU sends a long sentence a clause at a time |
 | `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
@@ -1640,8 +1665,8 @@ optional local model.
 |---|---|
 | indicator header | `Listening · Claude · fable · xhigh`, plus copy, new conversation, on/off |
 | left click | the transcript, full height, selectable, code blocks clickable |
-| right click | toggle, new conversation, swap backend, voice-only, Model and Effort submenus |
-| notifications | status only: tool calls, model changes, voice mode; all transient except errors |
+| right click | toggle, new conversation, swap backend, voice-only, local or network speech, Model and Effort submenus |
+| notifications | status only: tool calls, model changes, speech switches, voice mode; all transient except errors |
 | status file | phase and backend for waybar; also model, effort and the valid choices |
 | `voice-assistant-ctl status` | service, process, phase, backend, Claude model and effort, session |
 | the `[context: …]` line | prepended to a user turn only after a long gap, a restart or a reboot |
@@ -1655,6 +1680,8 @@ optional local model.
   word effort, thinking or reasoning.
 - **"only listen to me"** / **"listen to everyone"** -- voice-only on and off.
   The whole sentence has to be the command.
+- **"switch speech to local"** / **"use network speech"** -- speech on this
+  machine or the LAN boards. Also a whole sentence.
 - Tap the toggle key mid-reply to abort it.
 
 ### Things the code will not tell you

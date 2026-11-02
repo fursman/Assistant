@@ -1,7 +1,7 @@
 #!/bin/bash
 # Right-click options for the voice-assistant waybar indicator.
 # Mirrors the GNOME indicator: toggle voice, new conversation, swap backend,
-# voice-only, and pick Claude model / effort. Driven by rofi + the control socket.
+# voice-only, where speech runs, and pick Claude model / effort. Driven by rofi + the control socket.
 set -u
 STATE="$HOME/.local/state/voice-assistant"
 SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voice-assistant.sock"
@@ -34,6 +34,7 @@ print("LOCAL_MODEL="+shlex.quote(str(d.get("local_model",""))))
 print("MODEL="+shlex.quote(str(d.get("model",""))))
 print("EFFORT="+shlex.quote(str(d.get("effort",""))))
 print("VOICE_ONLY="+("on" if d.get("voice_only") else "off"))
+print("SPEECH="+shlex.quote(str(d.get("speech",""))))
 print("MODELS=("+" ".join(shlex.quote(x) for x in d.get("models",[]))+")")
 print("EFFORTS=("+" ".join(shlex.quote(x) for x in d.get("efforts",[]))+")")
 PY
@@ -49,6 +50,7 @@ choice="$(printf '%s\n' \
   "New conversation" \
   "Swap backend  (now: ${LABEL:-${BACKEND:-?}${LOCAL_MODEL:+ · $LOCAL_MODEL}})" \
   "Only my voice  (now: $VOICE_ONLY)" \
+  "Speech         (now: ${SPEECH:-?})" \
   "Claude model   (${MODEL:-?})" \
   "Claude effort  (${EFFORT:-?})" | rofi_menu Assistant)"
 
@@ -57,6 +59,7 @@ case "$choice" in
   "New conversation") send '{"cmd":"new_session"}' >/dev/null ;;
   "Swap backend"*)    send '{"cmd":"backend","value":"toggle"}' >/dev/null ;;
   "Only my voice"*)   send '{"cmd":"voice_only","value":"toggle"}' >/dev/null ;;
+  "Speech"*)          send '{"cmd":"speech","value":"toggle"}' >/dev/null ;;
   "Claude model"*)  sel="$(printf '%s\n' "${MODELS[@]}" | rofi_menu Model)";   [ -n "${sel:-}" ] && send "{\"cmd\":\"claude\",\"model\":\"$sel\"}" >/dev/null ;;
   "Claude effort"*) sel="$(printf '%s\n' "${EFFORTS[@]}" | rofi_menu Effort)"; [ -n "${sel:-}" ] && send "{\"cmd\":\"claude\",\"effort\":\"$sel\"}" >/dev/null ;;
 esac
