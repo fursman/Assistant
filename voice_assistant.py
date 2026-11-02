@@ -345,6 +345,10 @@ REMOTE_TTS = os.getenv("VOICE_ASSISTANT_REMOTE_TTS", "").strip()
 # The server's own voice name: rk1-tts runs Kokoro, whose af_heart is the
 # voice Pocket's af_heart was cloned from.
 REMOTE_TTS_VOICE = os.getenv("VOICE_ASSISTANT_REMOTE_TTS_VOICE", "af_heart").strip()
+# How long a synthesis server may go quiet before this machine's voice takes
+# over. The RK1s' CPU Kokoro (full quality, RTF ~0.7) sends a long sentence a
+# clause at a time; 5 s fell back to the local voice mid-reply, mixing voices.
+REMOTE_TTS_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT", "10"))
 REMOTE_SPEECH_TIERS = {t.strip() for t in os.getenv(
     "VOICE_ASSISTANT_REMOTE_SPEECH_TIERS", "network,claude").split(",") if t.strip()}
 
@@ -4086,7 +4090,7 @@ class VoiceAssistant:
             self.logger.info(f"Speech recognition on {REMOTE_STT} for the {tiers} tiers, "
                              f"this machine's otherwise")
         if REMOTE_TTS and self.tts_available and self.kokoro:
-            remote = [remote_speech.RemoteTts(url.strip(), REMOTE_TTS_VOICE)
+            remote = [remote_speech.RemoteTts(url.strip(), REMOTE_TTS_VOICE, read_timeout=REMOTE_TTS_TIMEOUT)
                       for url in REMOTE_TTS.split(",") if url.strip()]
             self.kokoro = remote_speech.FallbackTts(self.kokoro, remote, use)
             self.logger.info(f"Speech synthesis on {REMOTE_TTS} ({REMOTE_TTS_VOICE}) for the "
