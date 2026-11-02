@@ -1425,6 +1425,7 @@ win over both.
 | `VOICE_ASSISTANT_REMOTE_TTS_VOICE` | `af_heart` | the synthesis server's own voice name |
 | `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude` | tiers that use the LAN speech servers |
 | `VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` | `0.8` | seconds queued before a board's first word plays |
+| `VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT` | `10` | seconds a board may go quiet mid-sentence before this machine's voice takes over; a board running full Kokoro on its CPU sends a long sentence a clause at a time |
 | `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
 | `VOICE_ASSISTANT_TTS_TAIL_GATE` | `0.35` | silence held after playback before the mic is trusted |
 | `VOICE_ASSISTANT_LISTEN_CHIME` | `1` | chime when the mic goes live again after a reply |
