@@ -7214,7 +7214,12 @@ class VoiceAssistant:
         if tts_thread:
             tts_thread.join(timeout=90)
         if drain:
-            self.player.drain(timeout=120)
+            # Wait for what is queued, not a fixed two minutes: synthesis now
+            # runs ahead on the boards, so a long reply is queued in full long
+            # before it has been heard, and a fixed cap gave up mid-reply -- the
+            # microphone came back and the indicator said "ready" while the
+            # last half-minute was still playing.
+            self.player.drain(timeout=self.player.queued_seconds() + 30)
             self._log_playback()
         else:
             self.player.abort()

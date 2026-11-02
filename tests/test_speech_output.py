@@ -483,3 +483,26 @@ def test_key_combos_are_said_as_key_names():
     assert say("Press Super+Ctrl+V now.") == "Press Super Control V now."
     assert say("Cmd + Shift + V pastes.") == "Command Shift V pastes."
     assert "C++" in say("C++ is fine.")
+
+
+def test_a_long_reply_is_heard_to_the_end_before_listening_resumes():
+    """Synthesis runs ahead, so a reply can be queued whole: the wait for it to
+    be heard must cover what is queued, not stop at a fixed two minutes."""
+    class Player:
+        rate = 24000
+
+        def __init__(self):
+            self.timeouts = []
+
+        def queued_seconds(self):
+            return 150.0              # a long answer, made faster than it is spoken
+
+        def drain(self, timeout=None):
+            self.timeouts.append(timeout)
+            return True
+
+    host = types.SimpleNamespace(player=Player(), _sentence_queue=object(), _log_playback=lambda: None)
+    q = queue.Queue()
+    va.VoiceAssistant._end_tts(host, q, None)
+    assert q.get_nowait() is None, "the worker is told the reply is over"
+    assert host.player.timeouts[0] >= 150, "waits for all 150 s still queued"
