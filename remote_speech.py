@@ -446,6 +446,9 @@ class FallbackTts:
         self.local = local
         self.pool = Pool("tts", _as_list(remote), health)
         self.use_remote = use_remote
+        # Whether the sentence being streamed is coming from a board, so the
+        # player can hold a longer cushion for it (TTS_REMOTE_PREBUFFER).
+        self.speaking_remote = False
 
     @property
     def remote(self):
@@ -459,6 +462,7 @@ class FallbackTts:
             yield self.local.create(text, voice=voice, speed=speed)
 
     def stream(self, text, voice=None, speed=None):
+        self.speaking_remote = False
         if self.use_remote():
             with _IN_FLIGHT_LOCK:
                 listening = set(_IN_FLIGHT["stt"])
@@ -475,6 +479,7 @@ class FallbackTts:
                         # machine, can still say all of it.
                         health.mark_down(str(e))
                         continue
+                    self.speaking_remote = True
                     yield first
                     try:
                         yield from gen

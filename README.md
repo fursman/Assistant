@@ -683,6 +683,42 @@ of audio: 16 logical threads RTF 2.41, 8 physical RTF 1.18.
 languages), an extra install. Whichever engine is chosen, Kokoro is the
 fallback if it fails to load, and espeak is the fallback after that.
 
+### Speech on the LAN
+
+Recognition and synthesis can run on other machines, leaving this one's CPU
+alone while you talk and while it answers. `remote_speech.py` speaks to two
+servers: a Moonshine recogniser over plain TCP (port 8772,
+[moonshine-rknn](https://github.com/fursman/moonshine-rknn)) and a Kokoro
+synthesiser over chunked HTTP (port 8771, `POST /tts`, `GET /health`). Here
+they run on the RK1 boards of a Turing Pi, with the work on the NPU:
+
+```bash
+# ~/.config/voice-assistant/env
+VOICE_ASSISTANT_REMOTE_STT=192.168.1.200:8772,192.168.1.201:8772,192.168.1.202:8772,192.168.1.203:8772
+VOICE_ASSISTANT_REMOTE_TTS=http://192.168.1.200:8771,http://192.168.1.201:8771,http://192.168.1.202:8771,http://192.168.1.203:8771
+```
+
+Off unless set; nothing finds the boards for you. A list is a pool: each
+request goes to an idle board answering its health checks, least recently used
+first, and synthesis prefers a board that is not transcribing you at that
+moment. Only the network and Claude tiers use them
+(`VOICE_ASSISTANT_REMOTE_SPEECH_TIERS`); the local tier stays on the machine so
+it keeps working with the network down.
+
+This machine's engines stay loaded as the fallback. A board that refuses, goes
+quiet or fails its health check is marked down, probed in the background, and
+the next board or this machine takes the turn. A recogniser that drops
+mid-utterance hands the recording back for a local transcription; a
+synthesiser that drops mid-sentence does not repeat what was already heard.
+
+The boards speak Kokoro's own `af_heart`, the voice Pocket's default was cloned
+from. They are faster than realtime (RTF ~0.45 over Wi-Fi) but send audio in
+bursts ~0.6 s apart, the first holding only ~0.37 s, so the 0.35 s prebuffer
+started playback on it and ran dry before the second: a gap in nearly every
+reply, heard as choppy speech. A sentence from a board therefore waits for
+`VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` (0.8 s) instead, about half a second
+more before the first word; this machine's own sentences keep 0.35 s.
+
 ## Making text speakable
 
 A language model writes for the eye. Before anything reaches the synthesiser it
@@ -1384,6 +1420,11 @@ win over both.
 | `VOICE_ASSISTANT_TTS_MAX_THREADS` | `8` | most threads a TTS engine (Kokoro, Pocket) gets; the default count is the physical cores this process may run on, up to this |
 | `VOICE_ASSISTANT_TTS_PREBUFFER` | `0.35` | seconds queued before the first word plays |
 | `VOICE_ASSISTANT_TTS_PREBUFFER_WAIT` | `1.2` | deadline on that wait |
+| `VOICE_ASSISTANT_REMOTE_STT` | (unset) | recognition server(s) on the LAN, `host:port`, comma-separated for a pool (see Speech on the LAN) |
+| `VOICE_ASSISTANT_REMOTE_TTS` | (unset) | synthesis server(s) on the LAN, URLs, comma-separated for a pool |
+| `VOICE_ASSISTANT_REMOTE_TTS_VOICE` | `af_heart` | the synthesis server's own voice name |
+| `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude` | tiers that use the LAN speech servers |
+| `VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` | `0.8` | seconds queued before a board's first word plays |
 | `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
 | `VOICE_ASSISTANT_TTS_TAIL_GATE` | `0.35` | silence held after playback before the mic is trusted |
 | `VOICE_ASSISTANT_LISTEN_CHIME` | `1` | chime when the mic goes live again after a reply |
@@ -1411,11 +1452,13 @@ win over both.
 |---|---|---|---|
 | **local backend** | never leaves | never leaves | never leave |
 | **dsh backend** | never leaves | never leaves | never leave |
-| **network backend** | never leaves | to the LAN server | run here, output to the LAN server |
-| **Claude backend** | never leaves | sent to Anthropic | sent to Anthropic |
+| **network backend** | to the LAN speech servers, if set | to the LAN server | run here, output to the LAN server |
+| **Claude backend** | to the LAN speech servers, if set | sent to Anthropic | sent to Anthropic |
 
-Audio is never uploaded in any mode: VAD, transcription, end-of-turn detection
-and synthesis are all local, always. In local mode the only outbound traffic is
+Audio is never uploaded to the internet in any mode: VAD, transcription,
+end-of-turn detection and synthesis are all local by default. With Speech on
+the LAN set, the network and Claude tiers send your recorded speech, and the
+text of each reply, to those LAN servers; the local tier never does. In local mode the only outbound traffic is
 `web_search` / `fetch_page` / `weather`, and only when the model chooses to use
 them: a search goes to your SearXNG, which passes it on to its engines, when one
 is set, and `weather` sends Open-Meteo the place name and its coordinates. Model
@@ -1524,6 +1567,7 @@ power-profiles-daemon uses a more power-saving CPU preference when unplugged.
 | `turn_router.py` | The turn router: one `/judge` call per turn, calibrated, failing open |
 | `llm_discovery.py` | The LAN scan for model servers, shared by `voice-llm discover` and the swap key |
 | `router_calibration.json` | Its rubric fit and thresholds (`~/.config/voice-assistant/` copy wins) |
+| `remote_speech.py` | Speech on the LAN: recognition and synthesis on other machines, with this one's engines as the fallback |
 | `tests/test_turn_router.py` | Router tests; `.venv/bin/python -m pytest tests` |
 | `setup.sh` | One-shot installer, including the local LLM stack |
 | `voice-assistant-ctl` | start / stop / status / toggle / logs / test |

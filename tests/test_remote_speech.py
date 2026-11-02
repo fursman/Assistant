@@ -321,6 +321,19 @@ def test_barge_in_hangs_up_on_the_server():
     assert srv.left_early.wait(3), "the server saw the client leave"
 
 
+def test_says_whether_the_sentence_came_from_a_board():
+    srv = TtsServer()
+    w, _, _ = tts(srv.url)
+    list(w.stream("Hi."))
+    assert w.speaking_remote, "a board's sentence gets the longer cushion"
+    w.use_remote = lambda: False
+    list(w.stream("Hi."))
+    assert not w.speaking_remote, "this machine's keeps the short one"
+    w, _, _ = tts(f"http://127.0.0.1:{closed_port()}")
+    list(w.stream("Hi."))
+    assert not w.speaking_remote, "and so does a fallback"
+
+
 def test_create_joins_the_stream():
     w, _, _ = tts(TtsServer().url)
     samples, sr = w.create("Hi.")

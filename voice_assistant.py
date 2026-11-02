@@ -312,6 +312,11 @@ TTS_VOICES = os.getenv("VOICE_ASSISTANT_TTS_VOICES", "voices-v1.0.bin")
 # bounded by a deadline so a slow first clause cannot stall the reply.
 TTS_PREBUFFER_SECONDS = float(os.getenv("VOICE_ASSISTANT_TTS_PREBUFFER", "0.35"))
 TTS_PREBUFFER_MAX_WAIT = float(os.getenv("VOICE_ASSISTANT_TTS_PREBUFFER_WAIT", "1.2"))
+# The same cushion for a sentence synthesised on a LAN board. rk1-tts sends
+# audio in bursts ~0.6 s apart and the first holds only ~0.37 s, so 0.35 s
+# started playback on the first burst and ran dry before the second: one or
+# more gaps in nearly every reply. Waiting for the second burst removes them.
+TTS_REMOTE_PREBUFFER_SECONDS = float(os.getenv("VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER", "0.8"))
 # Play synthesised audio as it is decoded, for engines that can (Pocket).
 TTS_STREAM = os.getenv("VOICE_ASSISTANT_TTS_STREAM", "1").strip().lower() \
     not in ("0", "false", "no", "off")
@@ -6946,7 +6951,10 @@ class VoiceAssistant:
                         deadline = time.time() + TTS_PREBUFFER_MAX_WAIT
                     staged.append(samples)
                     staged_seconds += len(samples) / self.player.rate
-                    if staged_seconds >= TTS_PREBUFFER_SECONDS or time.time() >= deadline:
+                    cushion = (TTS_REMOTE_PREBUFFER_SECONDS
+                               if getattr(self.kokoro, "speaking_remote", False)
+                               else TTS_PREBUFFER_SECONDS)
+                    if staged_seconds >= cushion or time.time() >= deadline:
                         released = self._release_staged(staged)
             except Exception as e:
                 self.logger.error(f"TTS error on sentence: {e}")
