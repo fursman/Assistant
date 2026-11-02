@@ -233,7 +233,15 @@ def serve(dev):
         want = (True, not on or flash, on and state[1] == "listening") if state else (False, False, False)
         if dev.held != want:
             dev.show(*want)
-        if not select.select([dev.fd], [], [], 0.25)[0]:
+        # While flashing, wake right at the next on/off edge rather than at the
+        # next quarter-second poll: polled, each edge landed up to 0.25 s late,
+        # by an amount that drifted, so the flash beat against the poll and
+        # every few seconds a blink came out short or long -- a visible seam.
+        wait = 0.25
+        if on and state[1] in ("thinking", "speaking"):
+            half = FLASH_PERIOD / 2
+            wait = min(wait, half - time.monotonic() % half + 0.002)
+        if not select.select([dev.fd], [], [], wait)[0]:
             continue
         report = os.read(dev.fd, 64)
         if not report:
