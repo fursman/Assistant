@@ -55,6 +55,65 @@ def test_long_opening_without_breaks_splits_where_a_speaker_breathes():
     assert end is not None and 5 <= len(text[:end].split()) <= 13
 
 
+# --- the first sentence of a reply, when long, in two units -----------------------------
+
+LONG_FIRST = ("The evening is settling in over the island tonight, and rain should "
+              "reach us from the southwest by Thursday. More later.")
+
+
+def test_long_first_sentence_is_cut_once_at_its_first_pause(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", True)
+    end = nb(None, LONG_FIRST, True)
+    assert LONG_FIRST[:end] == "The evening is settling in over the island tonight,"
+    rest = LONG_FIRST[end:]
+    # the rest of that sentence is one unit; nothing else is split
+    assert rest[:nb(None, rest, False)].strip() == \
+        "and rain should reach us from the southwest by Thursday."
+
+
+def test_split_first_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", False)
+    end = nb(None, LONG_FIRST, True)
+    assert LONG_FIRST[:end].endswith("by Thursday.")
+
+
+def test_short_first_sentence_stays_whole(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", True)
+    text = "Sure, I can help with that right now. Next"
+    assert text[:nb(None, text, True)] == "Sure, I can help with that right now."
+
+
+def test_later_sentences_are_never_split(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", True)
+    assert LONG_FIRST[:nb(None, LONG_FIRST, False)].endswith("by Thursday.")
+
+
+def test_split_skips_a_pause_with_too_few_words_before_it(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", True)
+    text = "Well, the ferry from Fulford leaves at four thirty, and it is usually busy then."
+    assert text[:nb(None, text, True)] == "Well, the ferry from Fulford leaves at four thirty,"
+
+
+def test_split_needs_a_rest_that_can_be_ready_in_time(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", True)
+    # "It is late," leaves a rest five times its length: too long to make
+    # while it plays, so the sentence stays whole (no later pause either).
+    text = ("It is late tonight, so the rain that is moving in from the southwest "
+            "should reach the island by about midnight. Then")
+    assert text[:nb(None, text, True)].endswith("midnight.")
+    # a later pause that balances it is taken instead
+    text = ("It is late tonight, the rain is moving in from the southwest, and it "
+            "should reach the island by about midnight. Then")
+    assert text[:nb(None, text, True)] == \
+        "It is late tonight, the rain is moving in from the southwest,"
+
+
+def test_split_never_leaves_a_stub(monkeypatch):
+    monkeypatch.setattr(va, "TTS_SPLIT_FIRST", True)
+    text = "The forecast for the whole island this evening says rain later, I think. Then"
+    assert text[:nb(None, text, True)].endswith("I think.")
+
+
 # --- tool markup never reaches speech --------------------------------------------------
 
 def test_markup_gate_passes_prose_and_stops_at_an_opener_split_across_deltas():
@@ -259,6 +318,130 @@ def test_worker_survives_a_synthesis_error(monkeypatch):
         q.put(x)
     host._tts_worker(q, abort)
     assert [n for _, n in host.player.writes] == [2400]
+
+
+# --- a pool of boards: the next units synthesise while one plays ---------------------
+
+class PoolTTS:
+    """FallbackTts-like: a pool of `boards`, whole-sentence synthesis taking
+    `per_char` seconds per character, one chunk per unit."""
+
+    def __init__(self, boards=4, per_char=0.004, up=True):
+        self.pool = types.SimpleNamespace(health=[types.SimpleNamespace(up=lambda: up)] * boards)
+        self.remote_ok = True
+        self.per_char = per_char
+        self.lock = threading.Lock()
+        self.active = self.peak = 0
+        self.started, self.closed = [], 0
+        self.speaking_remote = True
+
+    def use_remote(self):
+        return self.remote_ok
+
+    def stream(self, text, voice=None, speed=None):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.started.append((time.time(), text))
+        try:
+            time.sleep(self.per_char * len(text))
+            n = int(len(text) * 240)                    # 10 ms of audio per character
+            yield np.full(n, float(len(text)), np.float32), 24000
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.closed += 1
+
+
+def _run_worker(host, units, abort=None):
+    q, abort = queue.Queue(), abort or threading.Event()
+    for u in units:
+        q.put(u)
+    q.put(None)
+    t = threading.Thread(target=host._tts_worker, args=(q, abort))
+    t.start()
+    t.join(10)
+    assert not t.is_alive()
+
+
+def test_pool_synthesises_ahead_and_plays_in_order(monkeypatch):
+    monkeypatch.setattr(va, "TTS_STREAM", True)
+    monkeypatch.setattr(va, "TTS_PREBUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(va, "TTS_REMOTE_PREBUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(va, "REMOTE_TTS_AHEAD", 4)
+    tts = PoolTTS(per_char=0.004)
+    host = _worker_host(tts)
+    written = []
+    host.player.write = lambda x: written.append(float(x[0]))
+    units = ["Short one,", "and then a much longer rest of the first sentence follows.", "Two.", "Three!"]
+    _run_worker(host, units)
+    assert written == [float(len(u)) for u in units]        # in order, each whole
+    assert tts.peak >= 3                                      # synthesised at the same time
+    starts = [t for t, _ in tts.started]
+    assert max(starts) - min(starts) < 0.05                   # all asked for at once
+
+
+def test_pool_ahead_is_bounded_by_boards_answering(monkeypatch):
+    monkeypatch.setattr(va, "TTS_STREAM", True)
+    monkeypatch.setattr(va, "TTS_PREBUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(va, "REMOTE_TTS_AHEAD", 4)
+    tts = PoolTTS(boards=2, per_char=0.002)
+    host = _worker_host(tts)
+    _run_worker(host, ["one unit here."] * 5)
+    assert tts.peak == 2 and tts.closed == 5
+
+
+def test_one_at_a_time_without_the_pool_or_when_off(monkeypatch):
+    monkeypatch.setattr(va, "TTS_STREAM", True)
+    monkeypatch.setattr(va, "TTS_PREBUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(va, "REMOTE_TTS_AHEAD", 4)
+    tts = PoolTTS(per_char=0.002)
+    tts.remote_ok = False                        # this tier speaks on this machine
+    host = _worker_host(tts)
+    _run_worker(host, ["a unit.", "another unit.", "a third."])
+    assert tts.peak == 1
+    monkeypatch.setattr(va, "REMOTE_TTS_AHEAD", 1)
+    tts = PoolTTS(per_char=0.002)
+    host = _worker_host(tts)
+    _run_worker(host, ["a unit.", "another unit.", "a third."])
+    assert tts.peak == 1
+
+
+def test_pool_abort_stops_everything(monkeypatch):
+    monkeypatch.setattr(va, "TTS_STREAM", True)
+    monkeypatch.setattr(va, "TTS_PREBUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(va, "REMOTE_TTS_AHEAD", 4)
+    tts = PoolTTS(per_char=0.01)
+    host = _worker_host(tts)
+    q, abort = queue.Queue(), threading.Event()
+    for u in ["x" * 30] * 4:
+        q.put(u)
+    t = threading.Thread(target=host._tts_worker, args=(q, abort))
+    t.start()
+    time.sleep(0.1)
+    abort.set()
+    t.join(2)
+    assert not t.is_alive()
+    assert host.player.writes == []
+
+
+def test_pool_worker_survives_a_failed_unit(monkeypatch):
+    monkeypatch.setattr(va, "TTS_STREAM", True)
+    monkeypatch.setattr(va, "TTS_PREBUFFER_SECONDS", 0.0)
+    monkeypatch.setattr(va, "REMOTE_TTS_AHEAD", 4)
+    tts = PoolTTS(per_char=0.001)
+    real = tts.stream
+
+    def stream(text, voice=None, speed=None):
+        if text == "bad":
+            raise RuntimeError("bad text")
+        yield from real(text, voice, speed)
+    tts.stream = stream
+    host = _worker_host(tts)
+    written = []
+    host.player.write = lambda x: written.append(float(x[0]))
+    _run_worker(host, ["good one.", "bad", "good two."])
+    assert written == [9.0, 9.0]
 
 
 # --- playback gaps -------------------------------------------------------------------

@@ -446,20 +446,35 @@ class FallbackTts:
         self.local = local
         self.pool = Pool("tts", _as_list(remote), health)
         self.use_remote = use_remote
+        # Several units of a reply may be synthesising at once (one per board),
+        # each streamed by its own thread: per-thread state, and this machine's
+        # engine -- the fallback -- used by one of them at a time.
+        self._tls = threading.local()
+        self._local_lock = threading.Lock()
         # Whether the sentence being streamed is coming from a board, so the
         # player can hold a longer cushion for it (TTS_REMOTE_PREBUFFER).
         self.speaking_remote = False
+
+    @property
+    def speaking_remote(self) -> bool:
+        """For the sentence this thread is streaming."""
+        return getattr(self._tls, "remote", False)
+
+    @speaking_remote.setter
+    def speaking_remote(self, value):
+        self._tls.remote = bool(value)
 
     @property
     def remote(self):
         return self.pool.servers[0]
 
     def _local_stream(self, text, voice, speed):
-        stream = getattr(self.local, "stream", None)
-        if stream is not None:
-            yield from stream(text, voice=voice, speed=speed)
-        else:
-            yield self.local.create(text, voice=voice, speed=speed)
+        with self._local_lock:
+            stream = getattr(self.local, "stream", None)
+            if stream is not None:
+                yield from stream(text, voice=voice, speed=speed)
+            else:
+                yield self.local.create(text, voice=voice, speed=speed)
 
     def stream(self, text, voice=None, speed=None):
         self.speaking_remote = False

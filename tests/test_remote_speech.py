@@ -416,3 +416,37 @@ def test_speech_moves_on_when_a_board_fails_before_the_first_word():
     tts = rs.FallbackTts(local, [rs.RemoteTts(bad.url), rs.RemoteTts(good.url)], lambda: True, healths)
     pieces = list(tts.stream("Hi."))
     assert len(pieces) == 3 and local.spoken == [] and healths[0].downs
+
+
+def test_each_thread_knows_whether_its_sentence_came_from_a_board():
+    tts = rs.FallbackTts(LocalTts(), [], lambda: True, health=[])
+    seen = {}
+
+    def run(name, value):
+        tts.speaking_remote = value
+        time.sleep(0.05)
+        seen[name] = tts.speaking_remote
+    th = [threading.Thread(target=run, args=(n, v)) for n, v in (("a", True), ("b", False))]
+    [t.start() for t in th]
+    [t.join() for t in th]
+    assert seen == {"a": True, "b": False}
+
+
+def test_this_machine_speaks_one_fallback_at_a_time():
+    class Slow:
+        active = peak = 0
+        lock = threading.Lock()
+
+        def stream(self, text, voice=None, speed=None):
+            with Slow.lock:
+                Slow.active += 1
+                Slow.peak = max(Slow.peak, Slow.active)
+            time.sleep(0.05)
+            yield np.zeros(10, np.float32), 24000
+            with Slow.lock:
+                Slow.active -= 1
+    tts = rs.FallbackTts(Slow(), [], lambda: False, health=[])
+    th = [threading.Thread(target=lambda: list(tts.stream("x"))) for _ in range(3)]
+    [t.start() for t in th]
+    [t.join() for t in th]
+    assert Slow.peak == 1

@@ -351,6 +351,22 @@ REMOTE_TTS_VOICE = os.getenv("VOICE_ASSISTANT_REMOTE_TTS_VOICE", "af_heart").str
 REMOTE_TTS_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT", "10"))
 REMOTE_SPEECH_TIERS = {t.strip() for t in os.getenv(
     "VOICE_ASSISTANT_REMOTE_SPEECH_TIERS", "network,claude").split(",") if t.strip()}
+# How many units of a reply may be synthesising at once on the boards. A board
+# synthesises a sentence whole (that is where Kokoro's phrasing comes from), so
+# one at a time left a gap whenever a sentence took longer to make than the one
+# before it took to play. Bounded by the boards answering; 1 is one at a time.
+REMOTE_TTS_AHEAD = max(1, int(os.getenv("VOICE_ASSISTANT_REMOTE_TTS_AHEAD", "4") or 1))
+# The first sentence of a reply, when it is long, is spoken in two units: up to
+# its first natural pause, then the rest (each synthesised whole, the rest on
+# another board while the first part plays), so the first word comes sooner.
+# Only once, and only where the rest is not so long that it could not be ready
+# in time (2026-11-02, measured against the RK1 pool: REPORT.md there).
+TTS_SPLIT_FIRST = os.getenv("VOICE_ASSISTANT_TTS_SPLIT_FIRST", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+TTS_SPLIT_FIRST_MIN_CHARS = 60      # a first sentence this long or shorter stays whole
+TTS_SPLIT_FIRST_MIN_WORDS = 4       # words before the pause
+TTS_SPLIT_FIRST_MIN_REST = 20       # characters after it
+TTS_SPLIT_FIRST_MAX_RATIO = 2.5     # rest / first part, in characters
 # Where speech runs, switched at run time (`assistant --speech`, SUPER+SHIFT+M,
 # "use local speech"): "network" lets the tiers above use the servers, "local"
 # keeps recognition and synthesis on this machine whatever the tier. This is
@@ -1782,6 +1798,28 @@ def _is_sentence_end(text: str, end: int) -> bool:
     if len(word) == 1 and m.group(1).isupper():
         return False                     # "J. Smith"
     return True
+
+
+def _first_pause(sentence: str):
+    """Where a long first sentence is cut once, at its first natural pause
+    (comma, semicolon, colon, dash) with a reasonable part before it, or None
+    to keep it whole. The rest is synthesised on another board while the
+    first part plays, so it must not be much longer than the first part: a
+    pause that leaves too long a rest gives way to a later one."""
+    body = sentence.strip()
+    if len(body) <= TTS_SPLIT_FIRST_MIN_CHARS:
+        return None
+    lead = len(sentence) - len(sentence.lstrip())
+    for m in _CLAUSE_END.finditer(sentence):
+        head, rest = sentence[lead:m.end()].strip(), sentence[m.end():].strip()
+        if len(head.split()) < TTS_SPLIT_FIRST_MIN_WORDS:
+            continue
+        if len(rest) < TTS_SPLIT_FIRST_MIN_REST:
+            return None                 # later pauses leave even less
+        if len(rest) > TTS_SPLIT_FIRST_MAX_RATIO * len(head):
+            continue                    # a later pause balances it better
+        return m.end()
+    return None
 
 
 def _text_similarity(a: str, b: str) -> float:
@@ -5016,6 +5054,10 @@ class VoiceAssistant:
         """
         for m in _SENTENCE_END.finditer(text):
             if _is_sentence_end(text, m.end()):
+                if first_unit and TTS_SPLIT_FIRST:
+                    cut = _first_pause(text[:m.end()])
+                    if cut is not None:
+                        return cut
                 return m.end()
         if not first_unit:
             return None
@@ -6989,13 +7031,35 @@ class VoiceAssistant:
 
         return self._finish_turn(sentence_q, False, tts_thread)
 
+    def _tts_ahead(self) -> int:
+        """How many units may synthesise at once: one per board answering when
+        this reply's speech goes to the board pool, else one (this machine's
+        engine does one at a time)."""
+        engine = self.kokoro
+        pool = getattr(engine, "pool", None)
+        use_remote = getattr(engine, "use_remote", None)
+        if pool is None or use_remote is None or REMOTE_TTS_AHEAD <= 1:
+            return 1
+        try:
+            if not use_remote():
+                return 1
+            up = sum(1 for h in pool.health if h.up())
+        except Exception:
+            return 1
+        return max(1, min(up, REMOTE_TTS_AHEAD))
+
     def _tts_worker(self, sentence_q, abort):
         """Synthesize queued units and write them to the persistent player.
 
         The first unit is held back until a short cushion of audio exists, so a
         throttled CPU cannot start speaking and then run out mid-sentence. The
         cushion is bounded: a slow first clause must not delay the reply.
+        With a pool of boards, the units after the one playing synthesise at
+        the same time on the other boards (_tts_worker_ahead).
         """
+        ahead = self._tts_ahead()
+        if ahead > 1:
+            return self._tts_worker_ahead(sentence_q, abort, ahead)
         staged = []
         staged_seconds = 0.0
         released = False
@@ -7050,6 +7114,87 @@ class VoiceAssistant:
                     close()
             if abort.is_set():
                 return
+
+    def _tts_worker_ahead(self, sentence_q, abort, ahead):
+        """_tts_worker for a pool of boards: each unit starts synthesising as
+        soon as it is queued and a board is free (up to `ahead` at once, the
+        pool sends each to a board with nothing in flight), and the units are
+        played strictly in order, each as its audio arrives. A board makes a
+        sentence whole, so without this the next one only started when the
+        last had been made, and a long sentence after a short one left a gap."""
+        class Job:
+            __slots__ = ("text", "chunks", "thread", "remote")
+
+        def synth(job):
+            pieces = None
+            try:
+                pieces = self.kokoro.stream(job.text, voice=TTS_VOICE, speed=TTS_SPEED)
+                for samples, sr in pieces:
+                    if abort.is_set():
+                        break
+                    job.remote = getattr(self.kokoro, "speaking_remote", False)
+                    job.chunks.put((samples, sr))
+            except Exception as e:
+                self.logger.error(f"TTS error on sentence: {e}")
+            finally:
+                close = getattr(pieces, "close", None)
+                if close is not None:
+                    close()
+                job.chunks.put(None)
+
+        waiting, jobs = collections.deque(), collections.deque()
+        more = True                  # units may still arrive
+        staged, staged_seconds, released, deadline = [], 0.0, False, None
+        while True:
+            if abort.is_set():
+                return
+            # Take whatever has been queued, without waiting while there is audio to play.
+            while more:
+                try:
+                    unit = sentence_q.get(timeout=0 if jobs or waiting else 0.2)
+                except queue.Empty:
+                    break
+                if unit is None:
+                    more = False
+                else:
+                    waiting.append(unit)
+            busy = sum(1 for j in jobs if j.thread.is_alive())
+            while waiting and busy < ahead:
+                job = Job()
+                job.text, job.chunks, job.remote = waiting.popleft(), queue.Queue(), False
+                job.thread = threading.Thread(target=synth, args=(job,), name="tts-ahead", daemon=True)
+                job.thread.start()
+                jobs.append(job)
+                busy += 1
+            if not jobs:
+                if not more:
+                    if staged and not released:
+                        self._release_staged(staged)
+                    return
+                if staged and not released and deadline is not None and time.time() >= deadline:
+                    released = self._release_staged(staged)
+                continue
+            try:
+                item = jobs[0].chunks.get(timeout=0.05)
+            except queue.Empty:
+                if staged and not released and deadline is not None and time.time() >= deadline:
+                    released = self._release_staged(staged)
+                continue
+            if item is None:
+                jobs.popleft()
+                continue
+            samples, sr = item
+            samples = _resample_to(samples, sr, self.player.rate)
+            if released:
+                self.player.write(samples)
+                continue
+            if deadline is None:
+                deadline = time.time() + TTS_PREBUFFER_MAX_WAIT
+            staged.append(samples)
+            staged_seconds += len(samples) / self.player.rate
+            cushion = TTS_REMOTE_PREBUFFER_SECONDS if jobs[0].remote else TTS_PREBUFFER_SECONDS
+            if staged_seconds >= cushion or time.time() >= deadline:
+                released = self._release_staged(staged)
 
     def _release_staged(self, staged) -> bool:
         for s in staged:

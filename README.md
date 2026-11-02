@@ -741,6 +741,21 @@ reply, heard as choppy speech. A sentence from a board therefore waits for
 `VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` (0.8 s) instead, about half a second
 more before the first word; this machine's own sentences keep 0.35 s.
 
+A board synthesises each sentence whole, which is where Kokoro's phrasing
+comes from, so a sentence's first word waits for all of it. Two things keep
+that from costing time. The units of a reply are synthesised ahead, each on a
+board with nothing in flight (`VOICE_ASSISTANT_REMOTE_TTS_AHEAD`, one per board
+answering), and played strictly in order: one at a time, a long sentence after
+a short one left a gap of up to 1.9 s while it was made. And a long first
+sentence (over 60 characters) is cut once at its first natural pause with at
+least four words before it, as long as the rest is no more than 2.5 times the
+first part, so it can be ready before the first part has played
+(`VOICE_ASSISTANT_TTS_SPLIT_FIRST`). Both halves are still whole units, and
+every later sentence stays whole. Measured against the four RK1s (2026-11-02,
+three runs per reply): first audio 4.4-5.3 s became 2.1-2.3 s for a first
+sentence of ~115 characters, and no reply had a gap, against gaps of up to
+1.7 s before.
+
 ## Making text speakable
 
 A language model writes for the eye. Before anything reaches the synthesiser it
@@ -1450,6 +1465,8 @@ win over both.
 | `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude` | tiers that use the LAN speech servers |
 | `VOICE_ASSISTANT_SPEECH` | `network` | `local` keeps recognition and synthesis on this machine whatever the tier; `network` uses the LAN speech servers for the tiers above. Local whenever no server is configured; SUPER+SHIFT+M, `assistant --speech` and "switch speech to local" write it back |
 | `VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` | `0.8` | seconds queued before a board's first word plays |
+| `VOICE_ASSISTANT_REMOTE_TTS_AHEAD` | `4` | units of a reply synthesising at once on the board pool, one per board answering, played in order; `1` is one at a time |
+| `VOICE_ASSISTANT_TTS_SPLIT_FIRST` | `1` | a reply's first sentence, when longer than 60 characters, is spoken as two units cut once at its first natural pause (comma, semicolon, colon, dash) so the first word comes sooner; `0` keeps it whole |
 | `VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT` | `10` | seconds a board may go quiet mid-sentence before this machine's voice takes over; a board running full Kokoro on its CPU sends a long sentence a clause at a time |
 | `VOICE_ASSISTANT_TTS_STREAM` | `1` | play audio as it is decoded (Pocket) rather than per sentence |
 | `VOICE_ASSISTANT_TTS_TAIL_GATE` | `0.35` | silence held after playback before the mic is trusted |
