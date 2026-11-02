@@ -701,12 +701,35 @@ VOICE_ASSISTANT_REMOTE_STT=192.168.1.200:8772,192.168.1.201:8772,192.168.1.202:8
 VOICE_ASSISTANT_REMOTE_TTS=http://192.168.1.200:8771,http://192.168.1.201:8771,http://192.168.1.202:8771,http://192.168.1.203:8771
 ```
 
-Off unless set; nothing finds the boards for you. A list is a pool: each
-request goes to an idle board answering its health checks, least recently used
-first, and synthesis prefers a board that is not transcribing you at that
-moment. Only the network and Claude tiers use them
+A list is a pool: each request goes to an idle board answering its health
+checks, least recently used first, and synthesis prefers a board that is not
+transcribing you at that moment. Only the network and Claude tiers use them
 (`VOICE_ASSISTANT_REMOTE_SPEECH_TIERS`); the local tier stays on the machine so
 it keeps working with the network down.
+
+**Without the lists, the boards are found on the LAN.** A board set up with
+[rk1-speech](https://github.com/fursman/rk1-speech) announces its recogniser
+as `_speech-stt._tcp` and its synthesiser as `_speech-tts._tcp` over mDNS, with
+TXT records naming the protocol (`proto=moonshine-tcp/1`, `proto=kokoro-http/1`),
+engine, version and board. `speech_discovery.py` looks for them the way
+`llm_discovery.py` looks for model servers: in a background thread at start,
+every `VOICE_ASSISTANT_SPEECH_DISCOVER_INTERVAL` seconds (300; every minute
+while none has been found; 0 turns it off) and right after you switch speech to
+the network. A turn never waits for it: it uses whatever the pools hold. A
+board found joins the pool at once and takes requests as soon as it answers its
+health check; one that goes away is marked down like any other. Only the two
+protocols above are taken, so a board running something else is left alone.
+Standard library only, and no avahi on this machine: it sends one-shot mDNS
+queries from an ephemeral port, which the boards' avahi answers by unicast.
+
+**A list in the env file always wins**, kind by kind: with
+`VOICE_ASSISTANT_REMOTE_STT` set, recognition uses exactly that list and only
+synthesis is looked for. `python3 speech_discovery.py` prints what it finds:
+
+```
+stt rk1-1 <address>:8772 moonshine-rknn d1822a562426
+tts rk1-1 <address>:8771 kokoro-rknn e32630f9f33b
+```
 
 **SUPER+SHIFT+M** switches speech between the boards and this machine, both
 recognition and synthesis together, and says which in a notification:
@@ -721,11 +744,24 @@ assistant --speech toggle        # or local, network; prints "Speech: local"
 assistant --status               # speech     network  (stt ...; tts ...; claude/network tiers)
 ```
 
+With boards found on the LAN, `--status` counts them on the speech line and
+lists them under it, each with whether its servers answer:
+
+```
+speech     network  (stt 4 found on the LAN; tts 4 found on the LAN; claude/network tiers)
+           rk1-1      <address>       stt up  tts up
+           rk1-2      <address>       stt up  tts down
+           ...
+           (looked just now)
+```
+
 or say "switch speech to local", "use network speech". The choice is written
 to the env file as `VOICE_ASSISTANT_SPEECH`, so a restart comes back to it,
 and goes into the transcript and the status file (`speech`). With no boards
-configured there is nothing to switch to: network answers **"Speech: local (no
-network speech configured)"** and stays local, writing nothing.
+configured and discovery off there is nothing to switch to: network answers
+**"Speech: local (no network speech configured)"** and stays local, writing
+nothing. With discovery on and no board found yet, network is kept (**"Speech:
+network (no boards found yet)"**) and this machine speaks until one turns up.
 
 This machine's engines stay loaded as the fallback. A board that refuses, goes
 quiet or fails its health check is marked down, probed in the background, and
@@ -1459,8 +1495,9 @@ win over both.
 | `VOICE_ASSISTANT_TTS_MAX_THREADS` | `8` | most threads a TTS engine (Kokoro, Pocket) gets; the default count is the physical cores this process may run on, up to this |
 | `VOICE_ASSISTANT_TTS_PREBUFFER` | `0.35` | seconds queued before the first word plays |
 | `VOICE_ASSISTANT_TTS_PREBUFFER_WAIT` | `1.2` | deadline on that wait |
-| `VOICE_ASSISTANT_REMOTE_STT` | (unset) | recognition server(s) on the LAN, `host:port`, comma-separated for a pool (see Speech on the LAN) |
-| `VOICE_ASSISTANT_REMOTE_TTS` | (unset) | synthesis server(s) on the LAN, URLs, comma-separated for a pool |
+| `VOICE_ASSISTANT_REMOTE_STT` | (unset) | recognition server(s) on the LAN, `host:port`, comma-separated for a pool (see Speech on the LAN); unset = the boards found on the LAN |
+| `VOICE_ASSISTANT_REMOTE_TTS` | (unset) | synthesis server(s) on the LAN, URLs, comma-separated for a pool; unset = the boards found on the LAN |
+| `VOICE_ASSISTANT_SPEECH_DISCOVER_INTERVAL` | `300` | seconds between looks for speech boards announcing themselves over mDNS (every minute while none is found), for a kind with no list above; `0` = never look |
 | `VOICE_ASSISTANT_REMOTE_TTS_VOICE` | `af_heart` | the synthesis server's own voice name |
 | `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude` | tiers that use the LAN speech servers |
 | `VOICE_ASSISTANT_SPEECH` | `network` | `local` keeps recognition and synthesis on this machine whatever the tier; `network` uses the LAN speech servers for the tiers above. Local whenever no server is configured; SUPER+SHIFT+M, `assistant --speech` and "switch speech to local" write it back |

@@ -18,8 +18,10 @@ once and probed in the background; the next turn uses it again as soon as it
 answers. Nothing here ever waits on a down server for longer than its connect
 timeout.
 
-Standard library only: plain TCP frames for the recogniser (see
-rk1-speech/stt_server.py), chunked HTTP for the synthesiser.
+Standard library only: plain TCP frames for the recogniser (moonshine-rknn's
+server), chunked HTTP for the synthesiser (kokoro-rknn's). The servers come
+from VOICE_ASSISTANT_REMOTE_STT / _TTS, or from their mDNS announcements
+(speech_discovery.py), added to a pool as they are found.
 """
 from __future__ import annotations
 
@@ -260,7 +262,11 @@ class Pool:
 
     First the ones answering their health checks; among those, ones with no
     request of this kind in flight before busy ones, hosts in `avoid` last,
-    and otherwise the least recently used first, so the boards take turns."""
+    and otherwise the least recently used first, so the boards take turns.
+
+    Servers found on the LAN later join with add(); none ever leaves, so a
+    server's index stays valid while a request holds it (one that stops
+    answering is simply not offered)."""
 
     def __init__(self, kind: str, servers, health=None):
         self.kind = kind
@@ -271,11 +277,28 @@ class Pool:
             health = [health]
         self.health = list(health)
         self._used = [0.0] * len(self.servers)
+        self._add_lock = threading.Lock()
+
+    def has(self, host: str, port: int) -> bool:
+        return any(s.host == host and s.port == port for s in list(self.servers))
+
+    def add(self, server, health=None) -> bool:
+        """Take another server (one discovery found); False when it is already
+        here. Its health is checked from now on, and it is offered once it
+        answers. Appended in the order order() relies on: a health entry
+        never exists before its server."""
+        with self._add_lock:
+            if self.has(server.host, server.port):
+                return False
+            self.servers.append(server)
+            self._used.append(0.0)
+            self.health.append(health if health is not None else Health(server.name, server.probe))
+            return True
 
     def order(self, avoid=()):
         with _IN_FLIGHT_LOCK:
             busy = dict(_IN_FLIGHT[self.kind])
-        up = [i for i, h in enumerate(self.health) if h.up()]
+        up = [i for i, h in enumerate(list(self.health)) if h.up()]
         up.sort(key=lambda i: (busy.get(self.servers[i].host, 0),
                                self.servers[i].host in avoid, self._used[i]))
         return [(i, self.servers[i], self.health[i]) for i in up]
@@ -312,7 +335,9 @@ class FallbackStt:
 
     @property
     def remote(self):
-        return self.pool.servers[self._active if self._active is not None else 0]
+        if self._active is not None:
+            return self.pool.servers[self._active]
+        return self.pool.servers[0] if self.pool.servers else None
 
     def _candidates(self):
         return self.pool.order() if self.use_remote() else []
@@ -466,7 +491,7 @@ class FallbackTts:
 
     @property
     def remote(self):
-        return self.pool.servers[0]
+        return self.pool.servers[0] if self.pool.servers else None
 
     def _local_stream(self, text, voice, speed):
         with self._local_lock:

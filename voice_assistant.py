@@ -69,6 +69,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from silero_vad import load_silero_vad
 
 import llm_discovery  # the LAN scan, shared with `voice-llm discover`
+import speech_discovery  # speech boards that announce themselves (mDNS)
 import look_tools  # screenshots, webcam frames and image files for `look`
 import weather_tools  # Open-Meteo, shared with the dsh MCP sidecar
 import web_tools  # search and fetch, shared with the dsh MCP sidecar
@@ -336,12 +337,20 @@ LISTEN_RESUME_CHIME = os.getenv("VOICE_ASSISTANT_LISTEN_CHIME", "1").strip().low
 # host:port of the recognition server, URL of the synthesis server, or comma-
 # separated lists of several (requests go to an idle board answering health
 # checks, taking turns; synthesis prefers a board not transcribing the user at
-# that moment). Unset = everything stays on this machine. The tiers listed
-# use them while they answer and fall back to this machine's engines when they
-# do not; the local tier is left out by default so it keeps working with the
-# network down.
+# that moment). Unset = the boards that announce themselves on the LAN
+# (SPEECH_DISCOVER_INTERVAL below), else everything stays on this machine. The
+# tiers listed use them while they answer and fall back to this machine's
+# engines when they do not; the local tier is left out by default so it keeps
+# working with the network down.
 REMOTE_STT = os.getenv("VOICE_ASSISTANT_REMOTE_STT", "").strip()
 REMOTE_TTS = os.getenv("VOICE_ASSISTANT_REMOTE_TTS", "").strip()
+# Look for speech boards announcing themselves over mDNS (rk1-speech:
+# _speech-stt._tcp, _speech-tts._tcp; speech_discovery.py), for each kind with
+# no list above: at start and this often (seconds), in the background, and
+# sooner while none has been found. A board found joins the pool at once and
+# is used as soon as it answers its health check; a turn never waits on a
+# scan. 0 = never look: only the lists above.
+SPEECH_DISCOVER_INTERVAL = float(os.getenv("VOICE_ASSISTANT_SPEECH_DISCOVER_INTERVAL", "300") or 0)
 # The server's own voice name: rk1-tts runs Kokoro, whose af_heart is the
 # voice Pocket's af_heart was cloned from.
 REMOTE_TTS_VOICE = os.getenv("VOICE_ASSISTANT_REMOTE_TTS_VOICE", "af_heart").strip()
@@ -376,9 +385,26 @@ SPEECH_MODE = "local" if os.getenv("VOICE_ASSISTANT_SPEECH", "network").strip().
     == "local" else "network"
 
 
+def _speech_discovering(kind: str) -> bool:
+    """Whether this kind of speech server ("stt" | "tts") is looked for on the
+    LAN: discovery is on and the env file lists none (a list always wins)."""
+    return SPEECH_DISCOVER_INTERVAL > 0 and not (REMOTE_STT if kind == "stt" else REMOTE_TTS)
+
+
+def _network_speech_possible() -> bool:
+    """Servers configured, or looked for: network speech means something."""
+    return bool(REMOTE_STT or REMOTE_TTS or SPEECH_DISCOVER_INTERVAL > 0)
+
+
 def _initial_speech_mode() -> str:
     """SPEECH_MODE, or local when there is no LAN speech server to use."""
-    return SPEECH_MODE if (REMOTE_STT or REMOTE_TTS) else "local"
+    return SPEECH_MODE if _network_speech_possible() else "local"
+
+
+# The speech servers the last mDNS scan found ({kind: [speech_discovery.Found]}),
+# replaced whole by the discovery thread, and when that was (0 = not yet).
+_SPEECH_FOUND = {"stt": [], "tts": []}
+_SPEECH_SCANNED_AT = 0.0
 
 
 # --- LLM backend -----------------------------------------------------------
@@ -3518,6 +3544,7 @@ class VoiceAssistant:
         # Where speech runs (SPEECH_MODE): read by the LAN speech wrappers at
         # every utterance and sentence, so a switch needs no restart.
         self.speech_mode = _initial_speech_mode()
+        self._speech_rescan = threading.Event()   # wakes _watch_speech_servers
 
         # Who is speaking (voiceprint.py): loaded by _setup_voiceprint.
         self.voice_only = VOICE_ONLY
@@ -4149,25 +4176,56 @@ class VoiceAssistant:
     def _setup_remote_speech(self):
         """Wrap the local engines (already loaded and warm: they are the
         fallback) so the tiers in REMOTE_SPEECH_TIERS use the LAN servers,
-        while the speech mode is network."""
-        if not (REMOTE_STT or REMOTE_TTS):
+        while the speech mode is network. A kind with no list in the env file
+        starts with an empty pool when discovery is on; the boards found join
+        it (_add_found_speech_servers)."""
+        if not _network_speech_possible():
             return
         import remote_speech
         use = self._use_remote_speech
         tiers = "/".join(sorted(REMOTE_SPEECH_TIERS)) or "no"
         self.logger.info(f"Speech: {self.speech_mode}")
-        if REMOTE_STT:
+        if REMOTE_STT or _speech_discovering("stt"):
             remote = [remote_speech.RemoteStt(spec.strip(), SAMPLE_RATE)
                       for spec in REMOTE_STT.split(",") if spec.strip()]
             self.stt = remote_speech.FallbackStt(self.stt, remote, use)
-            self.logger.info(f"Speech recognition on {REMOTE_STT} for the {tiers} tiers, "
-                             f"this machine's otherwise")
-        if REMOTE_TTS and self.tts_available and self.kokoro:
+            self.logger.info(f"Speech recognition on {REMOTE_STT or 'the boards found on the LAN'} "
+                             f"for the {tiers} tiers, this machine's otherwise")
+        if (REMOTE_TTS or _speech_discovering("tts")) and self.tts_available and self.kokoro:
             remote = [remote_speech.RemoteTts(url.strip(), REMOTE_TTS_VOICE, read_timeout=REMOTE_TTS_TIMEOUT)
                       for url in REMOTE_TTS.split(",") if url.strip()]
             self.kokoro = remote_speech.FallbackTts(self.kokoro, remote, use)
-            self.logger.info(f"Speech synthesis on {REMOTE_TTS} ({REMOTE_TTS_VOICE}) for the "
-                             f"{tiers} tiers, this machine's otherwise")
+            self.logger.info(f"Speech synthesis on {REMOTE_TTS or 'the boards found on the LAN'} "
+                             f"({REMOTE_TTS_VOICE}) for the {tiers} tiers, this machine's otherwise")
+        # Whatever a scan has found already.
+        self._add_found_speech_servers()
+
+    # Discovery and start-up both add to the pools: one at a time.
+    _speech_pool_lock = threading.Lock()
+
+    def _add_found_speech_servers(self) -> list:
+        """Put the boards the last scan found into the pools, for the kinds
+        being looked for; returns the ones added. No I/O: each new server's
+        health is checked by its own thread, and it is offered once it answers."""
+        import remote_speech
+        added = []
+        with self._speech_pool_lock:
+            for kind, engine in (("stt", getattr(self, "stt", None)), ("tts", getattr(self, "kokoro", None))):
+                pool = getattr(engine, "pool", None)
+                if pool is None or not _speech_discovering(kind):
+                    continue
+                for f in _SPEECH_FOUND.get(kind, []):
+                    if pool.has(f.address, f.port):
+                        continue
+                    if kind == "stt":
+                        server = remote_speech.RemoteStt(f.spec, SAMPLE_RATE)
+                    else:
+                        server = remote_speech.RemoteTts(f.spec, REMOTE_TTS_VOICE,
+                                                         read_timeout=REMOTE_TTS_TIMEOUT)
+                    server.name = f.name or f.address
+                    if pool.add(server):
+                        added.append(f)
+        return added
 
     def _use_remote_speech(self) -> bool:
         """Whether this utterance or sentence may go to the LAN servers. Asked
@@ -4191,10 +4249,16 @@ class VoiceAssistant:
         else:
             return {"ok": False, "error": f"unknown speech setting {value!r}"}
         note = ""
-        if want == "network" and not (REMOTE_STT or REMOTE_TTS):
+        if want == "network" and not _network_speech_possible():
             want, note = "local", "no network speech configured"
         else:
             _write_env_setting("VOICE_ASSISTANT_SPEECH", want)
+            if want == "network" and not any(self._speech_servers().values()):
+                # Looked for, none found yet: this machine speaks until one is.
+                note = "no boards found yet"
+                rescan = getattr(self, "_speech_rescan", None)
+                if rescan is not None:
+                    rescan.set()
         self.speech_mode = want
         label = f"Speech: {want}" + (f" ({note})" if note else "")
         self.logger.info(label + ("" if want == before else f" (was {before})"))
@@ -4209,9 +4273,43 @@ class VoiceAssistant:
 
     @staticmethod
     def _speech_servers() -> dict:
-        """The configured LAN speech servers, for status: {"stt": [...], "tts": [...]}."""
-        return {kind: [x.strip() for x in spec.split(",") if x.strip()]
-                for kind, spec in (("stt", REMOTE_STT), ("tts", REMOTE_TTS))}
+        """The LAN speech servers, for status: {"stt": [...], "tts": [...]},
+        each kind's configured list, or what discovery found for it."""
+        out = {}
+        for kind, spec in (("stt", REMOTE_STT), ("tts", REMOTE_TTS)):
+            if spec:
+                out[kind] = [x.strip() for x in spec.split(",") if x.strip()]
+            else:
+                out[kind] = [f.spec for f in _SPEECH_FOUND.get(kind, [])] if _speech_discovering(kind) else []
+        return out
+
+    @staticmethod
+    def _speech_discovery_state() -> dict:
+        """For status: where each kind's servers come from ("configured" |
+        "mdns" | "off") and when the LAN was last looked at."""
+        state = {kind: ("configured" if spec else "mdns" if _speech_discovering(kind) else "off")
+                 for kind, spec in (("stt", REMOTE_STT), ("tts", REMOTE_TTS))}
+        state["scan"] = ("off" if not (_speech_discovering("stt") or _speech_discovering("tts"))
+                         else int(time.time() - _SPEECH_SCANNED_AT) if _SPEECH_SCANNED_AT else "pending")
+        return state
+
+    def _speech_boards(self) -> list:
+        """The boards in the speech pools, for status: one entry per address,
+        with its name, its servers and whether each answers. No I/O."""
+        names = {f.address: f.name for found in _SPEECH_FOUND.values() for f in found}
+        found = {(f.kind, f.address, f.port) for fs in _SPEECH_FOUND.values() for f in fs}
+        boards = {}
+        for kind, engine in (("stt", getattr(self, "stt", None)), ("tts", getattr(self, "kokoro", None))):
+            pool = getattr(engine, "pool", None)
+            if pool is None:
+                continue
+            for i, health in enumerate(list(pool.health)):
+                srv = pool.servers[i]
+                b = boards.setdefault(srv.host, {"address": srv.host, "name": names.get(srv.host, "")})
+                b[kind] = f"{srv.host}:{srv.port}"
+                b[f"{kind}_up"] = bool(health.up())
+                b[f"{kind}_source"] = "mdns" if (kind, srv.host, srv.port) in found else "configured"
+        return sorted(boards.values(), key=lambda b: (b["name"] or "~", b["address"]))
 
     # One loader for both features, so turning voice-only on for the first
     # time cannot race a second load.
@@ -7472,6 +7570,56 @@ class VoiceAssistant:
         return True
 
     # ------------------------------------------------------------------
+    # Speech servers on the LAN
+    # ------------------------------------------------------------------
+
+    def _watch_speech_servers(self):
+        """Keep the speech pools stocked with the boards that announce
+        themselves, for the kinds the env file does not list. A scan is about
+        a second, in this thread only: a turn uses whatever the pools hold. At
+        start, every SPEECH_DISCOVER_INTERVAL seconds, and every minute while
+        nothing has been found (a board still booting, or no LAN yet)."""
+        while True:
+            self._discover_speech_servers()
+            nothing = not any(_SPEECH_FOUND.get(k) for k in ("stt", "tts") if _speech_discovering(k))
+            self._speech_rescan.wait(min(SPEECH_DISCOVER_INTERVAL, 60) if nothing
+                                     else SPEECH_DISCOVER_INTERVAL)
+            self._speech_rescan.clear()
+
+    def _discover_speech_servers(self) -> bool:
+        """One scan; False when it could not look."""
+        global _SPEECH_FOUND, _SPEECH_SCANNED_AT
+        # Only for a pool that can take what is found (no synthesis pool without local TTS).
+        engines = {"stt": getattr(self, "stt", None), "tts": getattr(self, "kokoro", None)}
+        kinds = [k for k in ("stt", "tts")
+                 if _speech_discovering(k) and getattr(engines[k], "pool", None) is not None]
+        if not kinds:
+            return False
+        try:
+            found = speech_discovery.scan(kinds)
+        except Exception as e:
+            self.logger.debug(f"Speech discovery: {e}")
+            return False
+        before = {k: [(f.name, f.address, f.port) for f in _SPEECH_FOUND.get(k, [])] for k in kinds}
+        _SPEECH_FOUND = dict(_SPEECH_FOUND, **found)
+        _SPEECH_SCANNED_AT = time.time()
+        try:
+            added = self._add_found_speech_servers()
+        except Exception as e:      # never the end of the discovery thread
+            self.logger.warning(f"Speech discovery: could not add a server: {e}")
+            added = []
+        now = {k: [(f.name, f.address, f.port) for f in _SPEECH_FOUND.get(k, [])] for k in kinds}
+        if now != before:
+            self.logger.info(
+                "Speech servers on the LAN: " + ", ".join(f"{len(now[k])} {k}" for k in kinds)
+                + "".join(f"\n  {f.kind} {f.name} {f.spec} {f.txt.get('engine', '-')} "
+                          f"{f.txt.get('version', '-')}" for k in kinds for f in _SPEECH_FOUND[k]))
+        if added:
+            self.logger.info("Added to the speech pools: "
+                             + ", ".join(f"{f.kind} {f.name or f.address}" for f in added))
+        return True
+
+    # ------------------------------------------------------------------
     # Local LLM watcher
     # ------------------------------------------------------------------
 
@@ -7788,6 +7936,8 @@ class VoiceAssistant:
                     "speech": getattr(self, "speech_mode", "local"),
                     "speech_servers": self._speech_servers(),
                     "speech_tiers": sorted(REMOTE_SPEECH_TIERS),
+                    "speech_discovery": self._speech_discovery_state(),
+                    "speech_boards": self._speech_boards(),
                     "session": self._session_id}
         if cmd == "backend":
             # Off the loop too: the toggle may probe nvidia-smi, systemd and
@@ -8222,6 +8372,9 @@ class VoiceAssistant:
             threading.Thread(target=self._watch_local_llm, daemon=True).start()
         if NETWORK_DISCOVER_INTERVAL > 0:
             threading.Thread(target=self._watch_network_servers, daemon=True).start()
+        if _speech_discovering("stt") or _speech_discovering("tts"):
+            threading.Thread(target=self._watch_speech_servers, name="speech-discovery",
+                             daemon=True).start()
         try:
             self.logger.info("Voice Assistant ready — send SIGUSR1 to toggle")
             asyncio.run(self._listen_loop())

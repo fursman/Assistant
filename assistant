@@ -76,16 +76,48 @@ def request(payload: dict) -> dict:
 
 
 def speech_line(r: dict) -> str:
-    """`network  (stt a, b; tts c, d; network/claude tiers)`, or `local`."""
+    """`network  (stt a, b; tts c, d; network/claude tiers)`, or `local`. A kind
+    found on the LAN rather than configured is counted, its boards listed by
+    speech_board_lines()."""
     servers = r.get("speech_servers") or {}
+    found = r.get("speech_discovery") or {}
+    looking = any(found.get(kind) == "mdns" for kind in ("stt", "tts"))
     if r["speech"] != "network":
-        return "local" + ("" if any(servers.values()) or not servers
-                          else "  (no network speech configured)")
-    where = [f"{kind} {', '.join(servers[kind])}" for kind in ("stt", "tts") if servers.get(kind)]
+        if any(servers.values()) or not servers:
+            return "local"
+        return "local  (" + ("no speech boards found on the LAN yet" if looking
+                             else "no network speech configured") + ")"
+    where = []
+    for kind in ("stt", "tts"):
+        if found.get(kind) == "mdns":
+            n = len(servers.get(kind) or [])
+            where.append(f"{kind} {n} found on the LAN" if n else f"{kind} none found yet")
+        elif servers.get(kind):
+            where.append(f"{kind} {', '.join(servers[kind])}")
     tiers = r.get("speech_tiers")
     if tiers is not None:
         where.append(f"{'/'.join(tiers) or 'no'} tiers")
     return "network" + (f"  ({'; '.join(where)})" if where else "")
+
+
+def speech_board_lines(r: dict) -> list:
+    """One line per board in the speech pools, when any came from the LAN:
+    `rk1-1  10.0.0.11  stt up  tts down`."""
+    boards = r.get("speech_boards") or []
+    if not any(b.get(f"{k}_source") == "mdns" for b in boards for k in ("stt", "tts")):
+        return []
+    lines = []
+    for b in boards:
+        parts = []
+        for kind in ("stt", "tts"):
+            if b.get(kind):
+                how = "" if b.get(f"{kind}_source") == "mdns" else " (configured)"
+                parts.append(f"{kind} {'up' if b.get(f'{kind}_up') else 'down'}{how}")
+        lines.append(f"           {b.get('name') or '?':<10} {b['address']:<15} {'  '.join(parts)}")
+    scan = (r.get("speech_discovery") or {}).get("scan")
+    if isinstance(scan, int):
+        lines.append(f"           (looked {scan // 60} min ago)" if scan >= 60 else "           (looked just now)")
+    return lines
 
 
 def die(message: str, code: int = 1):
@@ -116,7 +148,8 @@ def main():
                         "until then everyone is heard)")
     p.add_argument("--speech", choices=("local", "network", "toggle"),
                    help="where speech recognition and synthesis run: this machine, or "
-                        "the LAN speech servers (VOICE_ASSISTANT_REMOTE_STT/_TTS)")
+                        "the LAN speech servers (found on the LAN, or "
+                        "VOICE_ASSISTANT_REMOTE_STT/_TTS)")
     p.add_argument("--status", action="store_true", help="show what is running")
     p.add_argument("--new", action="store_true", help="start a fresh conversation")
     p.add_argument("--json", action="store_true", help="print the raw reply")
@@ -188,6 +221,8 @@ def main():
                   f"{f'  (voiceprint {vp})' if vp else ''}")
         if "speech" in r:
             print(f"speech     {speech_line(r)}")
+            for line in speech_board_lines(r):
+                print(line)
         print(f"session    {r['session']}")
     else:
         note = r.get("note") or ""

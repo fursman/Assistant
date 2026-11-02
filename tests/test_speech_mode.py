@@ -60,6 +60,9 @@ def boards(monkeypatch):
     monkeypatch.setattr(va, "REMOTE_STT", STT)
     monkeypatch.setattr(va, "REMOTE_TTS", TTS)
     monkeypatch.setattr(va, "REMOTE_SPEECH_TIERS", {"network", "claude"})
+    # Lists for both kinds, so the LAN is never looked at (test_speech_discovery.py).
+    monkeypatch.setattr(va, "SPEECH_DISCOVER_INTERVAL", 300.0)
+    monkeypatch.setattr(va, "_SPEECH_FOUND", {"stt": [], "tts": []})
     monkeypatch.setattr(va, "_write_env_setting", lambda key, value: written.append((key, value)))
     monkeypatch.setattr(va, "_local_llm_health", lambda timeout=1.0: "down")
     monkeypatch.setattr(va, "NETWORK_LLM_URL", "")
@@ -70,6 +73,7 @@ def boards(monkeypatch):
 def no_boards(boards, monkeypatch):
     monkeypatch.setattr(va, "REMOTE_STT", "")
     monkeypatch.setattr(va, "REMOTE_TTS", "")
+    monkeypatch.setattr(va, "SPEECH_DISCOVER_INTERVAL", 0.0)    # and none looked for
     return boards
 
 
@@ -253,6 +257,7 @@ def test_network_still_keeps_the_local_tier_here(wrapped):
 def test_it_starts_where_the_env_file_left_it(monkeypatch):
     monkeypatch.setattr(va, "REMOTE_STT", STT)
     monkeypatch.setattr(va, "REMOTE_TTS", "")
+    monkeypatch.setattr(va, "SPEECH_DISCOVER_INTERVAL", 0.0)
     for mode in ("local", "network"):
         monkeypatch.setattr(va, "SPEECH_MODE", mode)
         assert va._initial_speech_mode() == mode
