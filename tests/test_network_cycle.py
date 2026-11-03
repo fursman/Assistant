@@ -79,7 +79,9 @@ def lan(monkeypatch):
     monkeypatch.setattr(va, "NETWORK_HARNESS", "native")
     monkeypatch.setattr(va, "LOCAL_HARNESS", "native")
     monkeypatch.setattr(va, "LLM_FALLBACK", True)
-    monkeypatch.setattr(va.shutil, "which", lambda name: "/usr/bin/" + name)
+    # Every CLI but the Antigravity one: these cycles have no Gemini stop
+    # (test_voice_commands.py::test_toggle_stops_at_gemini covers it).
+    monkeypatch.setattr(va.shutil, "which", lambda name: None if name == "agy" else "/usr/bin/" + name)
     monkeypatch.setattr(va, "_write_env_setting",
                         lambda key, value: world["written"].append((key, value)))
 

@@ -43,6 +43,12 @@ va.VOICE_UNLOCK = False
     ("go over to the cluster", "network"),
     ("use the cluster", "network"),
     ("switch to hosted", "claude"),
+    ("switch to gemini", "gemini"),
+    ("Switch to Germany.", "gemini"),                 # Gemini, as heard
+    ("go over to google", "gemini"),
+    ("use antigravity", "gemini"),
+    ("try argon", "gemini"),
+    ("use google maps for that", None),              # not a switch
     ("use the hosted model", "claude"),
     ("switch back to local", "local"),
     # not commands
@@ -137,7 +143,7 @@ def test_status_payload_names_the_backend_and_its_model(tmp_path, monkeypatch):
     monkeypatch.setattr(va, "CLAUDE_MODEL", "fable")
     monkeypatch.setattr(va, "CLAUDE_EFFORT", "xhigh")
     monkeypatch.setattr(va, "LOCAL_LLM_MODEL", "qwen3.8-27b")
-    for backend in ("dsh", "local", "claude"):
+    for backend in ("dsh", "local", "claude", "gemini"):
         host = StatusHost(tmp_path, backend)
         host._set_status("ready")
         d = json.loads((tmp_path / "status").read_text())
@@ -237,7 +243,9 @@ def tiers(monkeypatch):
     monkeypatch.setattr(va, "NETWORK_HARNESS", "native")
     monkeypatch.setattr(va, "LOCAL_HARNESS", "native")
     monkeypatch.setattr(va, "LOCAL_LLM_MODEL", "qwen3.8-27b")
-    monkeypatch.setattr(va.shutil, "which", lambda name: "/usr/bin/" + name)
+    # Every CLI but the Antigravity one: the cycle these tests spell out is
+    # the one without a Gemini stop (test_toggle_stops_at_gemini has it).
+    monkeypatch.setattr(va.shutil, "which", lambda name: None if name == "agy" else "/usr/bin/" + name)
     monkeypatch.setattr(va, "_write_env_setting", lambda key, value: None)
     monkeypatch.setattr(va, "_llm_health", lambda url, timeout=1.0: "ready")
     monkeypatch.setattr(va, "_start_user_unit", lambda unit: True)
@@ -255,6 +263,19 @@ def test_toggle_without_a_gpu_flips_between_network_and_claude(tmp_path, tiers):
     host = TierHost(tmp_path, local="absent")
     seen = [host._switch_backend("toggle")["tier"] for _ in range(4)]
     assert seen == ["network", "claude", "network", "claude"]
+
+
+def test_toggle_stops_at_gemini_when_the_antigravity_cli_is_installed(tmp_path, tiers, monkeypatch):
+    monkeypatch.setattr(va.shutil, "which", lambda name: "/usr/bin/" + name)
+    host = TierHost(tmp_path, local="absent")
+    seen = [host._switch_backend("toggle")["tier"] for _ in range(4)]   # from claude
+    assert seen == ["gemini", "network", "claude", "gemini"]
+    r = host._switch_backend("gemini")
+    assert r["ok"] and (r["tier"], r["label"]) == ("gemini", "Gemini")
+    assert host.backend == "gemini" and host._backend_label(spoken=True) == "Gemini"
+    assert "switch to Gemini" in va._backend_switch_note()
+    monkeypatch.setattr(va.shutil, "which", lambda name: None if name == "agy" else "/usr/bin/" + name)
+    assert host._switch_backend("gemini") == {"ok": False, "error": "the Antigravity CLI (agy) is not installed"}
 
 
 def test_toggle_cycles_all_three_tiers_and_skips_a_missing_one(tmp_path, tiers, monkeypatch):

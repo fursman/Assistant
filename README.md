@@ -92,6 +92,7 @@ Verify with `./test_installation.py`.
 - **Python 3.11+**
 - **Either** the [`claude` CLI](https://claude.ai/install.sh) (installed for you
   by `setup.sh`) **or** an NVIDIA GPU with ≥ 16 GB of VRAM for the local model.
+  Google's Antigravity CLI (`agy`) is a further option, for Gemini.
 - **Disk:** ~1.5 GB for the Python venv, ~700 MB of speech models, a further
   ~14 GB if you install the local LLM.
 
@@ -123,9 +124,9 @@ picks per query.
    exact command, and the reply clause by clause. Notifications only carry
    status. Left click the robot to read along; right click for the controls.
 
-The same switch is a spoken command: "switch to Claude" (or "hosted"), "go back
-to the local model", "switch to the network model" (or "the cluster"), "use the
-harness". The reply names the tier only ("Switched to the network model."). It is handled by the assistant before any model sees
+The same switch is a spoken command: "switch to Claude" (or "hosted"), "switch
+to Gemini" (or "antigravity", "argon"), "go back to the local model", "switch to
+the network model" (or "the cluster"), "use the harness". The reply names the tier only ("Switched to the network model."). It is handled by the assistant before any model sees
 it, with the recogniser's usual misses accepted ("clog", "clawed" and "cloud"
 are all Claude). That matters because a model with a shell will otherwise do it
 the hard way: the harness once found `voice-llm claude` and ran it from inside
@@ -190,6 +191,7 @@ voice-llm qwen                   # force the local model (starts the server)
 voice-llm network                # the model at VOICE_ASSISTANT_NETWORK_URL (the swap key's last one)
 voice-llm dsh                    # the local model, driven by the DeepSeek Harness
 voice-llm claude                 # force Claude and stop the server (frees the GPU)
+voice-llm gemini                 # force Gemini: Google's Antigravity CLI (agy), signed in once
 voice-llm logs                   # the model server's own log
 voice-llm discover               # model servers on the LAN: the swap key's network stops
 ```
@@ -245,8 +247,8 @@ With one server it is local, network, Claude as it always was; without a GPU
 it goes network, Claude. The same thing from a terminal:
 
 ```bash
-assistant --swap                 # local -> each network server -> Claude -> local
-assistant --backend network      # or local, claude (hosted), dsh, auto
+assistant --swap                 # local -> each network server -> Claude -> Gemini -> local
+assistant --backend network      # or local, claude (hosted), gemini, dsh, auto
 assistant --model fable          # or opus, sonnet, haiku
 assistant --effort xhigh         # or low, medium, high, max
 ```
@@ -293,6 +295,15 @@ Three tiers, by where the model runs:
   another by number) to the env file; otherwise it prints the lines to add.
   A URL already set is never replaced.
 - **hosted** — the Claude Code CLI (`claude`; "hosted" is accepted as a name).
+- **gemini** — Google's [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli)
+  (`agy`), a hosted agent like Claude with its own shell, files and web, on
+  the Google account it is signed in with (a paid Google AI Pro plan carries
+  Gemini 4 Argon). Install with `curl -fsSL https://antigravity.google/cli/install.sh | bash`,
+  run `agy` once in a terminal to sign in, and it is a stop on the swap key.
+  `VOICE_ASSISTANT_GEMINI_MODEL` picks a model slug from `agy models`; unset,
+  the CLI's default answers. The CLI takes no system prompt, so the voice
+  persona is written to `AGENTS.md` in `~/.local/state/voice-assistant/gemini`,
+  where it runs. It is never a fallback: that stays Claude.
 
 The backend is `auto` by default:
 
@@ -1190,7 +1201,7 @@ change, in waybar's custom-module format so it can be used verbatim:
 ```
 
 States are `off ◯`, `ready ●`, `listening ◉`, `thinking ◈`, `speaking ◆`, and the
-second class is `claude`, `local`, `network` or `dsh` (the network tier is
+second class is `claude`, `gemini`, `local`, `network` or `dsh` (the network tier is
 `network` under either harness). The payload also carries `tier` and `label`
 ("Network · qwen3.8-flash-next", with the server's name when several are
 known), which the indicator and panel show, and
@@ -1331,7 +1342,7 @@ optional.
 
 | variable | default | meaning |
 |---|---|---|
-| `VOICE_ASSISTANT_LLM_BACKEND` | `auto` | `auto`, `local`, `network`, `claude` (or `hosted`), or `dsh` (the local tier under the DeepSeek Harness) |
+| `VOICE_ASSISTANT_LLM_BACKEND` | `auto` | `auto`, `local`, `network`, `claude` (or `hosted`), `gemini` (the Antigravity CLI), or `dsh` (the local tier under the DeepSeek Harness) |
 | `VOICE_ASSISTANT_LOCAL_HARNESS` | `native` | what drives the local model: `native` or `dsh` |
 | `VOICE_ASSISTANT_LLM_FALLBACK` | `1` | answer with Claude while the local or network model is down |
 | `VOICE_ASSISTANT_LOCAL_MIN_VRAM_MIB` | `15000` | VRAM needed to pick the local model |
@@ -1339,6 +1350,9 @@ optional.
 | `VOICE_ASSISTANT_EFFORT` | `max` | `low`, `medium`, `high`, `xhigh` or `max`; changeable at runtime |
 | `VOICE_ASSISTANT_CLAUDE_PERSISTENT` | `1` | keep one `claude` process alive across turns |
 | `VOICE_ASSISTANT_CLI_TIMEOUT` | | seconds a `claude` turn may take |
+| `VOICE_ASSISTANT_GEMINI_MODEL` | (unset) | a model slug from `agy models` for the gemini backend; unset = the CLI's default |
+| `VOICE_ASSISTANT_GEMINI_EFFORT` | (unset) | `low`, `medium`, `high`, `xhigh` or `max`, as the model allows |
+| `VOICE_ASSISTANT_GEMINI_HOME` | `~/.local/state/voice-assistant/gemini` | where `agy` runs and reads its `AGENTS.md` persona |
 | `VOICE_ASSISTANT_CONTEXT_MARKERS` | `1` | tell the model when time passed or the machine restarted |
 | `VOICE_ASSISTANT_CONTEXT_GAP` | `900` | seconds of silence before a gap is worth mentioning |
 
@@ -1499,7 +1513,7 @@ win over both.
 | `VOICE_ASSISTANT_REMOTE_TTS` | (unset) | synthesis server(s) on the LAN, URLs, comma-separated for a pool; unset = the boards found on the LAN |
 | `VOICE_ASSISTANT_SPEECH_DISCOVER_INTERVAL` | `300` | seconds between looks for speech boards announcing themselves over mDNS (every minute while none is found), for a kind with no list above; `0` = never look |
 | `VOICE_ASSISTANT_REMOTE_TTS_VOICE` | `af_heart` | the synthesis server's own voice name |
-| `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude` | tiers that use the LAN speech servers |
+| `VOICE_ASSISTANT_REMOTE_SPEECH_TIERS` | `network,claude,gemini` | tiers that use the LAN speech servers |
 | `VOICE_ASSISTANT_SPEECH` | `network` | `local` keeps recognition and synthesis on this machine whatever the tier; `network` uses the LAN speech servers for the tiers above. Local whenever no server is configured; SUPER+SHIFT+M, `assistant --speech` and "switch speech to local" write it back |
 | `VOICE_ASSISTANT_REMOTE_TTS_PREBUFFER` | `0.8` | seconds queued before a board's first word plays |
 | `VOICE_ASSISTANT_REMOTE_TTS_AHEAD` | `4` | units of a reply synthesising at once on the board pool, one per board answering, played in order; `1` is one at a time |

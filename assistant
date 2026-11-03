@@ -5,7 +5,7 @@
     assistant "remind me what we decided about the tomatoes"
     assistant --image ~/Downloads/plant.jpg "what is wrong with this leaf"
     assistant --swap                 # local -> each network server -> Claude, notified
-    assistant --backend network      # or local, claude (hosted), dsh, auto
+    assistant --backend network      # or local, claude (hosted), gemini, dsh, auto
     assistant --model fable          # or opus, sonnet, haiku
     assistant --effort xhigh         # or low, medium, high, max
     assistant --voice-only on        # or off, toggle: ignore voices but yours
@@ -135,14 +135,15 @@ def main():
                    help="send this image with the question (PNG, JPEG, GIF, WebP, BMP, TIFF)")
     p.add_argument("--swap", action="store_true",
                    help="cycle local model -> each network model server found on "
-                        "the LAN -> Claude, skipping what is not here or not answering")
+                        "the LAN -> Claude -> Gemini, skipping what is not here or not answering")
     p.add_argument("--model", choices=("opus", "sonnet", "haiku", "fable"),
                    help="Claude model to use from here on")
     p.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
                    help="Claude effort level to use from here on")
-    p.add_argument("--backend", choices=("local", "network", "claude", "hosted", "dsh", "auto"),
-                   help="select a backend explicitly (hosted = claude; dsh = the local "
-                        "model under the DeepSeek Harness)")
+    p.add_argument("--backend", choices=("local", "network", "claude", "hosted", "gemini",
+                                         "dsh", "auto"),
+                   help="select a backend explicitly (hosted = claude; gemini = the "
+                        "Antigravity CLI; dsh = the local model under the DeepSeek Harness)")
     p.add_argument("--voice-only", choices=("on", "off", "toggle"),
                    help="ignore every voice but yours (needs a learned voiceprint; "
                         "until then everyone is heard)")

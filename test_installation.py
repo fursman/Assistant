@@ -229,7 +229,11 @@ def main():
         else:
             ok("Local model server: not running (Claude will answer)")
 
-    if check_command("claude", "Claude Code CLI", required=(configured != "local")):
+    if configured == "gemini" or shutil.which("agy"):
+        # Optional: Google's Antigravity CLI, signed in once by running `agy`
+        # in a terminal; only a forced `gemini` backend needs it.
+        check_command("agy", "Antigravity CLI (Gemini)", required=(configured == "gemini"))
+    if check_command("claude", "Claude Code CLI", required=(configured not in ("local", "gemini"))):
         settings = Path.home() / ".claude/settings.json"
         try:
             if json.loads(settings.read_text()).get("skipDangerousModePermissionPrompt"):

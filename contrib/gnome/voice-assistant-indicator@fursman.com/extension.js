@@ -115,6 +115,7 @@ const STATE_CLASSES = Object.keys(STATES).map(s => `voice-${s}`);
 
 const BACKEND_LABEL = {
     claude: 'Claude',
+    gemini: 'Gemini',
     local: 'Local Qwen3.8',
     network: 'Network',
     dsh: 'DeepSeek Harness · Qwen3.8',

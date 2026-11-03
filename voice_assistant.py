@@ -359,7 +359,7 @@ REMOTE_TTS_VOICE = os.getenv("VOICE_ASSISTANT_REMOTE_TTS_VOICE", "af_heart").str
 # clause at a time; 5 s fell back to the local voice mid-reply, mixing voices.
 REMOTE_TTS_TIMEOUT = float(os.getenv("VOICE_ASSISTANT_REMOTE_TTS_TIMEOUT", "10"))
 REMOTE_SPEECH_TIERS = {t.strip() for t in os.getenv(
-    "VOICE_ASSISTANT_REMOTE_SPEECH_TIERS", "network,claude").split(",") if t.strip()}
+    "VOICE_ASSISTANT_REMOTE_SPEECH_TIERS", "network,claude,gemini").split(",") if t.strip()}
 # How many units of a reply may be synthesising at once on the boards. A board
 # synthesises a sentence whole (that is where Kokoro's phrasing comes from), so
 # one at a time left a gap whenever a sentence took longer to make than the one
@@ -412,6 +412,8 @@ _SPEECH_SCANNED_AT = 0.0
 # "local"   -> llama-server on this machine (offline, run_shell tool)
 # "network" -> llama-server elsewhere on the LAN (VOICE_ASSISTANT_NETWORK_URL)
 # "claude"  -> Claude Code CLI, hosted (tools, filesystem, web; needs network)
+# "gemini"  -> the Antigravity CLI (`agy`), Google's hosted agent, signed in
+#              with a Google account (a paid AI Pro plan has Gemini 4 Argon)
 # "auto"    -> local when this machine has a >= 16 GB NVIDIA GPU and the unit
 #              is installed (or a server already answers), else network when
 #              a network URL is configured, else claude
@@ -434,6 +436,17 @@ LOCAL_LLM_MIN_VRAM_MIB = int(os.getenv("VOICE_ASSISTANT_LOCAL_MIN_VRAM_MIB", "15
 # down, rather than telling the user the model did not answer.
 LLM_FALLBACK = os.getenv("VOICE_ASSISTANT_LLM_FALLBACK", "1").strip().lower() \
     not in ("0", "false", "no", "off")
+
+# The Antigravity CLI's model and effort (`agy models` lists the slugs the
+# plan has; "" leaves the CLI's own default, which is where Argon lands on a
+# paid AI Pro plan once rolled out). An unknown slug fails the process rather
+# than falling back, so the error is surfaced, not hidden.
+GEMINI_MODEL = os.getenv("VOICE_ASSISTANT_GEMINI_MODEL", "").strip()
+GEMINI_EFFORT = os.getenv("VOICE_ASSISTANT_GEMINI_EFFORT", "").strip().lower()
+# Where `agy` runs: the CLI has no system-prompt flag but reads AGENTS.md
+# from its working directory, so the persona is written there at every start.
+GEMINI_HOME = Path(os.getenv("VOICE_ASSISTANT_GEMINI_HOME",
+                             str(Path.home() / ".local/state/voice-assistant/gemini")))
 
 # Aliases the CLI accepts; it resolves each to the latest of that family.
 CLAUDE_MODELS = ("opus", "sonnet", "haiku", "fable")
@@ -1138,6 +1151,15 @@ CLAUDE_VOICE_PROMPT = (
     + _SHARED_PROMPT_TAIL
 )
 
+# What the Antigravity CLI reads from AGENTS.md in GEMINI_HOME: Claude's persona
+# (it has the same reach: a shell, files, the web) with who it actually is --
+# a hosted model with no name to go on has said it was Claude before.
+GEMINI_VOICE_PROMPT = (
+    CLAUDE_VOICE_PROMPT
+    + "\n\nYou are Gemini, answering through Google's Antigravity CLI -- not Claude. "
+    "If asked which model you are, say so."
+)
+
 LOCAL_VOICE_PROMPT = (
     "You are a voice assistant on a Linux desktop (" + DESKTOP + "). "
     "The user speaks to you and hears your replies through text-to-speech.\n\n"
@@ -1224,6 +1246,9 @@ def _backend_switch_note() -> str:
     else:
         who = "Claude, the local model or the DeepSeek Harness"
         say = '\"switch to Claude\" or \"switch to the local model\"'
+    if shutil.which("agy"):
+        who = who.replace("Claude,", "Claude, Gemini,")
+        say = say.replace('\"switch to Claude\"', '\"switch to Claude\", \"switch to Gemini\"')
     return (
         f"\n\nSwitching who answers -- {who} -- is a "
         "voice command the assistant handles itself. If the user asks you to switch, do not "
@@ -1264,6 +1289,7 @@ CONTROL_SOCKET = Path(os.getenv(
 SESSION_FILE = Path.home() / ".local/state/voice-assistant/session_id"
 LOCAL_HISTORY_FILE = Path.home() / ".local/state/voice-assistant/local_history.json"
 DSH_TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/dsh_transcript.json"
+GEMINI_SESSION_FILE = Path.home() / ".local/state/voice-assistant/gemini_session_id"
 TURN_CONTEXT_FILE = Path.home() / ".local/state/voice-assistant/turn_context.json"
 TRANSCRIPT_FILE = Path.home() / ".local/state/voice-assistant/transcript.json"
 # Entries kept in the transcript file. The indicator renders only the last
@@ -2071,6 +2097,11 @@ _CLAUDE_NAMES = r"claude(?: code)?|clog|clogged|clawed|claud|cloud|clod|klaud|kl
 _BACKEND_PHRASES = (
     ("claude", _CLAUDE_NAMES + r"|(?:the )?hosted(?: model| one)?",
      _CLAUDE_NAMES + r"|the hosted model"),
+    # "Germany" and "jiminy" are Gemini as Moonshine hears it; "google" only
+    # after a switch verb ("use google maps" is not a switch).
+    ("gemini", r"gemini|gemeni|jemini|jiminy|germany|antigravity|anti ?gravity|argon"
+               r"|google(?:'s)?(?: model| one)?",
+     r"gemini|gemeni|jemini|jiminy|antigravity|anti ?gravity|argon|the google model"),
     ("local", r"qwen|quen|gwen|kwen|(?:the )?local(?: model| one| llm)?|llama",
      r"qwen|quen|gwen|kwen|the local model|llama"),
     ("network", r"(?:the )?network(?: model| one| llm)?|(?:the )?cluster",
@@ -2081,8 +2112,9 @@ _BACKEND_PHRASES = (
 
 
 def _parse_backend_request(text: str):
-    """The backend a spoken command asks for ('claude', 'local', 'network',
-    'dsh', 'auto'), or None when the sentence is not asking for a switch.
+    """The backend a spoken command asks for ('claude', 'gemini', 'local',
+    'network', 'dsh', 'auto'), or None when the sentence is not asking for a
+    switch.
 
     Narrow on purpose, like _parse_claude_request: a short sentence with a
     switch verb and a destination ("switch to clog please", "go back to the
@@ -2989,6 +3021,213 @@ class ClaudeSession:
 
 
 # ---------------------------------------------------------------------------
+# Gemini backend: the Antigravity CLI
+# ---------------------------------------------------------------------------
+
+class GeminiSession:
+    """One `agy` process kept alive across turns, fed JSON lines on stdin.
+
+    Google's Antigravity CLI, signed in with the user's Google account (the
+    sign-in is interactive, once: run `agy` in a terminal). The shape of
+    ClaudeSession with a simpler protocol: `{"event": "user", "message":
+    {"content": ...}}` in; `init` (the conversation id), `step_update` (an
+    `agent_response` carries `text_delta`, a `tool` its name and parameters)
+    and one `result` per turn out. It has no interrupt -- a control message
+    ends the session -- so an abort kills the process, and the next turn
+    resumes the conversation by id (`--conversation`).
+
+    No system-prompt flag either: the CLI reads AGENTS.md from its working
+    directory, so it runs in GEMINI_HOME, where that file is written at
+    every start (so a prompt edit lands without anything to clean up).
+    """
+
+    def __init__(self, logger, conversation_id=None):
+        self.logger = logger
+        self.conversation_id = conversation_id
+        self.proc = None
+        self.events = queue.Queue()
+        self._lock = threading.Lock()
+        self.stderr_tail = ""        # its last complaint, for the spoken error
+        self.inited = False          # saw `init` from this process
+
+    def start(self, conversation_id=None) -> bool:
+        with self._lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return True
+            if conversation_id is not None:
+                self.conversation_id = conversation_id
+            try:
+                GEMINI_HOME.mkdir(parents=True, exist_ok=True)
+                (GEMINI_HOME / "AGENTS.md").write_text(GEMINI_VOICE_PROMPT)
+            except OSError as e:
+                self.logger.warning(f"Could not write {GEMINI_HOME}/AGENTS.md: {e}")
+            cmd = [
+                "agy",
+                "--input-format", "stream-json",
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",
+                "--disable-slash-commands",
+            ]
+            if GEMINI_MODEL:
+                cmd.extend(["--model", GEMINI_MODEL])
+            if GEMINI_EFFORT:
+                cmd.extend(["--effort", GEMINI_EFFORT])
+            if self.conversation_id:
+                cmd.extend(["--conversation", self.conversation_id])
+            # `-p` is a string flag that takes the next argument as the
+            # prompt, so it goes last and empty: the prompts arrive on stdin.
+            cmd.append("-p=")
+            _refresh_session_env()        # its hyprctl/notify calls inherit this
+            env = os.environ.copy()
+            try:
+                self.proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, env=env, cwd=str(GEMINI_HOME), bufsize=0)
+            except Exception as e:
+                self.logger.error(f"Failed to spawn agy: {e}")
+                self.proc = None
+                return False
+            self.events = queue.Queue()
+            self.stderr_tail = ""
+            self.inited = False
+            # The queue is this process's: a reader of a process that was
+            # replaced cannot feed its EOF to the new one's turn.
+            for target in (self._read_stdout, self._read_stderr):
+                threading.Thread(target=target, args=(self.proc, self.events),
+                                 daemon=True).start()
+            self.logger.info("Gemini session started"
+                             + (f" (conversation {self.conversation_id})"
+                                if self.conversation_id else " (new conversation)"))
+            return True
+
+    def stop(self, timeout=3.0):
+        with self._lock:
+            proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()     # ends the session after the current turn
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    def abort(self):
+        """Kill the process mid-turn: the protocol has no interrupt. The
+        reader sees EOF; the next turn resumes the conversation by id."""
+        with self._lock:
+            proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _read_stdout(self, proc, events):
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    events.put(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+        finally:
+            events.put(None)          # EOF sentinel
+
+    def _read_stderr(self, proc, _events):
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                msg = raw.decode("utf-8", errors="replace").strip()
+                if msg:
+                    self.stderr_tail = msg[:300]
+                    self.logger.warning(f"agy stderr: {msg[:400]}")
+        except Exception:
+            pass
+
+    def send_user(self, text: str) -> bool:
+        proc = self.proc
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            return False
+        try:
+            line = json.dumps({"event": "user", "message": {"content": text}})
+            proc.stdin.write((line + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError) as e:
+            self.logger.warning(f"agy stdin write failed: {e}")
+            return False
+
+    def begin_turn(self, text):
+        """Send one prompt; the queue its events arrive on, or None when the
+        process cannot take it (the caller respawns). Nothing from an earlier
+        turn can be waiting: an abort kills the process, and a finished turn
+        is read to its result. The one thing that can be queued at idle is
+        the EOF of a process that died on its own."""
+        while True:
+            try:
+                ev = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if ev is None:
+                return None
+        if not self.send_user(text):
+            return None
+        return self.events
+
+
+def _gemini_tool(name: str, params: dict):
+    """An Antigravity tool call as _notify_tool_use knows it: Claude's tool
+    name and argument keys, so the popup labels and the transcript lines
+    read the same whoever is answering."""
+    params = params if isinstance(params, dict) else {}
+
+    def pick(*needles):
+        for k, v in params.items():
+            lk = str(k).lower()
+            if isinstance(v, str) and v and any(n in lk for n in needles):
+                return v
+        return ""
+
+    if name == "run_command":
+        return "Bash", {"command": pick("commandline", "command")}
+    if name == "view_file":
+        return "Read", {"file_path": pick("path", "file")}
+    if name == "write_to_file":
+        return "Write", {"file_path": pick("path", "file")}
+    if name in ("replace_file_content", "multi_replace_file_content", "sed_file",
+                "notebook_edit"):
+        return "Edit", {"file_path": pick("path", "file")}
+    if name == "search_web":
+        return "WebSearch", {"query": pick("query")}
+    if name in ("read_url_content", "open_browser_url"):
+        return "WebFetch", {"url": pick("url")}
+    if name == "grep_search":
+        return "Grep", {"pattern": pick("query", "pattern")}
+    if name in ("find_by_name", "list_dir"):
+        return "Glob", {"pattern": pick("pattern", "path")}
+    if name in ("invoke_subagent", "browser_subagent", "run_workflow"):
+        return "Task", params
+    return name, params
+
+
+# ---------------------------------------------------------------------------
 # Tool-call markup gate
 # ---------------------------------------------------------------------------
 
@@ -3060,7 +3299,7 @@ class DshSession:
     # turn is told what was said meanwhile (see unseen()). That is what lets
     # SUPER+M swap between the local model and Claude mid-conversation
     # without either one losing the thread.
-    BACKENDS = ("dsh", "claude", "local")
+    BACKENDS = ("dsh", "claude", "gemini", "local")
 
     def __init__(self, logger):
         self.logger = logger
@@ -3560,8 +3799,8 @@ class VoiceAssistant:
         self._abort_event = threading.Event()
 
         # Backend: `backend` is what drives the turn ("local" = the native
-        # loop, "dsh" = the DeepSeek Harness, "claude"), `llm_tier` which
-        # llama-server the first two talk to ("local" or "network").
+        # loop, "dsh" = the DeepSeek Harness, "claude", "gemini"), `llm_tier`
+        # which llama-server the first two talk to ("local" or "network").
         self.backend = "claude"
         self.llm_tier = "local"
         self._network_rescan = threading.Event()   # wakes _watch_network_servers
@@ -3582,6 +3821,13 @@ class VoiceAssistant:
         self._dsh_turn_active = False
         self._dsh_reset_pending = False
         self._dsh_error = ""
+        self._gemini = None              # GeminiSession, spawned on first use
+        self._gemini_available = False
+        self._gemini_turn_active = False
+        self._gemini_restart_pending = False
+        self._gemini_error = ""
+        self._gemini_session_id: Optional[str] = None
+        self._gemini_seen_steps = set()  # tool steps already shown this turn
 
         # Turn router (turn_router.py): a verdict per turn, held from the
         # moment the utterance is known until the turn ends.
@@ -3646,6 +3892,7 @@ class VoiceAssistant:
         self._preflight_checks()
         self._setup_router()
         self._session_id = self._load_session_id()
+        self._gemini_session_id = self._load_gemini_session_id()
         self._load_local_history()
         self._setup_audio()
         self._setup_models()
@@ -3660,8 +3907,8 @@ class VoiceAssistant:
 
     def _resolve_backend(self):
         """Choose who answers. Returns (backend, tier, why): backend 'local'
-        (the native loop), 'dsh' or 'claude'; tier 'local', 'network' or
-        'claude'.
+        (the native loop), 'dsh', 'claude' or 'gemini'; tier 'local',
+        'network', 'claude' or 'gemini'.
 
         Reads self.backend_pref rather than the environment, so a runtime
         switch (SUPER+M, `assistant --swap`) goes through the same reasoning as
@@ -3670,9 +3917,12 @@ class VoiceAssistant:
         """
         self._claude_available = shutil.which("claude") is not None
         self._dsh_available = importlib.util.find_spec("deepseek_harness") is not None
+        self._gemini_available = shutil.which("agy") is not None
         pref = getattr(self, "backend_pref", LLM_BACKEND)
         if pref == "claude":
             return "claude", "claude", "asked for claude"
+        if pref == "gemini" and self._gemini_available:
+            return "gemini", "gemini", "asked for gemini"
         if pref == "local":
             return self._tier_backend("local"), "local", "asked for the local model"
         if pref == "network":
@@ -3686,6 +3936,9 @@ class VoiceAssistant:
                 return "dsh", "local", "asked for the DeepSeek Harness"
             return "local", "local", ("asked for the DeepSeek Harness but deepseek-harness-sdk "
                                       "is not installed — using the native loop")
+        elif pref == "gemini":
+            self.logger.warning("Asked for Gemini but the Antigravity CLI (agy) is not "
+                                "installed; using auto")
         elif pref != "auto":
             self.logger.warning(f"Unknown backend preference {pref!r}; using auto")
 
@@ -3757,9 +4010,10 @@ class VoiceAssistant:
 
     @property
     def tier(self) -> str:
-        """Who answers, as the user thinks of it: 'local', 'network' or 'claude'."""
-        if getattr(self, "backend", None) == "claude":
-            return "claude"
+        """Who answers, as the user thinks of it: 'local', 'network', 'claude'
+        or 'gemini'."""
+        if getattr(self, "backend", None) in ("claude", "gemini"):
+            return self.backend
         return getattr(self, "llm_tier", "local") or "local"
 
     def _preflight_checks(self):
@@ -3787,6 +4041,13 @@ class VoiceAssistant:
                 self.logger.warning(
                     "PREFLIGHT WARN: local LLM not ready and no claude CLI to fall back to")
 
+        if self.backend == "gemini" or self._gemini_available:
+            agy_path = shutil.which("agy")
+            if agy_path:
+                self.logger.info(f"Antigravity CLI: {agy_path}"
+                                 + (f", model {GEMINI_MODEL}" if GEMINI_MODEL else ""))
+            elif self.backend == "gemini":
+                self.logger.error("PREFLIGHT FAIL: 'agy' CLI not found in PATH")
         if self.backend == "claude" or self._claude_available:
             claude_path = shutil.which("claude")
             if claude_path:
@@ -3856,6 +4117,24 @@ class VoiceAssistant:
         except Exception as e:
             self.logger.error(f"Failed to persist session ID: {e}")
 
+    def _load_gemini_session_id(self) -> Optional[str]:
+        """The Antigravity conversation id, kept like Claude's session id."""
+        try:
+            sid = GEMINI_SESSION_FILE.read_text().strip()
+            if sid:
+                self.logger.info(f"Loaded persisted Gemini conversation: {sid}")
+                return sid
+        except Exception:
+            pass
+        return None
+
+    def _save_gemini_session_id(self, sid: str):
+        try:
+            GEMINI_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GEMINI_SESSION_FILE.write_text(sid)
+        except Exception as e:
+            self.logger.error(f"Failed to persist Gemini conversation id: {e}")
+
     def _load_local_history(self):
         """The local backend gets the same 'survives a restart' behaviour the
         Claude session id already had."""
@@ -3880,11 +4159,12 @@ class VoiceAssistant:
         self._clear_transcript()
         self._session_id = None
         self._local_history = []
-        for f in (SESSION_FILE, LOCAL_HISTORY_FILE, DSH_TRANSCRIPT_FILE):
+        for f in (SESSION_FILE, LOCAL_HISTORY_FILE, DSH_TRANSCRIPT_FILE, GEMINI_SESSION_FILE):
             try:
                 f.unlink(missing_ok=True)
             except Exception:
                 pass
+        self._gemini_session_id = None
         if self._dsh is not None:
             if self._dsh_turn_active:
                 # Same rule as claude: never pull the runtime out from under a
@@ -3910,6 +4190,16 @@ class VoiceAssistant:
                 self._claude.session_id = None
                 if self.is_active:
                     self._claude.start()
+        gemini = getattr(self, "_gemini", None)
+        if gemini is not None:
+            if getattr(self, "_gemini_turn_active", False):
+                # Same rule: never pull the process out from under its turn.
+                self._gemini_restart_pending = True
+            else:
+                gemini.stop()
+                gemini.conversation_id = None
+                if self.is_active and self.backend == "gemini":
+                    gemini.start()
         self.logger.info("Session cleared — next query starts a new conversation")
 
     # ------------------------------------------------------------------
@@ -4995,7 +5285,8 @@ class VoiceAssistant:
         llm = self._llm()
         # `local`, `dsh` and `claude` as before; the network tier, under either
         # harness, is `network` (`label` says which harness).
-        which = "network" if driver != "claude" and llm.name == "network" else driver
+        which = ("network" if driver not in ("claude", "gemini") and llm.name == "network"
+                 else driver)
         payload = {
             "text": symbols.get(state, ""),
             "class": [state, which],
@@ -5006,13 +5297,14 @@ class VoiceAssistant:
             # `model`/`effort` are Claude's settings and mean something only when
             # `backend` is claude; a llama-server tier's model is `local_model`
             # (the active tier's, network included).
-            "tier": "claude" if driver == "claude" else llm.name,
+            "tier": driver if driver in ("claude", "gemini") else llm.name,
             "label": self._backend_label(driver),
             "model": CLAUDE_MODEL,
             "effort": CLAUDE_EFFORT,
             "models": list(CLAUDE_MODELS),
             "efforts": list(CLAUDE_EFFORTS),
             "local_model": _local_model_label(llm.model),
+            "gemini_model": GEMINI_MODEL,
             # Also a class, so a bar can style it without reading the JSON.
             "voice_only": bool(getattr(self, "voice_only", False)),
             # Where speech runs: "network" (the LAN servers, for their tiers) or "local".
@@ -6399,6 +6691,129 @@ class VoiceAssistant:
         return status
 
     # ------------------------------------------------------------------
+    # Gemini: a turn on the Antigravity CLI
+    # ------------------------------------------------------------------
+
+    def _ensure_gemini_session(self) -> bool:
+        if self._gemini is None:
+            self._gemini = GeminiSession(self.logger, self._gemini_session_id)
+        if not self._gemini.alive:
+            return self._gemini.start()
+        return True
+
+    def _stream_gemini(self, text, abort) -> str:
+        """One turn on the long-lived agy process. -> 'ok'|'error'|'aborted'|'eof'"""
+        self._gemini_turn_active = True
+        try:
+            # What the other backends answered since Gemini's last turn.
+            prompt = self._ledger().recap_for("gemini") + text
+            return self._gemini_run(prompt, abort)
+        finally:
+            self._gemini_turn_active = False
+            if self._gemini_restart_pending:
+                # A "new conversation" arrived mid-turn and was deferred.
+                self._gemini_restart_pending = False
+                self._gemini.stop()
+                self._gemini.conversation_id = None
+                if self.is_active:
+                    self._gemini.start()
+                self.logger.info("Deferred new conversation applied (Gemini)")
+
+    def _gemini_run(self, prompt, abort, _retry=True) -> str:
+        if not self._ensure_gemini_session():
+            self._gemini_error = "I couldn't start the Antigravity CLI"
+            return "eof"
+        session = self._gemini
+        events = session.begin_turn(prompt)
+        if events is None:
+            self.logger.warning("agy would not take the prompt; respawning")
+            session.stop()
+            if not session.start(self._gemini_session_id):
+                return "eof"
+            events = session.begin_turn(prompt)
+            if events is None:
+                return "eof"
+        while True:
+            if abort.is_set():
+                return "aborted"
+            try:
+                event = events.get(timeout=0.25)
+            except queue.Empty:
+                self._flush_pending_tool_notice()
+                if abort.is_set():
+                    return "aborted"      # before `alive`: an abort kills the process
+                if not session.alive:
+                    return "eof"
+                continue
+            if event is None:
+                if abort.is_set():
+                    return "aborted"      # the EOF is our own kill
+                if not session.inited and session.conversation_id and _retry:
+                    # Died before saying anything, asked to resume: the
+                    # conversation is gone (the CLI's store was cleared, or
+                    # the id is another machine's). Once more, fresh.
+                    self.logger.warning(f"Gemini conversation {session.conversation_id} "
+                                        "could not be resumed; starting a new one")
+                    session.stop()
+                    session.conversation_id = None
+                    self._gemini_session_id = None
+                    try:
+                        GEMINI_SESSION_FILE.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return self._gemini_run(prompt, abort, _retry=False)
+                if session.stderr_tail:
+                    self._gemini_error = session.stderr_tail
+                return "eof"
+
+            kind = event.get("event")
+            if kind == "init":
+                session.inited = True
+                self._note_gemini_conversation(event.get("conversation_id"))
+            elif kind == "step_update":
+                self._gemini_step(event.get("step_update") or {})
+            elif kind == "result":
+                r = event.get("result") or {}
+                self._note_gemini_conversation(r.get("conversation_id"))
+                if r.get("status") != "SUCCESS":
+                    msg = str(r.get("error") or r.get("status") or "unknown error")
+                    self.logger.warning(f"Gemini error: {msg}")
+                    self._gemini_error = msg
+                    return "error"
+                usage = r.get("usage") or {}
+                self.logger.info(
+                    f"Gemini done (turns={r.get('num_turns', 1)}, "
+                    f"{usage.get('total_tokens', 0)} tokens cumulative)")
+                return "ok"
+
+    def _note_gemini_conversation(self, cid):
+        if cid and cid != self._gemini_session_id:
+            self._gemini_session_id = cid
+            if self._gemini is not None:
+                self._gemini.conversation_id = cid
+            self._save_gemini_session_id(cid)
+            self.logger.info(f"Gemini conversation: {cid}")
+
+    def _gemini_step(self, step: dict):
+        """One step_update: text to speak, or a tool to show. A tool step is
+        announced once, on first sight -- a fast one may skip ACTIVE."""
+        kind = step.get("step_type")
+        if kind == "agent_response":
+            delta = step.get("text_delta")
+            if delta:
+                self._assistant_text += delta
+                self._flush_sentences(final=False)
+        elif kind == "tool":
+            idx = step.get("step_index")
+            if idx in self._gemini_seen_steps:
+                return
+            self._gemini_seen_steps.add(idx)
+            info = step.get("tool_info") or {}
+            name, args = _gemini_tool(step.get("tool_name") or info.get("name") or "",
+                                      info.get("parameters"))
+            self._notify_tool_use(name, json.dumps(args))
+
+    # ------------------------------------------------------------------
     # A turn
     # ------------------------------------------------------------------
 
@@ -6414,7 +6829,7 @@ class VoiceAssistant:
         if routed is not None:
             return routed
         if self.backend not in ("local", "dsh"):
-            return "claude"
+            return self.backend
         llm = self._llm()
         state = _llm_health(llm.url)
         if state == "ready":
@@ -6435,6 +6850,8 @@ class VoiceAssistant:
         backend = backend or self.backend
         if backend == "claude":
             return "Claude"
+        if backend == "gemini":
+            return "Gemini" + (f" · {GEMINI_MODEL}" if GEMINI_MODEL and not spoken else "")
         llm = self._llm()
         if spoken:
             return f"the {llm.name} model" + (" under the DeepSeek Harness" if backend == "dsh" else "")
@@ -6451,7 +6868,7 @@ class VoiceAssistant:
     # does not have (see _tier_available). The DeepSeek Harness is not a stop:
     # it is how a tier is driven (VOICE_ASSISTANT_<TIER>_HARNESS). "network"
     # is one stop per model server known (_network_servers).
-    BACKEND_CYCLE = ("local", "network", "claude")
+    BACKEND_CYCLE = ("local", "network", "claude", "gemini")
 
     def _tier_available(self, tier: str) -> bool:
         """Worth a stop in the cycle. Local: as `auto` judges it, except that an
@@ -6460,6 +6877,8 @@ class VoiceAssistant:
             return self._local_tier_state()[0] != "absent"
         if tier == "network":
             return bool(_network_servers())
+        if tier == "gemini":
+            return self._gemini_available
         return self._claude_available
 
     def _network_answers(self, server: NetworkServer) -> bool:
@@ -6499,7 +6918,7 @@ class VoiceAssistant:
 
     def _switch_backend(self, value: str) -> dict:
         """Change which model answers: 'local' | 'network' | 'claude' (or
-        'hosted') | 'dsh' | 'auto' | 'toggle'. 'dsh' is the local tier under
+        'hosted') | 'gemini' | 'dsh' | 'auto' | 'toggle'. 'dsh' is the local tier under
         the DeepSeek Harness, as it was before there were tiers. 'toggle' is
         the next stop of the cycle (_next_stop): local, each network server
         that answers, Claude. A swap between two network servers is a tier
@@ -6517,6 +6936,7 @@ class VoiceAssistant:
         """
         value = {"hosted": "claude"}.get(value, value)
         self._claude_available = shutil.which("claude") is not None
+        self._gemini_available = shutil.which("agy") is not None
         server = None
         if value == "toggle":
             value, server = self._next_stop()
@@ -6525,8 +6945,10 @@ class VoiceAssistant:
         elif value == "network" and not NETWORK_LLM_URL:
             # None configured, but the LAN has some: the first that answers.
             server = next((s for s in _network_servers() if self._network_answers(s)), None)
-        if value not in ("local", "network", "dsh", "claude", "auto"):
+        if value not in ("local", "network", "dsh", "claude", "gemini", "auto"):
             return {"ok": False, "error": f"unknown backend {value!r}"}
+        if value == "gemini" and not self._gemini_available:
+            return {"ok": False, "error": "the Antigravity CLI (agy) is not installed"}
         if server is not None and _server_key(server.url) != _server_key(NETWORK_LLM_URL):
             # Another server: named by what it serves now, and written back
             # so a restart and `voice-llm status` land on the same one.
@@ -6568,6 +6990,9 @@ class VoiceAssistant:
                 # Boot the harness now, off the caller's thread, so its ~1.4 s
                 # is not on the user's first question.
                 threading.Thread(target=self._ensure_dsh_session, daemon=True).start()
+        elif self.backend == "gemini" and self.is_active:
+            # Boot agy now, off the caller's thread, for the same reason.
+            threading.Thread(target=self._ensure_gemini_session, daemon=True).start()
         label = self._backend_label()
         self.logger.info(f"Backend switched to {self.backend} on the {self.tier} tier ({why}){note}")
         # Into the transcript as well. The popup is transient, and a swap is
@@ -7087,6 +7512,8 @@ class VoiceAssistant:
         self._current_tool_input = ""
         self._claude_error = ""
         self._dsh_error = ""
+        self._gemini_error = ""
+        self._gemini_seen_steps = set()
         self._first_audio_at = None
         self._turn_started_at = time.time()
         self._turn_tool_calls = 0
@@ -7146,7 +7573,7 @@ class VoiceAssistant:
         image = self._turn_image
         noted = text
         if image:
-            noted = _image_note(image, readable=(backend == "claude")) + text
+            noted = _image_note(image, readable=(backend in ("claude", "gemini"))) + text
         if backend in ("local", "dsh"):
             self._play_chime_async("processing")
             if backend == "dsh":
@@ -7197,6 +7624,25 @@ class VoiceAssistant:
             if status == "ok":
                 self._ledger().remember(
                     text, self._assistant_text.strip() or "(acted, said nothing)", backend="claude")
+            return result
+
+        if backend == "gemini":
+            status = self._stream_gemini(noted, abort)
+            if abort.is_set() or status == "aborted":
+                self._end_tts(sentence_q, tts_thread, drain=False)
+                return None
+            if status in ("error", "eof") and not self._assistant_text.strip():
+                detail = (self._gemini_error or
+                          ("Gemini stopped without answering" if status == "eof" else ""))
+                detail = re.sub(r"\s+", " ", detail).strip()
+                if len(detail) > 120:
+                    detail = detail[:120].rsplit(" ", 1)[0] + "…"
+                msg = f"Sorry, {detail}." if detail else "Sorry, Gemini did not answer."
+                return self._speak_error(sentence_q, tts_thread, msg)
+            result = self._finish_turn(sentence_q, status == "ok", tts_thread)
+            if status == "ok":
+                self._ledger().remember(
+                    noted, self._assistant_text.strip() or "(acted, said nothing)", backend="gemini")
             return result
 
         return self._finish_turn(sentence_q, False, tts_thread)
@@ -7484,6 +7930,13 @@ class VoiceAssistant:
                     pass
             self.logger.info("Stopped one-shot Claude process")
 
+        gemini = getattr(self, "_gemini", None)
+        if gemini is not None and gemini.alive and getattr(self, "_gemini_turn_active", False):
+            # No interrupt in its protocol: kill it, and the next turn resumes
+            # the conversation by id.
+            gemini.abort()
+            self.logger.info("Stopped Gemini turn")
+
         if self._dsh is not None and self._dsh_turn_active:
             # The SDK protocol has no cancel; closing the runtime is the abort,
             # and the next turn respawns it (seeded from our transcript).
@@ -7567,6 +8020,10 @@ class VoiceAssistant:
         llama-server is still loading; not worth its ~250 MB when the native
         loop will. The DeepSeek Harness (~1.4 s) when that is the backend.
         """
+        if self.backend == "gemini":
+            if self._gemini_available:
+                self._ensure_gemini_session()
+            return
         health = _llm_health(self._llm().url)
         if self.backend == "dsh" and health == "ready":
             self._ensure_dsh_session()
@@ -8001,6 +8458,11 @@ class VoiceAssistant:
                                      else "pending"),
                     "dsh": ("running" if self._dsh is not None and self._dsh.alive
                             else "installed" if self._dsh_available else "not installed"),
+                    "gemini": ("running" if getattr(self, "_gemini", None) is not None
+                               and self._gemini.alive
+                               else "installed" if getattr(self, "_gemini_available", False)
+                               else "not installed"),
+                    "gemini_session": getattr(self, "_gemini_session_id", None),
                     "voice_active": self.is_active, "busy": self.is_processing,
                     "voice_only": self.voice_only,
                     "voiceprint": (self._voiceprint.status_line()
@@ -8426,6 +8888,8 @@ class VoiceAssistant:
             pass
         if self._claude is not None:
             self._claude.stop()
+        if self._gemini is not None:
+            self._gemini.stop()
         close = getattr(self.stt, "close", None)
         if close is not None:
             try:

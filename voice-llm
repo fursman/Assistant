@@ -2,12 +2,15 @@
 # Switch the voice assistant between the Claude Code CLI and the local
 # Qwen3.8-27B llama-server, and start/stop the model server to match.
 #
-#   voice-llm status | auto | claude | qwen | network | dsh | logs | discover
+#   voice-llm status | auto | claude | gemini | qwen | network | dsh | logs | discover
 #
 # `network` is a llama-server on another machine (VOICE_ASSISTANT_NETWORK_URL
 # in the env file); nothing here starts or stops it. `discover` looks for
 # model servers on the LAN and prints what it finds; setup.sh offers the first,
 # and the running assistant's swap key cycles through all of them.
+#
+# `gemini` is Google's Antigravity CLI (`agy`), signed in with a Google account:
+# a hosted agent like Claude, so nothing here starts or stops a server for it.
 #
 # `dsh` is the same local model driven by the DeepSeek Harness (DeepSeek's
 # open-source agent runtime, run locally through its Python SDK) instead of the
@@ -86,7 +89,7 @@ gpu_vram() {   # "<name>|<total MiB>" for the largest card, or nothing
 # will actually do, not just what is configured.
 resolve_backend() {
     local cfg="$1" gpu total st
-    case "$cfg" in claude|local|dsh) echo "$cfg (forced)"; return;; hosted) echo "claude (forced)"; return;; esac
+    case "$cfg" in claude|gemini|local|dsh) echo "$cfg (forced)"; return;; hosted) echo "claude (forced)"; return;; esac
     if [[ "$cfg" == network && -n "$NETWORK_URL" ]]; then echo "network (forced, $NETWORK_URL)"; return; fi
     # Where auto settles when this machine cannot run its own model.
     local other=claude
@@ -240,6 +243,24 @@ case "${1:-status}" in
     ok "Voice assistant answers with CLAUDE CODE (tools, filesystem, web)"
     ;;
 
+  gemini)
+    if ! command -v agy &>/dev/null; then
+        err "The Antigravity CLI is not installed: curl -fsSL https://antigravity.google/cli/install.sh | bash"
+        echo "  then run agy once in a terminal to sign in with your Google account"
+        exit 1
+    fi
+    # Same as network: over the control socket when the assistant is up, so
+    # the switch lands without a restart; the env file is for the next start.
+    if [[ -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/voice-assistant.sock" ]] \
+        && command -v assistant &>/dev/null && assistant --backend gemini &>/dev/null; then
+        :
+    else
+        set_backend gemini
+        restart_assistant
+    fi
+    ok "Voice assistant answers with GEMINI through the Antigravity CLI (tools, filesystem, web)"
+    ;;
+
   logs)
     journalctl --user -u "$SERVER" -f
     ;;
@@ -262,7 +283,7 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "usage: voice-llm [status|auto|claude|qwen|network|dsh|logs|discover]"
+    echo "usage: voice-llm [status|auto|claude|gemini|qwen|network|dsh|logs|discover]"
     echo
     echo "  status   what is configured, what it resolves to, and why"
     echo "  auto     pick per machine: local model if it fits, Claude otherwise (default)"
@@ -270,6 +291,7 @@ case "${1:-status}" in
     echo "  dsh      start the model server and drive it with the DeepSeek Harness"
     echo "  claude   force Claude and stop the model server (frees the GPU)"
     echo "           add --disable to keep it from starting at boot"
+    echo "  gemini   force Gemini, through Google's Antigravity CLI (agy)"
     echo "  logs     follow the model server"
     echo "  discover model servers on the LAN (the swap key's network stops)"
     exit 2
