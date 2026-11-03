@@ -461,3 +461,31 @@ def test_no_synthesis_pool_means_no_synthesis_scan(tmp_path, discovering):
     host._setup_remote_speech()
     host._discover_speech_servers()
     assert discovering["asked"] == [["stt"]]
+
+
+def test_a_firewall_that_drops_unicast_answers_falls_back_to_port_5353(monkeypatch):
+    """ufw on the MacBook let in 5353/udp only: the one-shot query's unicast
+    answers never arrived, while multicast answers to 5353 did."""
+    import speech_discovery as sdm
+    calls = []
+
+    def fake(questions, timeout, targets, port, shared):
+        calls.append(shared)
+        return [("x", sdm._PTR, 120, "y")] if shared else []
+    monkeypatch.setattr(sdm, "_exchange", fake)
+    monkeypatch.setattr(sdm, "_shared_port", False)
+    assert sdm.exchange([("q", sdm._PTR)], 0.1) == [("x", sdm._PTR, 120, "y")]
+    assert calls == [False, True]
+    calls.clear()
+    sdm.exchange([("q", sdm._PTR)], 0.1)
+    assert calls == [True], "remembered: no second wait for the way that does not work here"
+
+
+def test_answers_by_unicast_need_no_fallback(monkeypatch):
+    import speech_discovery as sdm
+    calls = []
+    monkeypatch.setattr(sdm, "_exchange", lambda q, t, tg, p, shared: calls.append(shared) or [("x", 1, 1, "y")])
+    monkeypatch.setattr(sdm, "_shared_port", False)
+    sdm.exchange([("q", sdm._PTR)], 0.1)
+    sdm.exchange([("q", sdm._PTR)], 0.1, targets=["10.0.0.1"])
+    assert calls == [False, False], "a direct (targets) query never uses the shared port"

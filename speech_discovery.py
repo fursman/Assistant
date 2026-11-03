@@ -133,11 +133,37 @@ def _interface_address() -> str:
         return ""
 
 
+# Whether the one-shot queries got nothing on this machine and the shared-port
+# way is in use: kept, so a firewalled machine does not wait out the first way
+# on every scan.
+_shared_port = False
+
+
 def exchange(questions, timeout: float = TIMEOUT, targets=(), port: int = MDNS_PORT) -> list:
     """Every record of every reply within `timeout` (the query goes out twice,
     0.25 s apart: mDNS loses packets). `targets` asks those hosts by unicast
-    instead of the multicast group."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    instead of the multicast group.
+
+    First as a one-shot query from an ephemeral port, answered by unicast. A
+    host firewall drops those answers, though: ufw on a laptop with only 5353/udp
+    open saw no board at all. So if that hears nothing from the group, ask again
+    from port 5353 itself (shared with avahi-daemon), whose answers come back by
+    multicast to 5353 -- which such a firewall already lets in."""
+    global _shared_port
+    if targets or port != MDNS_PORT:
+        return _exchange(questions, timeout, targets, port, shared=False)
+    if not _shared_port:
+        records = _exchange(questions, timeout, targets, port, shared=False)
+        if records:
+            return records
+    records = _exchange(questions, timeout, targets, port, shared=True)
+    if records:
+        _shared_port = True
+    return records
+
+
+def _exchange(questions, timeout, targets, port, shared) -> list:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
         iface = _interface_address()
@@ -146,7 +172,18 @@ def exchange(questions, timeout: float = TIMEOUT, targets=(), port: int = MDNS_P
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface))
             except OSError:
                 pass
-        sock.bind(("0.0.0.0", 0))
+        if shared:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                sock.bind(("", MDNS_PORT))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                socket.inet_aton(MDNS_GROUP) + socket.inet_aton(iface or "0.0.0.0"))
+            except OSError:
+                return []
+        else:
+            sock.bind(("0.0.0.0", 0))
         qid = random.randint(1, 0xFFFF)
         packet = query(questions, qid)
         dests = [(t, port) for t in targets] or [(MDNS_GROUP, port)]
