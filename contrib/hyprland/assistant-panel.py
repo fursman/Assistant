@@ -30,7 +30,7 @@ STATES = {  # glyph + colour for the phase published in status.class[0]
     "thinking":  ("◈", "thinking",  YELLOW),
     "speaking":  ("◆", "speaking",  MAGENTA),
 }
-BACKENDS = {"claude": "Claude", "local": "Local", "network": "Network", "dsh": "Harness"}
+BACKENDS = {"claude": "Claude", "gemini": "Gemini", "local": "Local", "network": "Network", "dsh": "Harness"}
 ROLES = {  # colour + label + whether it is dimmed secondary text
     "you":       (BLUE,    "You",       False),
     "assistant": (WHITE,   "Assistant", False),
@@ -64,10 +64,14 @@ def render(cols, rows):
     phase  = cls[0] if len(cls) > 0 else "off"
     backend= status.get("backend") or (cls[1] if len(cls) > 1 else "")
     # `model`/`effort` are Claude's settings; on a local backend the model is
-    # the local one and there is no effort to show.
+    # the local one and there is no effort to show. Gemini's is its own (empty
+    # when the CLI's default answers): never the local model's.
     if backend == "claude":
         model  = str(status.get("model", "")).title()
         effort = status.get("effort", "")
+    elif backend == "gemini":
+        model  = status.get("gemini_model", "")
+        effort = ""
     else:
         model  = status.get("local_model", "")
         effort = ""
