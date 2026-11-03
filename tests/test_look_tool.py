@@ -895,3 +895,26 @@ def test_cli_missing_image(settings, monkeypatch, tmp_path):
 def test_cli_without_image_is_unchanged(settings, monkeypatch):
     code, sent = _run_cli(monkeypatch, ["hello", "there"])
     assert sent == [{"cmd": "ask", "text": "hello there", "speak": False}]
+
+
+def test_a_step_that_repeats_the_last_steps_words_says_them_once(settings, monkeypatch):
+    """DeepSeek opened each tool step with the sentence it had just said."""
+    _sees(monkeypatch, True)
+    spoken = []
+    host = Host([("look", {"source": "screen"}, "Let me take a look at your screen."),
+                 "Let me take a look at your screen. Two dot-matrix hands on black."],
+                verdict=Verdict(tools=["look"]))
+    host._flush_sentences = lambda final=False: spoken.append(host._assistant_text)
+    monkeypatch.setattr(va, "LOOK_FORCE", False)
+    host._stream_local_llm("what's on my screen", threading.Event())
+    assert host._assistant_text == "Let me take a look at your screen.Two dot-matrix hands on black."
+    assert host._assistant_text.count("Let me take a look") == 1
+
+
+def test_step_echo_only_drops_a_real_repeat():
+    e = va.StepEcho("Let me look that up.")
+    assert "".join(e.feed(c) for c in ["Let me ", "check the ", "files."]) + e.close() == "Let me check the files."
+    e = va.StepEcho("Let me look that up.")
+    assert "".join(e.feed(c) for c in ["Let me look", "  that up.", " It is 552B."]) + e.close() == "It is 552B."
+    e = va.StepEcho("")
+    assert e.feed("Let me look that up.") == "Let me look that up."

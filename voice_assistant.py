@@ -3426,6 +3426,51 @@ class VocabularyCorrector:
         return " ".join(t for t in tokens if t)
 
 
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+class StepEcho:
+    """Drops a tool step's opening words when they repeat the previous step's.
+
+    Some models announce what they are about to do, call the tool, and then
+    open the next step with the same sentence: DeepSeek V4.1 Flash said "Let me
+    look up its size and parameter count." twice, and three times over three
+    steps. The start of each step is held until it either parts from the
+    previous step's words (then it is said after all) or has repeated them
+    whole (then that repeat is dropped and the rest goes on). Whitespace is
+    ignored in the comparison."""
+
+    def __init__(self, previous: str):
+        self.prev = _squash(previous)
+        self.buf = ""
+        self.active = bool(self.prev)
+        self.dropped = 0
+
+    def feed(self, text: str) -> str:
+        if not self.active or not text:
+            return text
+        self.buf += text
+        seen = _squash(self.buf)
+        if self.prev.startswith(seen):
+            return ""                        # may still be the repeat: hold it
+        self.active = False
+        if seen.startswith(self.prev):       # the whole repeat, then new words
+            for i in range(1, len(self.buf) + 1):
+                if _squash(self.buf[:i]) == self.prev:
+                    self.dropped = i
+                    return self.buf[i:].lstrip()
+        out, self.buf = self.buf, ""
+        return out                           # it parted: nothing was repeated
+
+    def close(self) -> str:
+        """The step ended while still repeating: that much is dropped too."""
+        if self.active and self.buf.strip():
+            self.dropped = len(self.buf)
+        self.active = False
+        return ""
+
+
 class ToolMarkupGate:
     """Keeps raw tool-call markup out of the speech pipeline.
 
@@ -5556,6 +5601,7 @@ class VoiceAssistant:
             tool_choice = "auto"
 
         force_failed = False
+        last_step_text = ""          # what the previous tool step wrote (StepEcho)
         for step in range(LOCAL_MAX_TOOL_ITERS + 1):
             # Offer tools until the last allowed step, so the model has to
             # answer in words rather than looping forever. On that last step the
@@ -5603,6 +5649,7 @@ class VoiceAssistant:
             # spoken before the look happened.
             forced = kwargs.get("tool_choice") == "required"
             held = ""
+            echo, step_text = StepEcho(last_step_text), ""
             try:
                 stream = client.chat.completions.create(**kwargs)
                 self._local_stream = stream
@@ -5626,6 +5673,8 @@ class VoiceAssistant:
                         if first_token_at is None:
                             first_token_at = time.time()
                         speakable = gate.feed(content)
+                        step_text += speakable
+                        speakable = echo.feed(speakable)
                         if speakable and forced:
                             held += speakable
                         elif speakable:
@@ -5667,6 +5716,12 @@ class VoiceAssistant:
             # Nothing more is coming, so anything the gate was still holding
             # back is ordinary text after all.
             tail = gate.close()
+            step_text += tail
+            tail = echo.feed(tail) + echo.close()
+            if echo.dropped:
+                self.logger.info(f"Dropped {echo.dropped} chars repeating the previous step's words: "
+                                 f"{last_step_text.strip()[:80]!r}")
+            last_step_text = step_text
             if tail and forced:
                 held += tail
             elif tail:
