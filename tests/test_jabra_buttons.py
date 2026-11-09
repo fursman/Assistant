@@ -200,3 +200,19 @@ def test_a_press_with_no_assistant_is_ignored(dev, monkeypatch):
     there.close()
     worker.join(2)
     assert isinstance(ended[0], OSError)
+
+
+# --- The hang-up command --------------------------------------------------------
+
+def test_red_runs_the_hang_up_command(monkeypatch):
+    calls = []
+    monkeypatch.setattr(jb, "HANGUP_CMD", "lock it")
+    monkeypatch.setattr(jb.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd))
+    jb.run_hangup()
+    assert calls == [["bash", "-c", "lock it"]]
+
+
+def test_no_hang_up_command_runs_nothing(monkeypatch):
+    monkeypatch.setattr(jb, "HANGUP_CMD", "")
+    monkeypatch.setattr(jb.subprocess, "Popen", lambda cmd, **kw: pytest.fail("ran"))
+    jb.run_hangup()

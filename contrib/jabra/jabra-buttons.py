@@ -36,7 +36,7 @@ in step when it is switched some other way.
 Pure stdlib, like the Hyprland panel. Installed as ~/.local/bin/voice-assistant-jabra
 and run by voice-assistant-jabra.service.
 """
-import errno, glob, json, os, re, select, signal, sys, time
+import errno, glob, json, os, re, select, signal, subprocess, sys, time
 
 STATE   = os.path.expanduser("~/.local/state/voice-assistant")
 STATUS  = os.path.join(STATE, "status")
@@ -45,6 +45,9 @@ PIDFILE = os.path.join(STATE, "voice-assistant.pid")
 HOOK, FLASH, MUTE = 0x000B0020, 0x000B0021, 0x000B002F    # Telephony page inputs
 LED_OFFHOOK, LED_MUTE, LED_RING = 0x00080017, 0x00080009, 0x00080018  # LED page outputs
 SETTLE = 3.0   # seconds a toggle may take to reach the status file
+# A shell command to run when red is pressed, for "I'm done here" actions such as
+# locking the screen. Empty: red only turns voice mode off.
+HANGUP_CMD = os.getenv("VOICE_ASSISTANT_JABRA_HANGUP_CMD", "").strip()
 FLASH_PERIOD = 1.0   # seconds per red flash, on and off, while the assistant has the turn
 
 
@@ -106,6 +109,18 @@ def hung_up(pressed, before):
     the Jabra is back in the call every report reads on-hook, and reading that
     as red turned a green press straight back off on its release."""
     return bool(before.get(HOOK)) and pressed.get(HOOK) is False
+
+
+def run_hangup():
+    """Run the hang-up command on its own, so a slow one can't stall the buttons."""
+    if not HANGUP_CMD:
+        return
+    try:
+        subprocess.Popen(["bash", "-c", HANGUP_CMD], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:
+        log(f"hang-up command failed ({e})")
 
 
 def wanted(pressed, before, on, in_call):
@@ -250,6 +265,7 @@ def serve(dev):
         target = wanted(pressed, before, on, in_call=bool(state))
         if state and hung_up(pressed, before):
             dev.show(False, False)      # out, so the next pass relights it: back in the call
+            run_hangup()
         before.update(pressed)
         # No assistant, nothing to switch: a press then is not an error.
         if state and target is not None and target != on:
