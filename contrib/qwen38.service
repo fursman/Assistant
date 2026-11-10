@@ -18,6 +18,13 @@ Environment=CUDA_VISIBLE_DEVICES=0
 # Exit 1 = skip: no GPU big enough, or its VRAM is already spoken for. systemd
 # leaves the unit inactive (not failed) and the assistant answers with Claude.
 ExecCondition=%h/.local/bin/qwen38-gpu-ok
+# Judge v3 options (contrib/llama.cpp/server-judge.h), as measured on a 16 GB
+# card with MTP on: no system-prompt checkpoint (no VRAM for its ~150 MiB
+# device copy, and a host copy costs ~400 ms), no question trie (measured
+# loss), and full padding (the bucket planner picked the same plans anyway).
+Environment=LLAMA_JUDGE_SYS_CKPT=0
+Environment=LLAMA_JUDGE_TRIE=0
+Environment=LLAMA_JUDGE_PAD=full
 #
 # Flags worth explaining:
 #   --spec-type draft-mtp --spec-draft-n-max 2
@@ -54,7 +61,8 @@ ExecStart=%h/llama.cpp/build/bin/llama-server \
     --ctx-size 16384 \
     --flash-attn on \
     --cache-type-k q8_0 --cache-type-v q8_0 \
-    --parallel 1 --judge-slots 1 --kv-unified \
+    --ubatch-size 256 \
+    --parallel 1 --judge-slots 2 --kv-unified \
     --spec-type draft-mtp --spec-draft-n-max 2 \
     --jinja --reasoning-format auto --reasoning off \
     --ctx-checkpoints 0 \

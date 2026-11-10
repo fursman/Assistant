@@ -869,15 +869,25 @@ always silent.
 The questions are answered by a `/judge` route that lives inside the same llama-server
 process as the local model (`contrib/llama.cpp/`: a small patch against a pinned upstream
 commit plus one header, applied by `setup.sh`). One batched forward pass reads the answer
-logits for every question; nothing is generated. The unit runs with `--judge-slots 1
---kv-unified`, a 16k context and the MTP draft (`--spec-type draft-mtp`, decode 21 -> 32
-tok/s). Speculative decoding keeps three copies of every sequence's recurrent state (150 MiB
-each on this hybrid model), so the judge gets one slot and answers the router's six questions
-in six rounds; that is still ~0.7 s, because the cost is prefilling the questions, not the
-number of rounds. Resident size 15.5 GB of 16.4; two judge slots with MTP left 427 MiB free
-and died of a CUDA out-of-memory on the first real turn.
+logits for every question; nothing is generated. The unit runs with `--judge-slots 2
+--kv-unified --ubatch-size 256`, a 16k context and the MTP draft (`--spec-type draft-mtp`,
+decode 21 -> 32 tok/s). Speculative decoding keeps three copies of every sequence's
+recurrent state (150 MiB each on this hybrid model). With the default 512 ubatch a second
+judge slot left 427 MiB free and died of a CUDA out-of-memory on the first real turn; the
+smaller batch buffer pays for it (15.9 GB peak, ~500 MiB free, survived the stress runs).
+Three slots with MTP still run out of memory.
 
-Each question costs ~0.1 s on the server (measured: six 740 ms, three 425 ms). The
+The patch is v3 (November 2026, on llama.cpp master `9f0e509`). It pads each round of
+questions to one forward pass, keeps the cached prefix at the end of the context so a
+longer transcript or new questions reuse it (a hybrid model cannot rewind), and tokenizes
+the shared prompt once. Measured on an RTX 4060 Ti against the September build: a router
+turn on a fresh utterance 868 -> 668 ms, on a cached context 630 -> 434 ms, the call after
+a prefetch 690 -> 496 ms, and new questions on a cached 500-token context 674 -> 96 ms.
+Chat speed and accuracy are unchanged. Its tuning knobs are `LLAMA_JUDGE_*` environment
+variables (set in the unit) or a per-request `"judge_opts"`; `"debug": true` returns
+per-decode timings. `setup.sh --rebuild-llama` replaces an older judge build.
+
+Each question costs ~0.1 s on the server (measured with the September build: six 740 ms, three 425 ms). The
 DeepSeek Harness only acts on the junk and risky/caution decisions (no tool gating, hard
 lane or routing), so on that backend only `addressed`, `intelligible` and `risky` are
 asked (`VOICE_ASSISTANT_ROUTER_DSH_QUESTIONS`; empty asks all six, for collecting full

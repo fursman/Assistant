@@ -1,8 +1,8 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index e346863e..62d35118 100644
+index 69be4a61e..fb87d8863 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2556,6 +2556,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2530,6 +2530,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              }
          ).set_env("LLAMA_ARG_N_PARALLEL"));
      }
@@ -17,10 +17,10 @@ index e346863e..62d35118 100644
          {"-ns", "--sequences"}, "N",
          string_format("number of sequences to decode (default: %d)", params.n_sequences),
 diff --git a/common/common.h b/common/common.h
-index a333f702..9682c7e3 100644
+index 84abddc76..06f6c06df 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -453,6 +453,7 @@ struct common_params {
+@@ -462,6 +462,7 @@ struct common_params {
      int32_t n_keep                =     0; // number of tokens to keep from initial prompt
      int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
      int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -29,18 +29,18 @@ index a333f702..9682c7e3 100644
      int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
      int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index f5477356..7e54482a 100644
+index 78c8ef149..27579bcfc 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -6,6 +6,7 @@
- #include "server-queue.h"
+@@ -11,6 +11,7 @@
+ #include "server-realtime.h"
  #include "server-schema.h"
  #include "server-stream.h"
 +#include "server-judge.h"
  
  #include "build-info.h"
  #include "common.h"
-@@ -906,6 +907,10 @@ private:
+@@ -1106,6 +1107,10 @@ private:
      // slots / clients
      std::vector<server_slot> slots;
  
@@ -51,7 +51,7 @@ index f5477356..7e54482a 100644
      int trace = 0;        // env: LLAMA_TRACE
      int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
      int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
-@@ -1096,11 +1101,35 @@ private:
+@@ -1305,11 +1310,35 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -87,7 +87,7 @@ index f5477356..7e54482a 100644
          if (model_tgt == nullptr) {
              SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
              return false;
-@@ -1489,6 +1518,13 @@ private:
+@@ -1742,6 +1771,13 @@ private:
                  /* force_pure_content    */ params_base.force_pure_content_parser
              };
  
@@ -101,7 +101,7 @@ index f5477356..7e54482a 100644
              {
                  auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
                  auto it = params_base.default_template_kwargs.find("preserve_reasoning");
-@@ -2471,6 +2507,38 @@ private:
+@@ -3178,6 +3214,38 @@ private:
                  {
                      // do nothing
                  } break;
@@ -140,7 +140,7 @@ index f5477356..7e54482a 100644
              case SERVER_TASK_TYPE_METRICS:
                  {
                      int n_processing_slots = 0;
-@@ -4699,6 +4767,29 @@ void server_routes::init_routes() {
+@@ -5823,6 +5891,29 @@ void server_routes::init_routes() {
          return res;
      };
  
@@ -171,11 +171,11 @@ index f5477356..7e54482a 100644
          auto res = create_response();
          if (!params.endpoint_slots) {
 diff --git a/tools/server/server-context.h b/tools/server/server-context.h
-index 0acbbffa..1cc3dde7 100644
+index 05c538ea1..dbbca0cb7 100644
 --- a/tools/server/server-context.h
 +++ b/tools/server/server-context.h
-@@ -154,6 +154,7 @@ struct server_routes {
-     server_http_context::handler_t post_rerank;
+@@ -137,6 +137,7 @@ struct server_routes {
+     server_http_context::handler_t post_systemone;
      server_http_context::handler_t get_lora_adapters;
      server_http_context::handler_t post_lora_adapters;
 +    server_http_context::handler_t post_judge;
@@ -183,20 +183,20 @@ index 0acbbffa..1cc3dde7 100644
      // to be used in router mode
      json get_model_info() const;
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 9c99143f..ed79d95b 100644
+index 8faae1f18..ed1f1236e 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -27,6 +27,7 @@ enum server_task_type {
-     SERVER_TASK_TYPE_SLOT_ERASE,
+@@ -32,6 +32,7 @@ enum server_task_type {
      SERVER_TASK_TYPE_GET_LORA,
      SERVER_TASK_TYPE_SET_LORA,
+     SERVER_TASK_TYPE_TTS,
 +    SERVER_TASK_TYPE_JUDGE,
  };
  
  // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
-@@ -175,6 +176,9 @@ struct server_task {
-     // used by SERVER_TASK_TYPE_SET_LORA
-     std::map<int, float> set_lora; // mapping adapter ID -> scale
+@@ -244,6 +245,9 @@ struct server_task {
+     // used by SERVER_TASK_TYPE_TTS
+     mtmd_helper::gen_audio::inp tts_inp;
  
 +    // used by SERVER_TASK_TYPE_JUDGE: the request body (context + typed questions)
 +    json judge_body;
@@ -204,7 +204,7 @@ index 9c99143f..ed79d95b 100644
      server_task() = default;
  
      server_task(server_task_type type) : type(type) {}
-@@ -489,6 +493,15 @@ struct server_task_result_error : server_task_result {
+@@ -609,6 +613,15 @@ struct server_task_result_error : server_task_result {
      virtual json to_json() override;
  };
  
@@ -221,10 +221,10 @@ index 9c99143f..ed79d95b 100644
  struct server_task_result_metrics : server_task_result {
      // these are immediate stats, not accumulated (server_metrics is cumulative)
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 22378b38..db8c0e6c 100644
+index 8b1d42650..7e5ec0fc1 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
-@@ -272,6 +272,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
+@@ -200,6 +200,7 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
      ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
      ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
      ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));

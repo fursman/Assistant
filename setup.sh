@@ -617,12 +617,19 @@ install_local_llm() {
         # The patch is against a pinned upstream commit: the server code it touches churns,
         # so a fresh clone is moved to that commit before the patch is applied. Without the
         # route the assistant still works; the router just fails open.
-        local llama_pin="e70802a01f03f0ed31a26338a5664796f3824371"
+        local llama_pin="9f0e5098a5d5d8adb8dd5c59036ae2a38ab07db9"
         local judge_patch="$(pwd)/contrib/llama.cpp/judge.patch"
+        local judge_header="$(pwd)/contrib/llama.cpp/server-judge.h"
         if [[ -f "$judge_patch" ]]; then
-            if git -C "$LLAMA_DIR" grep -q 'judge_slots' -- common/common.h 2>/dev/null; then
-                log_info "llama.cpp already carries the /judge route"
+            if cmp -s "$judge_header" "$LLAMA_DIR/tools/server/server-judge.h"; then
+                log_info "llama.cpp already carries this /judge route"
             else
+                # An older /judge build: drop it so the current patch goes onto a clean pin.
+                if git -C "$LLAMA_DIR" grep -q 'judge_slots' -- common/common.h 2>/dev/null; then
+                    log_info "Replacing the older /judge patch"
+                    git -C "$LLAMA_DIR" checkout -q -- . \
+                        && rm -f "$LLAMA_DIR/tools/server/server-judge.h"
+                fi
                 log_info "Pinning llama.cpp to ${llama_pin:0:7} and applying the /judge patch"
                 git -C "$LLAMA_DIR" fetch --depth 1 origin "$llama_pin" \
                     && git -C "$LLAMA_DIR" checkout -q FETCH_HEAD \
