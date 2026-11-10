@@ -154,3 +154,43 @@ def test_more_than_the_phrase_is_not_an_unlock(tmp_path, monkeypatch):
     assert "Just the words" in vu.attempt(long_turn, "maple river seven candle", 4242)
     (tmp_path / "unlock-phrase").write_text("4242 maple river seven candle\n")
     assert vu.attempt(None, "okay maple river seven candle", 4242) == "Welcome back."
+
+
+# The user's voice through another mic: like USER, but further off.
+USER_ON_PHONE = _vec(1.0, 2.2)     # scores 0.50 against USER
+
+
+def test_each_mic_learns_its_own_voiceprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(vpm, "ENROLL_MIN", 2)
+    mic = ["jabra"]
+    vp = vpm.Voiceprint(tmp_path / "vp.npz", mic=lambda: mic[0])
+    vp.consider(USER)
+    vp.consider(USER)
+    assert vp.ready and vp.first_mic == "jabra"
+    mic[0] = "phone"
+    vp._mic_cache = (0.0, "")
+    assert vp.count == 0 and not vp.ready
+    assert vp.status_line() == "learning 0/2"     # what the lock screen matches on
+    # Scored against the first mic's print until the phone has its own.
+    assert vp.score(USER_ON_PHONE) < vpm.THRESHOLD
+    assert vp.consider(USER_ON_PHONE)[0] and vp.consider(USER_ON_PHONE)[0]
+    assert vp.ready and vp.score(USER_ON_PHONE) > 0.99
+    assert (tmp_path / "vp-phone.npz").exists()
+    # The first mic's voiceprint is untouched, and remembered as the first.
+    again = vpm.Voiceprint(tmp_path / "vp.npz", mic=lambda: "jabra")
+    assert again.count == 2 and again.first_mic == "jabra"
+
+
+def test_a_stranger_cannot_start_another_mics_voiceprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(vpm, "ENROLL_MIN", 2)
+    mic = ["jabra"]
+    vp = vpm.Voiceprint(tmp_path / "vp.npz", mic=lambda: mic[0])
+    vp.consider(USER)
+    vp.consider(USER)
+    mic[0] = "phone"
+    vp._mic_cache = (0.0, "")
+    # A new mic's first samples have nothing of their own to be compared
+    # with; the first mic's print vets them instead.
+    added, score = vp.consider(STRANGER)
+    assert not added and score < vpm.CROSS_MIC_FLOOR
+    assert vp.count == 0

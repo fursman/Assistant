@@ -60,3 +60,8 @@ kokoro-v1.0.onnx
 voices-v1.0.bin
 smart-turn-*.onnx
 
+
+# Voiceprints (and any other embedding stores) never ship
+*.npz
+voiceprint*
+!voiceprint.py

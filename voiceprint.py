@@ -11,6 +11,14 @@ turn long enough to judge is added until ENROLL_SAMPLES are stored. Once a few
 are in, a turn that looks nothing like the rest (the TV, a visitor) is left
 out, so one stray voice cannot drag the average.
 
+One voiceprint per microphone. A different mic in a different room (a phone
+streaming through the TV bridge) moves the same voice a long way: the user
+scored 0.40-0.45 through a phone against a print learned on the Jabra, where
+they score 0.75. So each mic learns its own, the same way, and the first one
+(the mic in use when this was set up) vets the others' samples: a turn on a new
+mic is only learned if it scores CROSS_MIC_FLOOR against the first, which the
+user clears across mics and other people (0.1-0.2) do not.
+
 The unlock has two parts, both required:
   - the words: the lock screen shows a random phrase (contrib/voice-unlock/
     voice-unlock-phrase writes it, hyprlock displays it); the transcript has
@@ -65,6 +73,9 @@ ENROLL_MIN = int(os.getenv("VOICE_ASSISTANT_VOICEPRINT_MIN", "8"))
 ENROLL_MIN_SECONDS = float(os.getenv("VOICE_ASSISTANT_VOICEPRINT_MIN_SECONDS", "1.5"))
 # A candidate scoring below this against the voiceprint so far is someone else.
 ENROLL_OUTLIER = float(os.getenv("VOICE_ASSISTANT_VOICEPRINT_OUTLIER", "0.35"))
+# A sample for another mic's voiceprint must score this against the first
+# mic's: the user's own voice through a phone in another room scored 0.40-0.45.
+CROSS_MIC_FLOOR = float(os.getenv("VOICE_ASSISTANT_VOICEPRINT_CROSS_MIC", "0.3"))
 # Same-speaker turns score around 0.7-0.85 with this model, other people
 # mostly under 0.35 (two similar Kokoro voices reached 0.6 on a short phrase). The log line of every attempt shows the score, for tuning.
 THRESHOLD = float(os.getenv("VOICE_ASSISTANT_VOICE_UNLOCK_THRESHOLD", "0.6"))
@@ -141,8 +152,8 @@ def _unit(v):
     return v / (np.linalg.norm(v) + 1e-9)
 
 
-class Voiceprint:
-    """The stored embeddings of the user's turns, and scores against them."""
+class _Store:
+    """One mic's stored embeddings of the user's turns, and scores against them."""
 
     def __init__(self, path=STORE_PATH):
         self.path = Path(path)
@@ -197,6 +208,99 @@ class Voiceprint:
         if self.ready:
             return "ready"
         return f"learning {self.count}/{ENROLL_MIN}"
+
+
+def current_mic() -> str:
+    """node.name of the default source, which is the mic the assistant hears
+    through (it records from ALSA "default"); "" when it cannot be read."""
+    try:
+        out = subprocess.run(["wpctl", "inspect", "@DEFAULT_AUDIO_SOURCE@"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.search(r'node\.name = "([^"]+)"', out)
+    return m.group(1) if m else ""
+
+
+class Voiceprint:
+    """The user's voice, one store per microphone.
+
+    The original file (STORE_PATH) belongs to the first mic, named in
+    <stem>-mic next to it; a voiceprint learned before mics were told apart
+    is taken to belong to the mic in use when this first runs. Others live in
+    <stem>-<mic>.npz. Everything here answers for the mic in use now."""
+
+    def __init__(self, path=STORE_PATH, mic=None):
+        self.path = Path(path)
+        self._mic_fn = mic or current_mic
+        self._mic_cache = (0.0, "")
+        self.first = _Store(self.path)
+        self._others = {}
+        self._mic_path = self.path.with_name(self.path.stem + "-mic")
+        try:
+            self.first_mic = self._mic_path.read_text().strip()
+        except OSError:
+            self.first_mic = self.mic()
+            if self.first_mic:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._mic_path.write_text(self.first_mic + "\n")
+
+    def mic(self) -> str:
+        # Asked several times a turn; the answer only changes when a mic does.
+        at, name = self._mic_cache
+        if time.monotonic() - at > 1.0:
+            was, name = name, self._mic_fn()
+            self._mic_cache = (time.monotonic(), name)
+            if at and name != was and STATUS_PATH.exists():
+                # The lock screen shows where this mic's voiceprint stands.
+                write_status(self.store(name).status_line())
+        return name
+
+    def store(self, mic=None) -> _Store:
+        mic = self.mic() if mic is None else mic
+        if not mic or mic == self.first_mic:
+            return self.first
+        if mic not in self._others:
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", mic)
+            self._others[mic] = _Store(self.path.with_name(f"{self.path.stem}-{safe}.npz"))
+        return self._others[mic]
+
+    @property
+    def embeddings(self):
+        return self.store().embeddings
+
+    @property
+    def count(self) -> int:
+        return self.store().count
+
+    @property
+    def ready(self) -> bool:
+        return self.store().ready
+
+    @property
+    def full(self) -> bool:
+        return self.store().full
+
+    def score(self, emb) -> float:
+        """Against this mic's voiceprint; the first mic's while it has none."""
+        s = self.store()
+        return (s if s.count else self.first).score(emb)
+
+    def consider(self, emb) -> tuple:
+        """Add one turn's embedding to this mic's voiceprint unless full or an
+        outlier; on any mic but the first, also unless it is unlike the first
+        mic's. Returns (added, score against this mic's)."""
+        s = self.store()
+        if s is not self.first and self.first.ready:
+            cross = self.first.score(emb)
+            if cross < CROSS_MIC_FLOOR:
+                return False, cross
+        return s.consider(emb)
+
+    def status_line(self) -> str:
+        # Exactly "ready" or "learning n/m": the lock screen's label script
+        # matches on it to decide whether to show the phrase.
+        return self.store().status_line()
 
 
 def voice_only_verdict(voiceprint, emb, seconds) -> tuple:
@@ -300,7 +404,7 @@ class VoiceUnlock:
             self.logger.info(f"Voice unlock: refused, {fails} failed attempts on this lock")
             return "Voice unlock is off after too many tries. Please type your password."
         if not self.voiceprint.ready:
-            return ("I haven't learned your voice yet. "
+            return ("I haven't learned your voice on this microphone yet. "
                     f"I have {self.voiceprint.count} of {ENROLL_MIN} samples.")
         if not phrase:
             return "I can't see an unlock phrase on the screen yet. Try again in a moment."
@@ -313,7 +417,8 @@ class VoiceUnlock:
         words_ok = phrase_matches(transcript, phrase)
         voice_ok = score >= THRESHOLD
         self.logger.info(
-            f"Voice unlock: words {'ok' if words_ok else 'WRONG'} (wanted \"{phrase}\"), "
+            f"Voice unlock: words {'ok' if words_ok else 'WRONG'} (wanted \"{phrase}\""
+            + ("" if words_ok else f", heard \"{transcript}\"") + "), "
             f"voice {score:.2f} vs {THRESHOLD:.2f} {'ok' if voice_ok else 'REJECTED'}")
         # A fresh phrase after every attempt: nothing said here works twice.
         retire_phrase()
@@ -347,8 +452,11 @@ def main(argv):
         raise SystemExit(__doc__)
     vp = Voiceprint()
     if argv[0] == "status":
-        print(f"{vp.count} samples, {vp.status_line()}, threshold {THRESHOLD} "
-              f"(voice-only {VOICE_ONLY_THRESHOLD})")
+        print(f"threshold {THRESHOLD} (voice-only {VOICE_ONLY_THRESHOLD}), mic now: {vp.mic()}")
+        for f in sorted(vp.path.parent.glob(vp.path.stem + "*.npz")):
+            st = _Store(f)
+            print(f"  {f.name}: {st.count} samples, {st.status_line()}")
+        print(f"  first mic: {vp.first_mic}")
         return
     emb = SpeakerEmbedder().load()
     for p in argv[1:]:
