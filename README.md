@@ -1488,6 +1488,7 @@ win over both.
 | `VOICE_ASSISTANT_VOCABULARY_RATIO` | `0.80` | how close a near-miss must be |
 | `VOICE_ASSISTANT_VAD_START` / `_STOP` | `0.5` / `0.35` | Silero speech thresholds |
 | `VOICE_ASSISTANT_VAD_WINDOWS` | `3` | 32 ms windows before a turn starts |
+| `VOICE_ASSISTANT_PRE_ROLL` | `0.6` | seconds of audio kept from before speech is detected, so the first word is not clipped |
 | `VOICE_ASSISTANT_SMART_TURN` | `1` | semantic end-of-turn detection |
 | `VOICE_ASSISTANT_SMART_TURN_CHECKPOINTS` | `0.45:0.90,0.70:0.70,1.10:0.40,1.60:0.20` | `silence:probability` pairs; raise to be cut off less |
 | `VOICE_ASSISTANT_SMART_TURN_LEAD` | `0.12` | seconds before each checkpoint that smart-turn is asked |

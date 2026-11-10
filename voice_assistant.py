@@ -121,6 +121,37 @@ MAX_RECORD_DURATION = 60
 VAD_START_THRESHOLD = float(os.getenv("VOICE_ASSISTANT_VAD_START", "0.5"))
 VAD_STOP_THRESHOLD = float(os.getenv("VOICE_ASSISTANT_VAD_STOP", "0.35"))
 VAD_START_WINDOWS = int(os.getenv("VOICE_ASSISTANT_VAD_WINDOWS", "3"))  # 3 x 32 ms
+# Audio kept from before the detector fires, so the recording starts with the
+# first word rather than partway into it. Silero needs a few windows over the
+# start threshold, and a soft or plosive opening ("pepper ...") rises slowly:
+# with only the one previous 0.2 s chunk the voice unlock heard "pepper winter
+# basket bucket" as "winter basket bucket" and "ever winter basket bucket".
+PRE_ROLL_SECONDS = float(os.getenv("VOICE_ASSISTANT_PRE_ROLL", "0.6"))
+
+
+class PreRoll:
+    """The last PRE_ROLL_SECONDS of idle audio, whole chunks, oldest first."""
+
+    def __init__(self, seconds=None):
+        self.limit = int((PRE_ROLL_SECONDS if seconds is None else seconds) * SAMPLE_RATE)
+        self.chunks = collections.deque()
+        self.samples = 0
+
+    def push(self, chunk):
+        self.chunks.append(chunk)
+        self.samples += len(chunk)
+        while self.chunks and self.samples - len(self.chunks[0]) >= self.limit:
+            self.samples -= len(self.chunks.popleft())
+
+    def take(self, chunk):
+        """The held audio followed by `chunk`; the buffer is emptied."""
+        audio = np.concatenate([*self.chunks, chunk]) if self.chunks else chunk
+        self.clear()
+        return audio
+
+    def clear(self):
+        self.chunks.clear()
+        self.samples = 0
 
 # --- end-of-turn model -----------------------------------------------------
 # pipecat smart-turn v3.2 (Whisper-tiny encoder + a classifier head, 8.7 MB,
@@ -927,6 +958,39 @@ WAKE_SCREEN = os.getenv("VOICE_ASSISTANT_WAKE_SCREEN", "1").strip().lower() \
 # its stop command) before the window exists, then ignores every later keypress.
 # e.g. VOICE_ASSISTANT_WAKE_CMD="$HOME/.local/bin/screensaver stop"
 WAKE_CMD = os.getenv("VOICE_ASSISTANT_WAKE_CMD", "").strip()
+# A file that exists while something is drawn over the lock screen and hides its
+# unlock phrase (home-dash's live dashboard). The user's own voice then wakes the
+# screen, which brings the phrase back. Absent file: nothing changes.
+LOCK_OVERLAY_FILE = Path(os.path.expanduser(os.getenv(
+    "VOICE_ASSISTANT_LOCK_OVERLAY_FILE", "~/.local/state/home-dash/weblock-up")))
+
+
+_desktop_checked_at = 0.0
+
+
+def _current_desktop():
+    """DESKTOP, re-detected if the service started before anyone logged in.
+
+    After a reboot the service (lingering) comes up before the desktop session,
+    finds nothing, and would otherwise say "an unidentified desktop" until it
+    restarts -- so the screen wake quietly did nothing all day. Re-checked at
+    most every 30 s while unknown; once identified it sticks. The prompts built
+    at import keep the old text until a restart, but everything that reads
+    DESKTOP at call time (the screen wake, the look tool) catches up.
+    """
+    global DESKTOP, _desktop_checked_at
+    if "unidentified" not in DESKTOP or os.getenv("VOICE_ASSISTANT_DESKTOP", "").strip():
+        return DESKTOP
+    now = time.monotonic()
+    if now - _desktop_checked_at < 30:
+        return DESKTOP
+    _desktop_checked_at = now
+    _refresh_session_env()
+    found = _detect_desktop()
+    if found != DESKTOP:
+        logging.getLogger(__name__).info(f"Desktop is now: {found}")
+        DESKTOP = found
+    return DESKTOP
 
 
 def _wake_screen():
@@ -934,19 +998,22 @@ def _wake_screen():
     if not WAKE_SCREEN:
         return
     _refresh_session_env()
-    if "Hyprland" in DESKTOP or "Sway" in DESKTOP:
+    desktop = _current_desktop()
+    if "Hyprland" in desktop or "Sway" in desktop:
         cmd = ["wtype", "-P", "Shift_L", "-p", "Shift_L"]
-    elif "GNOME" in DESKTOP:
+    elif "GNOME" in desktop:
         cmd = ["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor",
                "--object-path", "/org/gnome/Mutter/IdleMonitor/Core",
                "--method", "org.gnome.Mutter.IdleMonitor.ResetIdletime"]
     else:
-        return
-    try:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError:
-        pass                    # wtype not installed
+        cmd = None
+    if cmd:
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass                # wtype not installed
+    # The user's own wake command runs whatever the desktop detection says.
     if WAKE_CMD:
         subprocess.Popen(["bash", "-c", WAKE_CMD], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -4715,6 +4782,26 @@ class VoiceAssistant:
             self.logger.warning(f"Speaker embedding failed ({e})")
             return None
 
+    def _reveal_lock_phrase(self, vu, audio, emb=None):
+        """Something covers the lock screen and the user spoke: show its phrase.
+
+        Only the user's own voice does this, so a conversation in the room
+        doesn't keep pulling the dashboard down. Nothing is unlocked or said;
+        the screen wake counts as input, which the overlay already answers to."""
+        import voiceprint
+        if not LOCK_OVERLAY_FILE.exists() or not vu.voiceprint.ready:
+            return False
+        if emb is None:
+            emb = self._speaker_embedding(audio)
+        if emb is None:
+            return False
+        ok, score, bar = voiceprint.voice_only_verdict(vu.voiceprint, emb, len(audio) / SAMPLE_RATE)
+        self.logger.info(f"Locked, overlay up: voice {score:.2f} vs {bar:.2f} "
+                         f"{'shows the phrase' if ok else 'ignored'}")
+        if ok:
+            _wake_screen()
+        return ok
+
     def _speaker_turn(self, audio, transcription, emb=None):
         """Who is speaking decides a turn before anything else does.
 
@@ -4737,6 +4824,7 @@ class VoiceAssistant:
                     return ""
                 if not voiceprint.is_unlock_attempt(
                         transcription, voiceprint.current_phrase(pid)):
+                    self._reveal_lock_phrase(vu, audio, emb)
                     self.logger.info(f"Locked: ignored (not an unlock attempt): {transcription}")
                     return ""
                 return vu.attempt(audio, transcription, pid)
@@ -5620,7 +5708,7 @@ class VoiceAssistant:
         self.logger.info(f"local tool look: {source}" + (f" {path}" if path else ""))
         _refresh_session_env()      # grim and the portal need the session's sockets
         try:
-            label, uri = look_tools.look(source, path, DESKTOP, self.logger)
+            label, uri = look_tools.look(source, path, _current_desktop(), self.logger)
         except look_tools.LookError as e:
             self.logger.warning(f"local tool look: {e}")
             return self._sanitize_tool_output(f"(no image: {e})"), None
@@ -5847,7 +5935,7 @@ class VoiceAssistant:
         user_content = recap + text
         if image:
             try:
-                label, uri = look_tools.look("file", image, DESKTOP, self.logger)
+                label, uri = look_tools.look("file", image, _current_desktop(), self.logger)
                 # The label goes in with the words, so the history keeps
                 # "[image file ~/x.png, 20:15]" once the image is dropped.
                 user_content = [{"type": "text",
@@ -8574,13 +8662,13 @@ class VoiceAssistant:
         # convenience, not a reason for the voice assistant to stop.
         self._control_task = asyncio.create_task(self._serve_control())
 
-        prev_chunk = None
+        pre_roll = PreRoll()
         while True:
             if not self.is_active:
                 if self.capture.running:
                     self.capture.stop()
                     self.player.close()
-                prev_chunk = None
+                pre_roll.clear()
                 await asyncio.sleep(0.1)
                 continue
 
@@ -8602,7 +8690,7 @@ class VoiceAssistant:
                 None, self.capture.read, VAD_CHUNK_DURATION, 1.0)
             if self.is_processing:
                 # A typed turn took the floor while this chunk was being read.
-                prev_chunk = None
+                pre_roll.clear()
                 continue
             if chunk is None:
                 if self.is_active and self.capture.stalled():
@@ -8614,13 +8702,13 @@ class VoiceAssistant:
                         await loop.run_in_executor(None, self.capture.reopen)
                         self._keep_output_open()
                         self.vad.reset()
-                        prev_chunk = None
+                        pre_roll.clear()
                     except OSError as e:
                         self.logger.error(f"Failed to reopen audio stream: {e}")
                         await asyncio.sleep(1)
                 continue
             if not self.is_active:
-                prev_chunk = None
+                pre_roll.clear()
                 continue
 
             if self.vad.onset(chunk):
@@ -8628,11 +8716,9 @@ class VoiceAssistant:
                 if not self._turns_screened():
                     _wake_screen()
                 self.logger.info("Speech detected, recording...")
-                # The previous chunk carries the start of the word that
-                # triggered the detector.
-                pre_audio = (np.concatenate([prev_chunk, chunk])
-                             if prev_chunk is not None else chunk)
-                prev_chunk = None
+                # The audio before this chunk carries the start of the word
+                # that triggered the detector.
+                pre_audio = pre_roll.take(chunk)
                 self._recording = True
                 try:
                     full_audio = await loop.run_in_executor(
@@ -8652,7 +8738,7 @@ class VoiceAssistant:
                 self._set_status("thinking")
                 asyncio.create_task(self._process_audio(full_audio))
             else:
-                prev_chunk = chunk
+                pre_roll.push(chunk)
 
     async def _process_audio(self, audio_data):
         loop = asyncio.get_running_loop()

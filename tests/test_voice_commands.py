@@ -520,3 +520,126 @@ def test_a_locked_screen_stays_shut_without_the_voiceprint(tmp_path, gate, wakes
     monkeypatch.setattr(voiceprint, "hyprlock_pid", lambda: None)
     _turn(host)
     assert host.asked == ["What's the weather tomorrow?"], "unlocked, it answers"
+
+
+# --- Screen wake after a reboot ---------------------------------------------
+# The service lingers, so after a reboot it starts before anyone logs in and
+# finds no desktop. It must notice the desktop once the user logs in, and the
+# user's own wake command must run either way.
+
+@pytest.fixture
+def popen_calls(monkeypatch):
+    calls = []
+    monkeypatch.setattr(va.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(va, "_refresh_session_env", lambda: None)
+    monkeypatch.setattr(va, "WAKE_SCREEN", True)
+    monkeypatch.setattr(va, "_desktop_checked_at", 0.0)
+    monkeypatch.delenv("VOICE_ASSISTANT_DESKTOP", raising=False)
+    return calls
+
+
+def test_wake_screen_notices_desktop_that_appeared_after_start(monkeypatch, popen_calls):
+    monkeypatch.setattr(va, "DESKTOP", "Ubuntu, an unidentified desktop on Wayland")
+    monkeypatch.setattr(va, "_detect_desktop", lambda: "Ubuntu, Hyprland on Wayland")
+    monkeypatch.setattr(va, "WAKE_CMD", "")
+    va._wake_screen()
+    assert popen_calls == [["wtype", "-P", "Shift_L", "-p", "Shift_L"]]
+    assert va.DESKTOP == "Ubuntu, Hyprland on Wayland"
+
+
+def test_wake_cmd_runs_even_with_no_desktop(monkeypatch, popen_calls):
+    monkeypatch.setattr(va, "DESKTOP", "Ubuntu, an unidentified desktop on Wayland")
+    monkeypatch.setattr(va, "_detect_desktop", lambda: "Ubuntu, an unidentified desktop on Wayland")
+    monkeypatch.setattr(va, "WAKE_CMD", "screensaver stop")
+    va._wake_screen()
+    assert popen_calls == [["bash", "-c", "screensaver stop"]]
+
+
+def test_unknown_desktop_rechecked_at_most_every_30s(monkeypatch, popen_calls):
+    monkeypatch.setattr(va, "DESKTOP", "Ubuntu, an unidentified desktop on Wayland")
+    checks = []
+    monkeypatch.setattr(va, "_detect_desktop",
+                        lambda: checks.append(1) or "Ubuntu, an unidentified desktop on Wayland")
+    va._current_desktop()
+    va._current_desktop()
+    assert len(checks) == 1
+
+
+def test_known_desktop_is_not_rechecked(monkeypatch, popen_calls):
+    monkeypatch.setattr(va, "DESKTOP", "Ubuntu, GNOME on Wayland")
+    monkeypatch.setattr(va, "_detect_desktop", lambda: pytest.fail("re-detected"))
+    assert va._current_desktop() == "Ubuntu, GNOME on Wayland"
+
+
+# --- Pre-roll ---------------------------------------------------------------
+# The recording must start before the detector fires: a slow-rising first word
+# ("pepper") lost its start with only one 0.2 s chunk of lead-in.
+
+def _chunk(n, value):
+    return np.full(int(va.SAMPLE_RATE * n), value, np.float32)
+
+
+def test_pre_roll_keeps_about_the_configured_lead_in():
+    pr = va.PreRoll(0.6)
+    for v in range(1, 7):                   # six 0.2 s idle chunks
+        pr.push(_chunk(0.2, v))
+    audio = pr.take(_chunk(0.2, 9))
+    # the last three idle chunks (0.6 s), then the triggering chunk
+    assert len(audio) == int(va.SAMPLE_RATE * 0.8)
+    assert list(audio[::int(va.SAMPLE_RATE * 0.2)]) == [4, 5, 6, 9]
+
+
+def test_pre_roll_empties_after_take_and_clear():
+    pr = va.PreRoll(0.6)
+    pr.push(_chunk(0.2, 1))
+    pr.take(_chunk(0.2, 2))
+    assert len(pr.take(_chunk(0.2, 3))) == int(va.SAMPLE_RATE * 0.2)
+    pr.push(_chunk(0.2, 1))
+    pr.clear()
+    assert len(pr.take(_chunk(0.2, 3))) == int(va.SAMPLE_RATE * 0.2)
+
+
+def test_pre_roll_zero_is_just_the_trigger_chunk():
+    pr = va.PreRoll(0)
+    pr.push(_chunk(0.2, 1))
+    assert len(pr.take(_chunk(0.2, 2))) == int(va.SAMPLE_RATE * 0.2)
+
+
+# --- Speaking to a lock screen with something drawn over it ---------------------
+
+def _overlay_host(tmp_path, monkeypatch, voice, heard="hello there"):
+    import voiceprint
+    host = GateHost(tmp_path, heard, voice)
+    host.voice_unlock = SimpleNamespace(voiceprint=host._voiceprint, attempt=lambda *a: "unlocking")
+    monkeypatch.setattr(voiceprint, "hyprlock_pid", lambda: 4242)
+    monkeypatch.setattr(voiceprint, "current_phrase", lambda pid: "pepper winter basket bucket")
+    flag = tmp_path / "overlay-up"
+    monkeypatch.setattr(va, "LOCK_OVERLAY_FILE", flag)
+    return host, flag
+
+
+def test_own_voice_brings_the_phrase_back(tmp_path, monkeypatch, gate, wakes):
+    host, flag = _overlay_host(tmp_path, monkeypatch, USER_VOICE)
+    flag.touch()
+    assert host._speaker_turn(np.zeros(3 * va.SAMPLE_RATE, np.float32), "hello there") == ""
+    assert wakes == [True] and host.asked == []
+
+
+def test_another_voice_leaves_the_overlay(tmp_path, monkeypatch, gate, wakes):
+    host, flag = _overlay_host(tmp_path, monkeypatch, OTHER_VOICE)
+    flag.touch()
+    assert host._speaker_turn(np.zeros(3 * va.SAMPLE_RATE, np.float32), "hello there") == ""
+    assert wakes == []
+
+
+def test_no_overlay_no_wake(tmp_path, monkeypatch, gate, wakes):
+    host, flag = _overlay_host(tmp_path, monkeypatch, USER_VOICE)
+    assert host._speaker_turn(np.zeros(3 * va.SAMPLE_RATE, np.float32), "hello there") == ""
+    assert wakes == []
+
+
+def test_an_unlock_attempt_is_still_an_attempt(tmp_path, monkeypatch, gate, wakes):
+    host, flag = _overlay_host(tmp_path, monkeypatch, USER_VOICE)
+    flag.touch()
+    said = host._speaker_turn(np.zeros(3 * va.SAMPLE_RATE, np.float32), "pepper winter basket bucket")
+    assert said == "unlocking" and wakes == []
