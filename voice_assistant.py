@@ -8625,6 +8625,12 @@ class VoiceAssistant:
                 self.capture.mute(True)
                 muted = True
             self._set_status("thinking")
+            # A typed question writes no "you" entry, so nothing closed the
+            # answer before it: every typed answer was appended to the last,
+            # one entry growing until its 4000-character limit cut the rest
+            # off -- and whatever reads the transcript to follow an answer as
+            # it is written (the watch gateway) then saw nothing arrive.
+            self._transcript_open = False
             self.logger.info(f"Typed query: {text[:80]}" + (f" (image {image})" if image else ""))
             # The router's opinion. Typed input is never dropped: the user
             # pressed Enter on it, so "not addressed to the assistant" cannot
