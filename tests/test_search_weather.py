@@ -235,6 +235,9 @@ def test_searxng_failing_falls_back_to_the_keyless_sources(settings, monkeypatch
 def test_json_not_enabled_says_what_to_fix(settings, monkeypatch, caplog, answer):
     monkeypatch.setattr(web_tools, "SEARXNG_URL", SEARX)
     _net(monkeypatch, dict(KEYLESS, **{SEARX: answer}))
+    # The hint is logged at INFO, and nothing guarantees that level is on: it was only
+    # captured when an earlier test, or this machine's environment, had happened to set it.
+    caplog.set_level(logging.INFO)
     web_tools.web_search(QUERY)
     assert "format json enabled in its settings.yml" in caplog.text
 
@@ -306,7 +309,7 @@ def test_searxng_settings_reach_the_sidecar(settings, monkeypatch, tmp_path):
     monkeypatch.setenv("VOICE_ASSISTANT_SEARXNG_URL", SEARX)
     monkeypatch.setenv("VOICE_ASSISTANT_WEATHER_PLACE", "Victoria, BC")
     monkeypatch.setenv("VOICE_ASSISTANT_LOCAL_URL", "http://not-for-the-sidecar")
-    monkeypatch.delenv("VOICE_ASSISTANT_WEATHER_UNITS")
+    monkeypatch.delenv("VOICE_ASSISTANT_WEATHER_UNITS", raising=False)   # unset on most machines
     patch = va.DshSession(logging.getLogger("test"))._write_patch()
     line = next(x for x in patch.read_text().splitlines() if x.strip().startswith("env:"))
     env = json.loads(line.split("env:", 1)[1])
