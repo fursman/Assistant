@@ -173,3 +173,68 @@ def test_overflow_retry_is_told_what_ran_and_the_record_keeps_it(monkeypatch):
     user, record = host._dsh.remembered[-1]
     assert user == "what is on my screen", "the ledger keeps what the user said"
     assert record.startswith("[Ran: ") and record.endswith("Your screen shows a terminal.")
+
+
+# --- speech that another program transcribed is screened like the microphone ----
+
+class _Verdict:
+    def __init__(self, junk, typed):
+        self.junk, self.typed, self.outcome = junk, typed, {}
+        # The real rule (turn_router.Verdict.drop): spoken input only.
+        self.drop = (not typed) and junk >= 0.8
+
+    def log_line(self):
+        return f"Router: junk={self.junk}"
+
+
+def _screened_host(junk):
+    host = _bare_host()
+    host.backend = "claude"
+    host.judged, host.ran, host.shown, host.recorded = [], [], [], []
+
+    def judge(text, typed):
+        host.judged.append((text, typed))
+        return None if junk is None else _Verdict(junk, typed)
+    host._router_judge = judge
+    host._router_finish = lambda: None
+    host._router_screening = lambda: True
+    host._router_record = host.recorded.append
+    host._append_transcript = lambda role, text: host.shown.append((role, text))
+    host._query_and_speak = lambda text, abort, speak: host.ran.append(text) or "ok"
+    return host
+
+
+WATCH = "[context: asked from the Galaxy Watch called watch two; the answer is shown there]\n"
+
+
+def test_speech_from_another_program_is_dropped_when_the_judge_calls_it_junk():
+    host = _screened_host(0.91)
+    res = asyncio.run(host._control_ask(WATCH + "and then she put it on the shelf", False, 1.0,
+                                        spoken=True))
+    assert res["ok"] and res["dropped"] and res["reply"] == "" and res["junk"] == 0.91
+    assert host.ran == [], "a dropped turn never reaches a model"
+    assert host.judged == [("and then she put it on the shelf", False)], \
+        "judged as speech, and without the caller's context line"
+    assert host.recorded and host.recorded[0].outcome == {"dropped": True, "screen": True}
+    assert host.shown and host.shown[0][0] == "system" and "Not for me" in host.shown[0][1]
+    assert host.is_processing is False and host.statuses[-1] == "ready"
+
+
+def test_speech_from_another_program_that_passes_is_answered_with_its_context():
+    host = _screened_host(0.04)
+    res = asyncio.run(host._control_ask(WATCH + "what is the tank level", False, 1.0, spoken=True))
+    assert res["ok"] and not res.get("dropped") and res["reply"] == "ok"
+    assert host.ran == [WATCH.strip() + "\nwhat is the tank level"], "the model still gets the context line"
+
+
+def test_typed_input_is_never_dropped_whatever_the_judge_says():
+    host = _screened_host(0.99)
+    res = asyncio.run(host._control_ask("asdf qwer", False, 1.0))
+    assert res["ok"] and not res.get("dropped") and host.ran == ["asdf qwer"]
+    assert host.judged == [("asdf qwer", True)]
+
+
+def test_no_judge_means_the_spoken_turn_just_goes_ahead():
+    host = _screened_host(None)          # not configured, down, or too slow: no opinion
+    res = asyncio.run(host._control_ask(WATCH + "hello there", False, 1.0, spoken=True))
+    assert res["ok"] and not res.get("dropped") and res["reply"] == "ok"

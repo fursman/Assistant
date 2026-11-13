@@ -810,6 +810,16 @@ ROUTER_CAUTION_MARKER = ("[router: this may touch the machine or the user's data
 ROUTER_BACKENDS = frozenset(
     b.strip() for b in os.getenv("VOICE_ASSISTANT_ROUTER_BACKENDS", "local,dsh").lower().split(",")
     if b.strip())
+# Backends the judge only screens for. On these the whole rubric is asked and every answer is
+# logged with how the turn went (router.jsonl), but the one decision acted on is the junk drop
+# (addressed + intelligible): no routing, no tool gating, no risky marker. Meant for Claude with
+# a judge elsewhere on the network (VOICE_ASSISTANT_ROUTER_URL): the voiceprint says whose voice
+# it is, this says whether they were talking to the assistant, and Claude's own handling of the
+# turns that get through is free ground truth for grading the judge's other answers. Empty = off.
+# A backend listed in ROUTER_BACKENDS as well gets the full router, not just the screen.
+ROUTER_SCREEN_BACKENDS = frozenset(
+    b.strip() for b in os.getenv("VOICE_ASSISTANT_ROUTER_SCREEN_BACKENDS", "").lower().split(",")
+    if b.strip())
 # A prefetched verdict is also reused when the final transcript adds at most this many words to
 # a prefetch that was its prefix: on a short utterance the 80% rule alone rejects a one-word lag.
 ROUTER_PREFETCH_MAX_EXTRA_WORDS = int(os.getenv("VOICE_ASSISTANT_ROUTER_PREFETCH_MAX_EXTRA_WORDS", "2"))
@@ -961,6 +971,9 @@ WAKE_CMD = os.getenv("VOICE_ASSISTANT_WAKE_CMD", "").strip()
 # A file that exists while something is drawn over the lock screen and hides its
 # unlock phrase (home-dash's live dashboard). The user's own voice then wakes the
 # screen, which brings the phrase back. Absent file: nothing changes.
+# Lines a caller put in front of a question to say where it came from ("[context: asked from
+# the Galaxy Watch ...]"). They are for the model, not for the judge.
+_CALLER_CONTEXT = re.compile(r"\A(?:\s*\[context:[^\n]*\]\s*\n)+")
 LOCK_OVERLAY_FILE = Path(os.path.expanduser(os.getenv(
     "VOICE_ASSISTANT_LOCK_OVERLAY_FILE", "~/.local/state/home-dash/weblock-up")))
 
@@ -5912,7 +5925,7 @@ class VoiceAssistant:
         look_hint = offer_look and bool(_LOOK_HINT.search(text))
         weather_hint = LOCAL_TOOLS_ENABLED and bool(_WEATHER_HINT.search(text))
 
-        v = self._router_verdict
+        v = None if self._router_screening() else self._router_verdict
         hard = bool(v is not None and getattr(v, "hard", False)) \
             and not (look_hint or weather_hint or image)
         use_hard = hard and allow_hard and self._hard_backend_ready()
@@ -7159,9 +7172,18 @@ class VoiceAssistant:
         return (str(last.get("user", "")), str(last.get("assistant", "")), time.time() - at)
 
     def _router_active(self) -> bool:
-        """Whether the router has a say on this turn: it exists, and the backend in force is one
-        it was made for (ROUTER_BACKENDS). With Claude chosen, the judge is not consulted."""
-        return self._router is not None and getattr(self, "backend", "local") in ROUTER_BACKENDS
+        """Whether the router is consulted on this turn: it exists, and the backend in force is
+        one it was made for (ROUTER_BACKENDS) or one it screens for (ROUTER_SCREEN_BACKENDS).
+        With Claude chosen and neither naming it, the judge is not consulted."""
+        backend = getattr(self, "backend", "local")
+        return self._router is not None and (backend in ROUTER_BACKENDS
+                                             or backend in ROUTER_SCREEN_BACKENDS)
+
+    def _router_screening(self) -> bool:
+        """Whether this turn's verdict is for the junk drop and the log only (see
+        ROUTER_SCREEN_BACKENDS): it must not move the turn, gate tools or add a marker."""
+        backend = getattr(self, "backend", "local")
+        return backend in ROUTER_SCREEN_BACKENDS and backend not in ROUTER_BACKENDS
 
     def _router_judge(self, text, typed=False, timeout=None):
         """Ask the router about this turn. Never raises; None means no opinion."""
@@ -7375,6 +7397,8 @@ class VoiceAssistant:
                 "model": getattr(self, "_turn_model", "") or None,
                 "backend_pref": getattr(self, "backend", None),
             })
+            if self._router_screening():
+                v.outcome["screen"] = True
         except Exception as e:
             self.logger.debug(f"Router: outcome not recorded ({e})")
         reply = (getattr(self, "_assistant_text", "") or "").strip()
@@ -7400,7 +7424,7 @@ class VoiceAssistant:
         of the risky bar, or ""."""
         try:
             v = self._router_verdict
-            if v is None:
+            if v is None or self._router_screening():
                 return ""
             if v.risky:
                 return ROUTER_RISKY_MARKER
@@ -7480,7 +7504,7 @@ class VoiceAssistant:
         model picks among all of them, `look` included when it is offered.
         """
         v = self._router_verdict
-        if v is None or not ROUTER_TOOLS:
+        if v is None or not ROUTER_TOOLS or self._router_screening():
             return "auto"
         try:
             wanted = sorted(set(v.tools))
@@ -7499,7 +7523,7 @@ class VoiceAssistant:
         A harness preference (dsh) is never overridden.
         """
         v = self._router_verdict
-        if v is None or not ROUTER_ROUTE or self.backend_pref == "dsh":
+        if v is None or not ROUTER_ROUTE or self.backend_pref == "dsh" or self._router_screening():
             return None
         try:
             if v.route == "local":
@@ -8588,10 +8612,16 @@ class VoiceAssistant:
             return await self._control_ask(str(req.get("text", "")),
                                            bool(req.get("speak", False)),
                                            float(req.get("wait", 180)),
-                                           str(req.get("image") or ""))
+                                           str(req.get("image") or ""),
+                                           bool(req.get("spoken", False)))
         return {"ok": False, "error": f"unknown command {cmd!r}"}
 
-    async def _control_ask(self, text: str, speak: bool, wait: float, image: str = "") -> dict:
+    async def _control_ask(self, text: str, speak: bool, wait: float, image: str = "",
+                           spoken: bool = False) -> dict:
+        """One question from the control socket. `spoken` says the words are a transcript of
+        speech some other program heard (a watch, a phone): they are then screened like the
+        microphone's, and a turn the judge calls junk comes back as {"dropped": true} with no
+        reply. Everything else is typed, and typed input is never dropped."""
         text = text.strip()
         if not text:
             return {"ok": False, "error": "empty question"}
@@ -8634,9 +8664,26 @@ class VoiceAssistant:
             self.logger.info(f"Typed query: {text[:80]}" + (f" (image {image})" if image else ""))
             # The router's opinion. Typed input is never dropped: the user
             # pressed Enter on it, so "not addressed to the assistant" cannot
-            # be true.
-            verdict = await loop.run_in_executor(None, self._router_judge, text, True)
+            # be true. Speech that another program transcribed can be anything
+            # its microphone heard, so it is judged as speech. The judge is
+            # shown the words alone: a caller's "[context: ...]" line in front
+            # of them reads as proof that the turn was meant for the assistant.
+            # No judge, or one that does not answer in time, means no opinion:
+            # the turn goes ahead as it always did.
+            judged = _CALLER_CONTEXT.sub("", text).strip() or text
+            verdict = await loop.run_in_executor(None, self._router_judge, judged, not spoken)
             if verdict is not None:
+                if spoken and verdict.drop and ROUTER_DROP:
+                    self.logger.info(f"Router: ignored (junk p={verdict.junk:.2f}) : {judged}")
+                    verdict.outcome["dropped"] = True
+                    if self._router_screening():
+                        verdict.outcome["screen"] = True
+                    self._append_transcript(
+                        "system", f"Not for me, ignored ({verdict.junk:.0%} sure): {judged}")
+                    self._router_record(verdict)
+                    return {"ok": True, "reply": "", "dropped": True,
+                            "junk": round(float(verdict.junk), 2),
+                            "backend": self.backend, "spoken": speak}
                 self._router_verdict = verdict
                 self.logger.info(verdict.log_line())
             abort = threading.Event()
@@ -8899,6 +8946,13 @@ class VoiceAssistant:
             if verdict is not None:
                 if verdict.drop and ROUTER_DROP:
                     self.logger.info(f"Router: ignored (junk p={verdict.junk:.2f}) : {transcription}")
+                    verdict.outcome["dropped"] = True
+                    if self._router_screening():
+                        # Screening for Claude drops turns that used to be answered, so leave
+                        # a trace where the user looks: a wrong drop should be easy to spot.
+                        verdict.outcome["screen"] = True
+                        self._append_transcript(
+                            "system", f"Not for me, ignored ({verdict.junk:.0%} sure): {transcription}")
                     self._router_record(verdict)
                     return
                 self._router_verdict = verdict

@@ -897,6 +897,28 @@ The router runs for the local model's turns (`VOICE_ASSISTANT_ROUTER_BACKENDS`,
 default `local,dsh`). When Claude has been chosen it answers everything with its
 own judgment and the judge is not consulted at all: no extra wait, no misroute.
 
+**Screening for Claude.** `VOICE_ASSISTANT_ROUTER_SCREEN_BACKENDS=claude` puts the judge in
+front of Claude's turns in a narrower role: the whole rubric is asked and every answer is
+written to `router.jsonl` with how the turn went, but the only decision acted on is the junk
+drop (not addressed to the assistant, or not intelligible). Nothing is rerouted, no tools are
+gated and no risky marker is added. A dropped turn leaves a "Not for me, ignored" line in the
+conversation view so a wrong drop is easy to spot, and the judge still fails open. Point
+`VOICE_ASSISTANT_ROUTER_URL` at a llama-server with the `/judge` route when this machine runs
+no local model (about 0.6 s for the six questions over the LAN to an RTX 4060 Ti, mostly
+hidden by the prefetch). Because Claude answers these turns, its handling of them (did it
+act, did it ask first, did it treat the words as meant for it) is ground truth for grading
+the judge's other answers without hand-labelling. A backend that is also listed in
+`VOICE_ASSISTANT_ROUTER_BACKENDS` gets the full router instead.
+
+**Speech from other programs.** A program that transcribes speech itself and hands the words
+to the control socket (a watch app's gateway, a phone) adds `"spoken": true` to its `ask`
+request. Those words are then judged as speech, like the microphone's: junk is dropped and
+the reply is `{"ok": true, "dropped": true, "junk": 0.87, "reply": ""}`, so the caller can
+say so instead of waiting for an answer. Without the flag an `ask` is typed input, which is
+never dropped. A leading `[context: ...]` line the caller put in front of the words is kept
+for the model but not shown to the judge. With no judge configured, or one that does not
+answer within `VOICE_ASSISTANT_ROUTER_TIMEOUT`, the turn goes ahead unscreened.
+
 Before a local turn goes to the model, the llama-server is asked six yes/no
 questions about it in one forward pass -- no generation, just the
 log-probabilities of "yes" and "no" after each question (`POST /judge`, about

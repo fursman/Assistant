@@ -262,6 +262,9 @@ def test_prefix_rule():
 def test_router_bypassed_when_claude_is_the_backend(monkeypatch):
     monkeypatch.setattr(va, "ROUTER_PREFETCH", True)
     monkeypatch.setattr(va, "ROUTER_BACKENDS", frozenset({"local", "dsh"}))
+    # Not whatever this machine's own settings say: one that screens Claude's turns
+    # (VOICE_ASSISTANT_ROUTER_SCREEN_BACKENDS=claude) does consult the judge.
+    monkeypatch.setattr(va, "ROUTER_SCREEN_BACKENDS", frozenset())
     router = FakeRouter(delay=0.01)
     host = Host(router)
     host.backend = "claude"
@@ -459,3 +462,41 @@ def test_vocab_failure_in_prefetch_falls_back_to_raw_text(monkeypatch):
     verdict = host._router_judge_spoken("what time is it")
     assert verdict is router.verdict
     assert router.calls == [("what time is it", False)]
+
+
+def test_screening_backend_is_judged_but_only_the_junk_drop_applies(monkeypatch):
+    """ROUTER_SCREEN_BACKENDS: Claude's turns reach the judge and are logged, but the verdict
+    must not move the turn, gate tools or add the risky marker."""
+    monkeypatch.setattr(va, "ROUTER_PREFETCH", True)
+    monkeypatch.setattr(va, "ROUTER_BACKENDS", frozenset({"local", "dsh"}))
+    monkeypatch.setattr(va, "ROUTER_SCREEN_BACKENDS", frozenset({"claude"}))
+    monkeypatch.setattr(va, "ROUTER_ROUTE", True)
+    monkeypatch.setattr(va, "ROUTER_TOOLS", True)
+    router = FakeRouter(delay=0.01)
+    host = Host(router)
+    host.backend = host.backend_pref = "claude"
+    assert host._router_active() is True
+    assert host._router_screening() is True
+    verdict = host._router_judge("delete everything in my home folder", False)
+    assert verdict is router.verdict, "the judge is asked"
+    assert router.calls == [("delete everything in my home folder", False)]
+    # A verdict that would mark, gate and reroute a local turn does none of that here.
+    verdict.risky, verdict.caution, verdict.route, verdict.tools, verdict.hard = True, True, "local", [], True
+    host._router_verdict = verdict
+    assert host._router_marker() == ""
+    assert host._router_route() is None
+    assert host._router_tool_choice() == "auto"
+    # The same verdict on a backend the router was made for keeps its full effect.
+    host.backend = host.backend_pref = "local"
+    assert host._router_screening() is False
+    assert host._router_marker() == va.ROUTER_RISKY_MARKER
+    assert host._router_tool_choice() == "none"
+    # Listed in both: the full router wins over the screen.
+    monkeypatch.setattr(va, "ROUTER_BACKENDS", frozenset({"local", "dsh", "claude"}))
+    host.backend = host.backend_pref = "claude"
+    assert host._router_active() is True
+    assert host._router_screening() is False
+    # Listed in neither: not consulted at all.
+    monkeypatch.setattr(va, "ROUTER_BACKENDS", frozenset({"local", "dsh"}))
+    monkeypatch.setattr(va, "ROUTER_SCREEN_BACKENDS", frozenset())
+    assert host._router_active() is False
