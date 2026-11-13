@@ -216,3 +216,41 @@ def test_no_hang_up_command_runs_nothing(monkeypatch):
     monkeypatch.setattr(jb, "HANGUP_CMD", "")
     monkeypatch.setattr(jb.subprocess, "Popen", lambda cmd, **kw: pytest.fail("ran"))
     jb.run_hangup()
+
+
+def test_a_typed_turn_with_voice_off_is_off(tmp_path, monkeypatch):
+    """A question from a watch runs with voice mode off: the phase says
+    "thinking", and the Jabra must not take that for voice mode coming on."""
+    import json
+    status, pidfile = tmp_path / "status", tmp_path / "pid"
+    pidfile.write_text(str(os.getpid()))
+    monkeypatch.setattr(jb, "STATUS", str(status))
+    monkeypatch.setattr(jb, "PIDFILE", str(pidfile))
+    real_open = open
+
+    def fake_open(path, *a, **kw):          # this test is not voice_assistant.py
+        if str(path).endswith("/cmdline"):
+            import io
+            return io.BytesIO(b"python3\0voice_assistant.py\0")
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    def phase(cls, voice=None):
+        d = {"class": [cls, "claude"]}
+        if voice:
+            d["voice"] = voice
+        status.write_text(json.dumps(d))
+        return jb.assistant()[1]
+
+    # An assistant that publishes voice mode: that decides, whatever the phase.
+    assert phase("thinking", "off") == "off"
+    assert phase("speaking", "off") == "off"
+    assert phase("thinking", "on") == "thinking"
+    assert phase("ready", "on") == "ready"
+    # One that does not: mid-turn, voice mode is what it last was.
+    assert phase("off") == "off"
+    assert phase("thinking") == "off"       # the watch's turn
+    assert phase("speaking") == "off"
+    assert phase("listening") == "listening"
+    assert phase("thinking") == "thinking"  # a spoken turn
+    assert phase("off") == "off"

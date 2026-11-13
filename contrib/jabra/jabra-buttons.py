@@ -207,9 +207,21 @@ def find_jabra():
     return found[0] if found else None
 
 
+_voice = False      # voice mode as last known, for an assistant that does not publish it
+
+
 def assistant():
     """(pid, phase) for the running assistant, or None. The phase is the status
-    file's: off, ready, listening, thinking or speaking."""
+    file's -- off, ready, listening, thinking or speaking -- and always "off"
+    while voice mode is off.
+
+    The two are not the same thing: a question that is typed, or sent from a
+    watch, is "thinking" with voice mode off. Read as on, that turned the
+    Jabra green mid-answer, and a red press then switched voice mode on. The
+    assistant publishes "voice" for this; one that predates it only proves
+    voice mode in off, ready and listening, and mid-turn it is what it last
+    was."""
+    global _voice
     try:
         with open(PIDFILE) as f:
             pid = int(f.read())
@@ -220,12 +232,19 @@ def assistant():
                 return None
     except (OSError, ValueError):
         return None
+    voice = None
     try:
         with open(STATUS) as f:
-            phase = (json.load(f).get("class") or ["off"])[0]
+            status = json.load(f)
+        phase = (status.get("class") or ["off"])[0]
+        voice = status.get("voice")
     except (OSError, ValueError):
         phase = "off"
-    return pid, phase
+    if voice in ("on", "off"):
+        _voice = voice == "on"
+    elif phase in ("off", "ready", "listening"):
+        _voice = phase != "off"
+    return pid, phase if _voice else "off"
 
 
 def serve(dev):

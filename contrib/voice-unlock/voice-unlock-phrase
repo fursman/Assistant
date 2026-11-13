@@ -10,7 +10,11 @@ state="$HOME/.local/state/voice-assistant"     # the assistant's, not XDG_STATE_
 status=$(cat "$state/voice-unlock" 2>/dev/null) || exit 0
 pid=$(pidof -s hyprlock) || exit 0
 
-if grep -q '"class": \["off"' "$state/status" 2>/dev/null; then
+# Voice mode, not the phase: a question from a watch is "thinking" with voice off.
+# (An assistant that does not publish "voice" yet only has the phase to go by.)
+if grep -q '"voice": "off"' "$state/status" 2>/dev/null ||
+   { ! grep -q '"voice": "on"' "$state/status" 2>/dev/null &&
+     grep -q '"class": \["off"' "$state/status" 2>/dev/null; }; then
     echo "Voice unlock: voice mode is off"
     exit 0
 fi

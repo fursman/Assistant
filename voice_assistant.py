@@ -5380,6 +5380,11 @@ class VoiceAssistant:
             "class": [state, which],
             "tooltip": f"Voice Assistant — {state} ({which})",
             "backend": which,
+            # Voice mode itself, which the phase is not: a typed question (or
+            # one sent from a watch) is "thinking" with the microphone off.
+            # Whatever acts on voice coming on -- the Jabra's lights, a lock
+            # screen that steps aside for it -- must read this, not `class`.
+            "voice": "on" if getattr(self, "is_active", False) else "off",
             # Extra keys for the indicator's model menu. waybar ignores what it
             # does not know, so this stays a valid custom-module payload.
             # `model`/`effort` are Claude's settings and mean something only when

@@ -157,6 +157,21 @@ def test_status_payload_names_the_backend_and_its_model(tmp_path, monkeypatch):
     assert va._local_model_label("") == ""
 
 
+def test_status_says_whether_voice_mode_is_on_apart_from_the_phase(tmp_path):
+    """A typed question (or one from a watch) is "thinking" with voice mode off.
+    Read as voice coming on, that ended the lock screen's dashboard at every
+    watch question (2026-11-12)."""
+    import json
+    host = StatusHost(tmp_path, "claude")
+    host.is_active = False
+    host._set_status("thinking")
+    d = json.loads((tmp_path / "status").read_text())
+    assert d["class"][0] == "thinking" and d["voice"] == "off"
+    host.is_active = True
+    host._set_status("ready")
+    assert json.loads((tmp_path / "status").read_text())["voice"] == "on"
+
+
 # --- a spoken model/effort change --------------------------------------------------
 
 class SpokenHost(va.VoiceAssistant):
